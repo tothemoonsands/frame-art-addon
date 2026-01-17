@@ -1,0 +1,32 @@
+name: Frame Art Uploader AI
+slug: frame_art_uploader_ai
+version: "0.1.3"
+description: >
+  Upload the newest AI-generated image to Samsung Frame Art Mode,
+  enforce true full-bleed display (16:9 crop + 4K upscale),
+  optionally select it immediately, and apply retention cleanup.
+startup: application
+boot: manual
+
+arch:
+  - aarch64
+  - armv7
+  - amd64
+
+map:
+  - media:rw
+  - share:rw
+
+options:
+  tv_ip: "192.168.1.38"
+  keep_count: 20
+  inbox_dir: "/media/frame_ai/inbox"
+  filename_prefix: "ai_"
+  select_after_upload: true
+
+schema:
+  tv_ip: str
+  keep_count: int
+  inbox_dir: str
+  filename_prefix: str
+  select_after_upload: bool
