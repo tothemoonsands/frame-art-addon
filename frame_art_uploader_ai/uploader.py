@@ -203,6 +203,13 @@ def prepare_for_frame(img_bytes: bytes) -> bytes:
         left = (w - target_w) // 2
         im = im.crop((left, 0, left + target_w, h))
 
+    w, h = im.size
+    zoom_crop_ratio = 0.05
+    inset_w = int(round(w * zoom_crop_ratio / 2))
+    inset_h = int(round(h * zoom_crop_ratio / 2))
+    if inset_w > 0 and inset_h > 0:
+        im = im.crop((inset_w, inset_h, w - inset_w, h - inset_h))
+
     out = BytesIO()
     im.save(out, format="PNG", optimize=True)
     return out.getvalue()
