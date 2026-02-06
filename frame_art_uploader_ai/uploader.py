@@ -11,16 +11,29 @@ from samsungtvws import SamsungTVWS
 
 OPTIONS_PATH = "/data/options.json"
 STATUS_PATH = "/share/frame_art_uploader_last.json"
+STATE_PATH = "/data/frame_art_uploader_state.json"
 
 # One-shot restore request written by Home Assistant.
 RESTORE_REQUEST_PATH = "/share/frame_art_restore_request.json"
 
 MYF_RE = re.compile(r"^MY[_-]F(\d+)", re.IGNORECASE)
+ALLOWED_EXTENSIONS = {".jpg", ".jpeg", ".png"}
+PHASE_SALT = {
+    "pre_dawn": 101,
+    "midday": 303,
+    "evening": 505,
+    "night": 707,
+}
 
 
 # ------------------------------------------------------------
 # Helpers
 # ------------------------------------------------------------
+
+def log_event(event: str, **fields: Any) -> None:
+    payload = {"event": event, **fields}
+    print(json.dumps(payload, separators=(",", ":"), sort_keys=True))
+
 
 def write_status(payload: dict) -> None:
     payload["ts"] = time.time()
@@ -31,6 +44,54 @@ def write_status(payload: dict) -> None:
 def load_options() -> dict:
     with open(OPTIONS_PATH, "r", encoding="utf-8") as f:
         return json.load(f)
+
+
+def sanitize_local_uploaded_ids(value: Any) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    out: list[str] = []
+    for item in value:
+        if isinstance(item, str):
+            cid = item.strip()
+            if cid:
+                out.append(cid)
+    return out
+
+
+def append_local_uploaded_id(state: dict, target_cid: Any) -> None:
+    existing = sanitize_local_uploaded_ids(state.get("local_uploaded_ids"))
+    state["local_uploaded_ids"] = existing
+    if isinstance(target_cid, str):
+        cid = target_cid.strip()
+        if cid:
+            state["local_uploaded_ids"].append(cid)
+
+
+def load_state() -> dict:
+    p = Path(STATE_PATH)
+    if not p.exists():
+        return {"last_applied": None, "local_uploaded_ids": []}
+    try:
+        data = json.loads(p.read_text(encoding="utf-8"))
+    except Exception:
+        return {"last_applied": None, "local_uploaded_ids": []}
+    if not isinstance(data, dict):
+        return {"last_applied": None, "local_uploaded_ids": []}
+    data.setdefault("last_applied", None)
+    data["local_uploaded_ids"] = sanitize_local_uploaded_ids(data.get("local_uploaded_ids"))
+    return data
+
+
+def save_state(state: dict) -> None:
+    Path(STATE_PATH).write_text(json.dumps(state, indent=2), encoding="utf-8")
+
+
+def parse_bool(value: Any) -> Optional[bool]:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return value.strip().lower() in {"true", "1", "yes", "on"}
+    return None
 
 
 def guess_file_type(path: Path) -> str:
@@ -109,7 +170,6 @@ def get_current_info(art: Any) -> dict:
     if not isinstance(current_state, dict):
         return {}
 
-    # samsungtvws can return either a top-level dict or a nested "current" dict.
     current_info = current_state.get("current") if isinstance(current_state.get("current"), dict) else {}
     if not current_info:
         current_info = current_state
@@ -117,8 +177,53 @@ def get_current_info(art: Any) -> dict:
     return current_info if isinstance(current_info, dict) else {}
 
 
-def read_restore_request() -> tuple[Optional[str], bool, Optional[bool]]:
-    """Return the requested content_id, presence flag, and requested show flag."""
+def list_local_images(folder: Path) -> list[Path]:
+    if not folder.exists() or not folder.is_dir():
+        return []
+    out: list[Path] = []
+    for p in folder.iterdir():
+        if not p.is_file():
+            continue
+        name = p.name
+        if name.startswith(".") or name.startswith("._") or name == ".DS_Store":
+            continue
+        if p.suffix.lower() not in ALLOWED_EXTENSIONS:
+            continue
+        out.append(p)
+    out.sort(key=lambda p: p.name.lower())
+    return out
+
+
+def choose_pick_file(payload: dict, state: dict) -> tuple[Optional[Path], str, int, int]:
+    phase = str(payload.get("phase", "")).strip().lower()
+    season = str(payload.get("season", "")).strip().lower()
+    holiday = str(payload.get("holiday", "none")).strip().lower()
+
+    try:
+        rng = int(payload.get("rng", 0))
+    except Exception:
+        rng = 0
+
+    if holiday and holiday != "none":
+        folder = Path("/media/frame_ai/holidays") / holiday
+        if holiday in {"christmas", "halloween"}:
+            folder = folder / ("evening" if phase in {"evening", "night"} else "day")
+    else:
+        folder = Path("/media/frame_ai/ambient") / season / phase
+
+    files = list_local_images(folder)
+    file_count = len(files)
+    if file_count == 0:
+        return None, str(folder), 0, -1
+
+    salt = PHASE_SALT.get(phase, 0)
+    idx = (rng + salt) % file_count
+    if file_count > 1 and str(files[idx]) == str(state.get("last_applied") or ""):
+        idx = (idx + 1) % file_count
+    return files[idx], str(folder), file_count, idx
+
+
+def read_restore_request() -> tuple[Optional[dict], bool, Optional[bool]]:
     p = Path(RESTORE_REQUEST_PATH)
     if not p.exists():
         return None, False, None
@@ -137,17 +242,8 @@ def read_restore_request() -> tuple[Optional[str], bool, Optional[bool]]:
         clear_restore_request()
         return None, True, None
 
-    cid = str(payload.get("content_id", "")).strip()
-    raw_show = payload.get("show")
-    requested_show: Optional[bool]
-    if isinstance(raw_show, bool):
-        requested_show = raw_show
-    elif isinstance(raw_show, str):
-        requested_show = raw_show.strip().lower() in {"true", "1", "yes", "on"}
-    else:
-        requested_show = None
+    requested_show = parse_bool(payload.get("show"))
 
-    # Ignore stale restore requests to avoid blocking uploads forever.
     requested_at_raw = payload.get("requested_at")
     if requested_at_raw:
         try:
@@ -170,7 +266,20 @@ def read_restore_request() -> tuple[Optional[str], bool, Optional[bool]]:
             clear_restore_request()
             return None, True, requested_show
 
-    return (cid or None), True, requested_show
+    if not isinstance(payload, dict):
+        return None, True, requested_show
+
+    normalized = dict(payload)
+    kind = str(payload.get("kind", "")).strip().lower()
+    if not kind:
+        if payload.get("content_id"):
+            kind = "content_id"
+            normalized["value"] = payload.get("content_id")
+        else:
+            kind = ""
+    normalized["kind"] = kind
+
+    return normalized, True, requested_show
 
 
 def clear_restore_request() -> None:
@@ -180,39 +289,77 @@ def clear_restore_request() -> None:
         pass
 
 
-# ------------------------------------------------------------
-# Image preparation
-# ------------------------------------------------------------
-
 def prepare_for_frame(img_bytes: bytes) -> bytes:
     im = Image.open(BytesIO(img_bytes))
 
-    # Preserve the original mode when possible, but fall back to RGB for unusual
-    # formats the TV might not accept.
     if im.mode not in {"RGB", "RGBA", "L"}:
         im = im.convert("RGB")
 
     w, h = im.size
+    target_ratio = 16 / 9
+    current_ratio = w / h if h else target_ratio
 
-    target_h = int(round(w * 9 / 16))
-    if target_h < h:
-        top = (h - target_h) // 2
-        im = im.crop((0, top, w, top + target_h))
-    elif target_h > h:
-        target_w = int(round(h * 16 / 9))
+    if current_ratio > target_ratio:
+        target_w = int(round(h * target_ratio))
         left = (w - target_w) // 2
         im = im.crop((left, 0, left + target_w, h))
+    elif current_ratio < target_ratio:
+        target_h = int(round(w / target_ratio))
+        top = (h - target_h) // 2
+        im = im.crop((0, top, w, top + target_h))
 
-    w, h = im.size
-    zoom_crop_ratio = 0.05
-    inset_w = int(round(w * zoom_crop_ratio / 2))
-    inset_h = int(round(h * zoom_crop_ratio / 2))
-    if inset_w > 0 and inset_h > 0:
-        im = im.crop((inset_w, inset_h, w - inset_w, h - inset_h))
+    im = im.resize((3840, 2160), Image.Resampling.LANCZOS)
 
     out = BytesIO()
     im.save(out, format="PNG", optimize=True)
     return out.getvalue()
+
+
+def resolve_local_path(value: str) -> Optional[Path]:
+    p = Path(value).resolve()
+    base = Path("/media/frame_ai").resolve()
+    if not str(p).startswith(str(base) + "/") and p != base:
+        return None
+    if not p.exists() or not p.is_file():
+        return None
+    if p.suffix.lower() not in ALLOWED_EXTENSIONS:
+        return None
+    if p.name.startswith(".") or p.name.startswith("._") or p.name == ".DS_Store":
+        return None
+    return p
+
+
+def upload_local_file(art: Any, file_path: Path) -> Optional[str]:
+    raw_bytes = file_path.read_bytes()
+    processed_bytes = prepare_for_frame(raw_bytes)
+    art.upload(processed_bytes, file_type="PNG", matte="none")
+    available = art.available()
+    myf = extract_myf_ids(available)
+    return myf[-1][1] if myf else None
+
+
+def cleanup_local_uploads(art: Any, state: dict, keep_count_local: int) -> tuple[list[str], Optional[str]]:
+    tracked = sanitize_local_uploaded_ids(state.get("local_uploaded_ids"))
+    state["local_uploaded_ids"] = tracked
+    if keep_count_local <= 0:
+        to_delete = tracked
+    elif len(tracked) > keep_count_local:
+        to_delete = tracked[:-keep_count_local]
+    else:
+        to_delete = []
+
+    deleted: list[str] = []
+    delete_error: Optional[str] = None
+    if to_delete:
+        try:
+            art.delete_list(to_delete)
+            deleted = to_delete
+            keep_set = set(to_delete)
+            state["local_uploaded_ids"] = [cid for cid in tracked if cid not in keep_set]
+        except Exception as e:
+            delete_error = repr(e)
+
+    return deleted, delete_error
 
 
 # ------------------------------------------------------------
@@ -221,9 +368,11 @@ def prepare_for_frame(img_bytes: bytes) -> bytes:
 
 def main() -> None:
     opts = load_options()
+    state = load_state()
 
     tv_ip = str(opts.get("tv_ip", "")).strip()
     keep_count = int(opts.get("keep_count", 20))
+    keep_count_local = int(opts.get("keep_count_local", 30))
     inbox_dir = str(opts.get("inbox_dir", "/media/frame_ai/inbox"))
     prefix = str(opts.get("filename_prefix", "ai_"))
     select_after = bool(opts.get("select_after_upload", True))
@@ -245,46 +394,110 @@ def main() -> None:
         )
         return
 
-    # ------------------------------------------------------------
-    # Restore-only path
-    # ------------------------------------------------------------
-    restore_cid, had_restore_request, requested_show = read_restore_request()
-    if restore_cid:
+    restore_payload, had_restore_request, requested_show = read_restore_request()
+    if restore_payload:
         try:
-            # Determine whether Art Mode is currently active. When the TV is in TV mode,
-            # get_current() typically returns an empty dict/None, so we fall back to a
-            # “not art mode” assumption in that case.
             current_info = get_current_info(art)
-            current_id = extract_content_id(current_info)
-            is_art_mode = bool(current_info) or current_id is not None
+            is_art_mode = bool(current_info) or extract_content_id(current_info) is not None
             show_flag = requested_show if requested_show is not None else is_art_mode
 
-            # If we are in Art Mode, show immediately; otherwise queue it silently so we
-            # do not force a mode switch.
-            art.select_image(restore_cid, show=show_flag)
+            kind = str(restore_payload.get("kind", "")).strip().lower()
+            request_value = str(restore_payload.get("value", "")).strip()
+            resolved_folder = None
+            file_count = 0
+            chosen_index = -1
+            selected_name = None
 
-            verified = False
+            if kind == "content_id":
+                target_cid = request_value
+                if not target_cid:
+                    raise ValueError(
+                        f"Invalid restore request: missing content_id value (kind={kind}, value={request_value!r}, resolved_folder={resolved_folder})"
+                    )
+                selected_name = target_cid
+            elif kind == "local_file":
+                local_path = resolve_local_path(request_value)
+                if local_path is None:
+                    raise ValueError(
+                        f"Invalid restore request: local_file must be an existing jpg/png under /media/frame_ai (kind={kind}, value={request_value!r}, resolved_folder={resolved_folder})"
+                    )
+                target_cid = upload_local_file(art, local_path)
+                if not target_cid:
+                    raise ValueError(
+                        f"Upload completed but content_id was not discovered (kind={kind}, value={request_value!r}, resolved_folder={local_path.parent})"
+                    )
+                append_local_uploaded_id(state, target_cid)
+                state["last_applied"] = str(local_path)
+                resolved_folder = str(local_path.parent)
+                file_count = 1
+                chosen_index = 0
+                selected_name = local_path.name
+            elif kind == "pick":
+                pick_file, resolved_folder, file_count, chosen_index = choose_pick_file(restore_payload, state)
+                if not pick_file:
+                    raise ValueError(
+                        f"No candidate files found for pick request (kind={kind}, value={request_value!r}, resolved_folder={resolved_folder})"
+                    )
+                target_cid = upload_local_file(art, pick_file)
+                if not target_cid:
+                    raise ValueError(
+                        f"Upload completed but content_id was not discovered (kind={kind}, value={request_value!r}, resolved_folder={resolved_folder})"
+                    )
+                append_local_uploaded_id(state, target_cid)
+                state["last_applied"] = str(pick_file)
+                selected_name = pick_file.name
+            else:
+                raise ValueError(
+                    f"Unsupported restore kind (kind={kind!r}, value={request_value!r}, resolved_folder={resolved_folder})"
+                )
+
+            art.select_image(target_cid, show=show_flag)
+
+            verified: Optional[bool] = None
+            verification_skipped = not show_flag
             if show_flag:
-                # Allow multiple checks/retries so slow TV responses don't report false negatives.
+                verified = False
                 for _ in range(3):
                     time.sleep(1.0)
                     current_info = get_current_info(art)
                     current_id = extract_content_id(current_info)
-                    if current_id == restore_cid:
+                    if current_id == target_cid:
                         verified = True
                         break
-                    # Re-issue the selection in case the first attempt didn't latch.
-                    art.select_image(restore_cid, show=True)
+                    art.select_image(target_cid, show=True)
+
+            deleted_local, cleanup_error = cleanup_local_uploads(art, state, keep_count_local)
+            save_state(state)
+
+            log_event(
+                "restore_request",
+                kind=kind,
+                resolved_folder=resolved_folder,
+                file_count=file_count,
+                chosen_index=chosen_index,
+                chosen=selected_name or target_cid,
+                cleanup_deletions=len(deleted_local),
+                cleanup_error=cleanup_error,
+            )
 
             write_status(
                 {
-                    "ok": True if not show_flag else verified,
+                    "ok": True if not show_flag else bool(verified),
                     "mode": "restore",
                     "tv_ip": tv_ip,
-                    "requested_content_id": restore_cid,
-                    "verified": verified,
-                    "art_mode": is_art_mode,
+                    "kind": kind,
+                    "value": request_value,
+                    "resolved_folder": resolved_folder,
+                    "file_count": file_count,
+                    "chosen_index": chosen_index,
                     "requested_show": requested_show,
+                    "art_mode": is_art_mode,
+                    "selected_content_id": target_cid,
+                    "chosen": selected_name or target_cid,
+                    "deleted_local": deleted_local,
+                    "cleanup_error": cleanup_error,
+                    "verified": verified,
+                    "verification_skipped": verification_skipped,
                 }
             )
 
@@ -294,7 +507,9 @@ def main() -> None:
                     "ok": False,
                     "mode": "restore",
                     "tv_ip": tv_ip,
-                    "requested_content_id": restore_cid,
+                    "kind": restore_payload.get("kind") if isinstance(restore_payload, dict) else None,
+                    "value": str(restore_payload.get("value", "")) if isinstance(restore_payload, dict) else None,
+                    "resolved_folder": locals().get("resolved_folder"),
                     "error": repr(e),
                 }
             )
@@ -302,14 +517,11 @@ def main() -> None:
         clear_restore_request()
         return
     elif had_restore_request:
-        # A restore file existed but was invalid/empty; avoid re-uploading a stale inbox
-        # image and report the failure.
         write_status(
             {
                 "ok": False,
                 "mode": "restore",
                 "tv_ip": tv_ip,
-                "requested_content_id": restore_cid,
                 "error": "Invalid or missing restore content_id",
                 "requested_show": requested_show,
             }
@@ -317,9 +529,6 @@ def main() -> None:
         clear_restore_request()
         return
 
-    # ------------------------------------------------------------
-    # Upload path
-    # ------------------------------------------------------------
     img_path = newest_candidate(inbox_dir, prefix)
     if img_path is None:
         write_status(
