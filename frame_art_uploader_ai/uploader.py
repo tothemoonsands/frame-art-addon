@@ -24,6 +24,9 @@ PHASE_SALT = {
     "evening": 505,
     "night": 707,
 }
+UNKNOWN_PHASE = "night"
+
+RUNTIME_OPTIONS: dict[str, Any] = {}
 
 
 # ------------------------------------------------------------
@@ -223,6 +226,58 @@ def choose_pick_file(payload: dict, state: dict) -> tuple[Optional[Path], str, i
     return files[idx], str(folder), file_count, idx
 
 
+def compute_phase_roll(payload: dict) -> tuple[int, int, str]:
+    try:
+        rng = int(payload.get("rng", 0))
+    except Exception:
+        rng = 0
+
+    phase_raw = str(payload.get("phase", "")).strip().lower()
+    phase = phase_raw if phase_raw in PHASE_SALT else UNKNOWN_PHASE
+    salt = PHASE_SALT.get(phase, PHASE_SALT[UNKNOWN_PHASE])
+    phase_roll = (rng + salt) % 100
+    return rng, phase_roll, phase
+
+
+def should_pick_samsung_phase(phase_roll: int, pick_samsung_pct: int) -> bool:
+    pct = max(0, min(100, int(pick_samsung_pct)))
+    return phase_roll < pct
+
+
+def choose_pick_samsung_id(payload: dict, rng: int, phase: str) -> Optional[str]:
+    options = RUNTIME_OPTIONS if isinstance(RUNTIME_OPTIONS, dict) else {}
+    samsung_pools = options.get("samsung_pools") if isinstance(options.get("samsung_pools"), dict) else {}
+    holidays_pool = samsung_pools.get("holidays") if isinstance(samsung_pools.get("holidays"), dict) else {}
+    ambient_pool = samsung_pools.get("ambient") if isinstance(samsung_pools.get("ambient"), dict) else {}
+
+    season = str(payload.get("season", "")).strip().lower()
+    holiday = str(payload.get("holiday", "none")).strip().lower()
+
+    pool: list[str] = []
+
+    if holiday and holiday != "none":
+        holiday_entry = holidays_pool.get(holiday)
+        if holiday in {"christmas", "halloween"} and isinstance(holiday_entry, dict):
+            bucket = "evening" if phase in {"evening", "night"} else "day"
+            maybe_list = holiday_entry.get(bucket)
+            if isinstance(maybe_list, list):
+                pool = [str(x).strip() for x in maybe_list if str(x).strip()]
+        elif isinstance(holiday_entry, list):
+            pool = [str(x).strip() for x in holiday_entry if str(x).strip()]
+    else:
+        season_entry = ambient_pool.get(season)
+        if isinstance(season_entry, dict):
+            maybe_list = season_entry.get(phase)
+            if isinstance(maybe_list, list):
+                pool = [str(x).strip() for x in maybe_list if str(x).strip()]
+
+    if not pool:
+        return None
+
+    idx = (rng + PHASE_SALT.get(phase, PHASE_SALT[UNKNOWN_PHASE])) % len(pool)
+    return pool[idx]
+
+
 def read_restore_request() -> tuple[Optional[dict], bool, Optional[bool]]:
     p = Path(RESTORE_REQUEST_PATH)
     if not p.exists():
@@ -367,12 +422,15 @@ def cleanup_local_uploads(art: Any, state: dict, keep_count_local: int) -> tuple
 # ------------------------------------------------------------
 
 def main() -> None:
+    global RUNTIME_OPTIONS
     opts = load_options()
+    RUNTIME_OPTIONS = opts if isinstance(opts, dict) else {}
     state = load_state()
 
     tv_ip = str(opts.get("tv_ip", "")).strip()
     keep_count = int(opts.get("keep_count", 20))
     keep_count_local = int(opts.get("keep_count_local", 30))
+    pick_samsung_pct = int(opts.get("pick_samsung_pct", 60))
     inbox_dir = str(opts.get("inbox_dir", "/media/frame_ai/inbox"))
     prefix = str(opts.get("filename_prefix", "ai_"))
     select_after = bool(opts.get("select_after_upload", True))
@@ -407,6 +465,9 @@ def main() -> None:
             file_count = 0
             chosen_index = -1
             selected_name = None
+            pick_source = None
+            rng = None
+            phase_roll = None
 
             if kind == "content_id":
                 target_cid = request_value
@@ -433,19 +494,36 @@ def main() -> None:
                 chosen_index = 0
                 selected_name = local_path.name
             elif kind == "pick":
-                pick_file, resolved_folder, file_count, chosen_index = choose_pick_file(restore_payload, state)
-                if not pick_file:
-                    raise ValueError(
-                        f"No candidate files found for pick request (kind={kind}, value={request_value!r}, resolved_folder={resolved_folder})"
-                    )
-                target_cid = upload_local_file(art, pick_file)
-                if not target_cid:
-                    raise ValueError(
-                        f"Upload completed but content_id was not discovered (kind={kind}, value={request_value!r}, resolved_folder={resolved_folder})"
-                    )
-                append_local_uploaded_id(state, target_cid)
-                state["last_applied"] = str(pick_file)
-                selected_name = pick_file.name
+                rng, phase_roll, phase = compute_phase_roll(restore_payload)
+                prefer_samsung = should_pick_samsung_phase(phase_roll, pick_samsung_pct)
+
+                if prefer_samsung:
+                    target_cid = choose_pick_samsung_id(restore_payload, rng, phase)
+                    if target_cid:
+                        pick_source = "samsung"
+                        resolved_folder = "samsung_pool"
+                        selected_name = target_cid
+                    else:
+                        pick_source = "local"
+                else:
+                    pick_source = "local"
+
+                if pick_source == "local":
+                    pick_file, resolved_folder, file_count, chosen_index = choose_pick_file(restore_payload, state)
+                    if not pick_file:
+                        raise ValueError(
+                            f"No candidate files found for pick request (kind={kind}, value={request_value!r}, resolved_folder={resolved_folder})"
+                        )
+                    target_cid = upload_local_file(art, pick_file)
+                    if not target_cid:
+                        raise ValueError(
+                            f"Upload completed but content_id was not discovered (kind={kind}, value={request_value!r}, resolved_folder={resolved_folder})"
+                        )
+                    append_local_uploaded_id(state, target_cid)
+                    state["last_applied"] = str(pick_file)
+                    selected_name = pick_file.name
+                else:
+                    state["last_applied"] = f"samsung:{target_cid}"
             else:
                 raise ValueError(
                     f"Unsupported restore kind (kind={kind!r}, value={request_value!r}, resolved_folder={resolved_folder})"
@@ -466,7 +544,12 @@ def main() -> None:
                         break
                     art.select_image(target_cid, show=True)
 
-            deleted_local, cleanup_error = cleanup_local_uploads(art, state, keep_count_local)
+            deleted_local: list[str] = []
+            cleanup_error: Optional[str] = None
+            if kind == "pick" and pick_source == "local":
+                deleted_local, cleanup_error = cleanup_local_uploads(art, state, keep_count_local)
+            elif kind == "local_file":
+                deleted_local, cleanup_error = cleanup_local_uploads(art, state, keep_count_local)
             save_state(state)
 
             log_event(
@@ -476,6 +559,10 @@ def main() -> None:
                 file_count=file_count,
                 chosen_index=chosen_index,
                 chosen=selected_name or target_cid,
+                pick_source=pick_source,
+                rng=rng,
+                phase_roll=phase_roll,
+                pick_samsung_pct=pick_samsung_pct,
                 cleanup_deletions=len(deleted_local),
                 cleanup_error=cleanup_error,
             )
@@ -492,6 +579,10 @@ def main() -> None:
                     "chosen_index": chosen_index,
                     "requested_show": requested_show,
                     "art_mode": is_art_mode,
+                    "pick_source": pick_source,
+                    "rng": rng,
+                    "phase_roll": phase_roll,
+                    "pick_samsung_pct": pick_samsung_pct,
                     "selected_content_id": target_cid,
                     "chosen": selected_name or target_cid,
                     "deleted_local": deleted_local,
