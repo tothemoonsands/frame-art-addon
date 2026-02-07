@@ -63,7 +63,61 @@ schema:
   keep_count: int
   keep_count_local: int
   pick_samsung_pct: int
-  samsung_pools: dict
+  samsung_pools:
+    holidays:
+      halloween:
+        day:
+          - str
+        evening:
+          - str
+      christmas:
+        day:
+          - str
+        evening:
+          - str
+      thanksgiving:
+        - str
+      independence:
+        - str
+      newyear:
+        - str
+    ambient:
+      winter:
+        pre_dawn:
+          - str
+        midday:
+          - str
+        evening:
+          - str
+        night:
+          - str
+      spring:
+        pre_dawn:
+          - str
+        midday:
+          - str
+        evening:
+          - str
+        night:
+          - str
+      summer:
+        pre_dawn:
+          - str
+        midday:
+          - str
+        evening:
+          - str
+        night:
+          - str
+      autumn:
+        pre_dawn:
+          - str
+        midday:
+          - str
+        evening:
+          - str
+        night:
+          - str
   inbox_dir: str
   filename_prefix: str
   select_after_upload: bool
