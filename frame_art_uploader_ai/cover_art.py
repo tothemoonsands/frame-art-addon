@@ -110,7 +110,7 @@ def download_artwork(url: str, dest_path: str, timeout_s: int = 15) -> None:
 
 
 def build_outpaint_canvas_and_mask(src_path: str) -> tuple[Path, Path]:
-    """Build a 1536x1024 outpaint canvas and mask that allows text-band repainting.
+    """Build a 1536x1024 outpaint canvas and fully editable mask.
 
     NOTE: If this outpaint algorithm changes, previously cached widescreen images may need
     to be deleted so they can be regenerated with the updated masking behavior.
@@ -118,42 +118,14 @@ def build_outpaint_canvas_and_mask(src_path: str) -> tuple[Path, Path]:
     canvas_w, canvas_h = 1536, 1024
     center_x, center_y = 256, 0
     center_size = 1024
-    top_text_band = int(round(center_size * 0.22))
-    bottom_text_band = int(round(center_size * 0.18))
-    edge_margin = int(round(center_size * 0.05))
 
     with Image.open(src_path) as src:
         cover = src.convert("RGB").resize((center_size, center_size), Image.Resampling.LANCZOS)
         canvas = Image.new("RGB", (canvas_w, canvas_h), (0, 0, 0))
         canvas.paste(cover, (center_x, center_y))
 
-    mask = Image.new("L", (canvas_w, canvas_h), 0)
-    center_end_x = center_x + center_size
-
-    # Outpaint gutters are fully editable.
-    for y in range(canvas_h):
-        for x in range(0, center_x):
-            mask.putpixel((x, y), 255)
-        for x in range(center_end_x, canvas_w):
-            mask.putpixel((x, y), 255)
-
-    # Top/bottom bands inside the original square are editable to remove album text.
-    for y in range(0, top_text_band):
-        for x in range(center_x, center_end_x):
-            mask.putpixel((x, y), 255)
-    for y in range(center_size - bottom_text_band, center_size):
-        for x in range(center_x, center_end_x):
-            mask.putpixel((x, y), 255)
-
-    # Small edge margin around the square helps catch edge typography and logos.
-    for y in range(0, center_size):
-        for i in range(edge_margin):
-            left_x = center_x + i
-            right_x = center_end_x - 1 - i
-            if left_x < center_end_x:
-                mask.putpixel((left_x, y), 255)
-            if right_x >= center_x:
-                mask.putpixel((right_x, y), 255)
+    # Entire canvas is editable: both gutters plus the full original 1024x1024 square.
+    mask = Image.new("L", (canvas_w, canvas_h), 255)
 
     temp_dir = Path(tempfile.mkdtemp(prefix="frame_art_outpaint_"))
     canvas_path = temp_dir / "canvas.png"
