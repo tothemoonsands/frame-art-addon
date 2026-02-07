@@ -9,12 +9,25 @@ from typing import Any, Optional
 from PIL import Image
 from samsungtvws import SamsungTVWS
 
+from cover_art import (
+    SOURCE_DIR,
+    WIDESCREEN_DIR,
+    download_artwork,
+    ensure_dirs,
+    itunes_lookup,
+    itunes_search,
+    normalize_key,
+    outpaint_mode_b,
+    resolve_artwork_url,
+)
+
 OPTIONS_PATH = "/data/options.json"
 STATUS_PATH = "/share/frame_art_uploader_last.json"
 STATE_PATH = "/data/frame_art_uploader_state.json"
 
 # One-shot restore request written by Home Assistant.
 RESTORE_REQUEST_PATH = "/share/frame_art_restore_request.json"
+FALLBACK_DIR = Path("/media/frame_ai/cover_art/fallback")
 
 MYF_RE = re.compile(r"^MY[_-]F(\d+)", re.IGNORECASE)
 ALLOWED_EXTENSIONS = {".jpg", ".jpeg", ".png"}
@@ -75,18 +88,28 @@ def append_local_uploaded_id(state: dict, target_cid: Any) -> None:
             state["local_uploaded_ids"].append(cid)
 
 
+def append_uploaded_id(state: dict, state_key: str, target_cid: Any) -> None:
+    existing = sanitize_local_uploaded_ids(state.get(state_key))
+    state[state_key] = existing
+    if isinstance(target_cid, str):
+        cid = target_cid.strip()
+        if cid:
+            state[state_key].append(cid)
+
+
 def load_state() -> dict:
     p = Path(STATE_PATH)
     if not p.exists():
-        return {"last_applied": None, "local_uploaded_ids": []}
+        return {"last_applied": None, "local_uploaded_ids": [], "cover_uploaded_ids": []}
     try:
         data = json.loads(p.read_text(encoding="utf-8"))
     except Exception:
-        return {"last_applied": None, "local_uploaded_ids": []}
+        return {"last_applied": None, "local_uploaded_ids": [], "cover_uploaded_ids": []}
     if not isinstance(data, dict):
-        return {"last_applied": None, "local_uploaded_ids": []}
+        return {"last_applied": None, "local_uploaded_ids": [], "cover_uploaded_ids": []}
     data.setdefault("last_applied", None)
     data["local_uploaded_ids"] = sanitize_local_uploaded_ids(data.get("local_uploaded_ids"))
+    data["cover_uploaded_ids"] = sanitize_local_uploaded_ids(data.get("cover_uploaded_ids"))
     return data
 
 
@@ -354,6 +377,25 @@ def read_restore_request() -> tuple[Optional[dict], bool, Optional[bool]]:
             kind = ""
     normalized["kind"] = kind
 
+    if kind == "cover_art_outpaint":
+        if requested_show is None:
+            requested_show = True
+        normalized["requested_at"] = str(payload.get("requested_at", "")).strip()
+        normalized["artwork_url"] = str(payload.get("artwork_url", "")).strip()
+        normalized["artist"] = str(payload.get("artist", "")).strip()
+        normalized["album"] = str(payload.get("album", "")).strip()
+        normalized["track"] = str(payload.get("track", "")).strip()
+        normalized["music_session_key"] = str(payload.get("music_session_key", "")).strip()
+        normalized["listening_mode"] = str(payload.get("listening_mode", "")).strip()
+        collection_id_raw = payload.get("collection_id")
+        if collection_id_raw in (None, ""):
+            normalized["collection_id"] = None
+        else:
+            try:
+                normalized["collection_id"] = int(collection_id_raw)
+            except Exception:
+                normalized["collection_id"] = None
+
     return normalized, True, requested_show
 
 
@@ -404,6 +446,19 @@ def resolve_local_path(value: str) -> Optional[Path]:
     return p
 
 
+def pick_cover_fallback(cache_key: str) -> Optional[Path]:
+    candidates = [
+        FALLBACK_DIR / f"{cache_key}.png",
+        FALLBACK_DIR / f"{cache_key}.jpg",
+        FALLBACK_DIR / "default.png",
+        FALLBACK_DIR / "default.jpg",
+    ]
+    for candidate in candidates:
+        if candidate.exists() and candidate.is_file():
+            return candidate
+    return None
+
+
 def upload_local_file(art: Any, file_path: Path) -> Optional[str]:
     raw_bytes = file_path.read_bytes()
     processed_bytes = prepare_for_frame(raw_bytes)
@@ -414,8 +469,12 @@ def upload_local_file(art: Any, file_path: Path) -> Optional[str]:
 
 
 def cleanup_local_uploads(art: Any, state: dict, keep_count_local: int) -> tuple[list[str], Optional[str]]:
-    tracked = sanitize_local_uploaded_ids(state.get("local_uploaded_ids"))
-    state["local_uploaded_ids"] = tracked
+    return cleanup_frame_uploads(art, state, "local_uploaded_ids", keep_count_local)
+
+
+def cleanup_frame_uploads(art: Any, state: dict, state_key: str, keep_count_local: int) -> tuple[list[str], Optional[str]]:
+    tracked = sanitize_local_uploaded_ids(state.get(state_key))
+    state[state_key] = tracked
     if keep_count_local <= 0:
         to_delete = tracked
     elif len(tracked) > keep_count_local:
@@ -430,7 +489,7 @@ def cleanup_local_uploads(art: Any, state: dict, keep_count_local: int) -> tuple
             art.delete_list(to_delete)
             deleted = to_delete
             keep_set = set(to_delete)
-            state["local_uploaded_ids"] = [cid for cid in tracked if cid not in keep_set]
+            state[state_key] = [cid for cid in tracked if cid not in keep_set]
         except Exception as e:
             delete_error = repr(e)
 
@@ -458,6 +517,8 @@ def main() -> None:
     inbox_dir = str(opts.get("inbox_dir", "/media/frame_ai/inbox"))
     prefix = str(opts.get("filename_prefix", "ai_"))
     select_after = bool(opts.get("select_after_upload", True))
+    openai_api_key = str(opts.get("openai_api_key", "")).strip()
+    openai_model = str(opts.get("openai_model", "gpt-image-1")).strip() or "gpt-image-1"
 
     if not tv_ip:
         write_status({"ok": False, "error": "Missing tv_ip"})
@@ -550,6 +611,91 @@ def main() -> None:
                     selected_name = pick_file.name
                 else:
                     state["last_applied"] = f"samsung:{target_cid}"
+            elif kind == "cover_art_outpaint":
+                ensure_dirs()
+                source_url = str(restore_payload.get("artwork_url", "")).strip()
+                artist = str(restore_payload.get("artist", "")).strip()
+                album = str(restore_payload.get("album", "")).strip()
+                collection_id_raw = restore_payload.get("collection_id")
+                collection_id: Optional[int] = None
+                if collection_id_raw not in (None, ""):
+                    try:
+                        collection_id = int(collection_id_raw)
+                    except Exception:
+                        collection_id = None
+
+                cache_key = normalize_key(collection_id, artist, album)
+                src_path = SOURCE_DIR / f"{cache_key}.jpg"
+                wide_path = WIDESCREEN_DIR / f"{cache_key}.png"
+
+                resolved_folder = str(WIDESCREEN_DIR)
+                selected_name = wide_path.name
+                file_count = 1
+                chosen_index = 0
+
+                if wide_path.exists():
+                    target_cid = upload_local_file(art, wide_path)
+                    if not target_cid:
+                        raise ValueError("Cached widescreen upload succeeded but content_id was not found")
+                    append_uploaded_id(state, "cover_uploaded_ids", target_cid)
+                    pick_source = "cover_art_cache"
+                else:
+                    FALLBACK_DIR.mkdir(parents=True, exist_ok=True)
+                    cover_error: Optional[Exception] = None
+                    fallback_path: Optional[Path] = None
+                    try:
+                        if not source_url:
+                            if collection_id is not None:
+                                lookup = itunes_lookup(collection_id, timeout_s=10)
+                                results = lookup.get("results") if isinstance(lookup, dict) else []
+                                album_info = {}
+                                if isinstance(results, list):
+                                    for item in results:
+                                        if isinstance(item, dict) and (item.get("artworkUrl100") or item.get("artworkUrl60")):
+                                            album_info = item
+                                            break
+                                source_url = resolve_artwork_url(album_info)
+                            elif artist and album:
+                                album_info = itunes_search(artist, album, timeout_s=10)
+                                source_url = resolve_artwork_url(album_info)
+                            else:
+                                raise ValueError("unsupported metadata; provide artwork_url, collection_id, or artist+album")
+
+                        if not source_url:
+                            raise ValueError("Unable to resolve artwork URL from request metadata")
+
+                        if not src_path.exists():
+                            download_artwork(source_url, str(src_path), timeout_s=15)
+
+                        outpaint_bytes = outpaint_mode_b(
+                            str(src_path),
+                            openai_api_key=openai_api_key,
+                            openai_model=openai_model,
+                            timeout_s=90,
+                        )
+                        processed_bytes = prepare_for_frame(outpaint_bytes)
+                        wide_path.write_bytes(processed_bytes)
+
+                        target_cid = upload_local_file(art, wide_path)
+                        if not target_cid:
+                            raise ValueError("Outpaint upload succeeded but content_id was not found")
+                        append_uploaded_id(state, "cover_uploaded_ids", target_cid)
+
+                        pick_source = "cover_art_outpaint"
+                    except Exception as e:
+                        cover_error = e
+                        fallback_path = pick_cover_fallback(cache_key)
+                        if fallback_path is None:
+                            raise cover_error
+                        target_cid = upload_local_file(art, fallback_path)
+                        if not target_cid:
+                            raise ValueError("Fallback upload completed but content_id was not discovered")
+                        append_uploaded_id(state, "cover_uploaded_ids", target_cid)
+                        pick_source = "cover_art_fallback"
+                        selected_name = fallback_path.name
+                        resolved_folder = str(FALLBACK_DIR)
+                        file_count = 1
+                        chosen_index = 0
             else:
                 raise ValueError(
                     f"Unsupported restore kind (kind={kind!r}, value={request_value!r}, resolved_folder={resolved_folder})"
@@ -576,6 +722,8 @@ def main() -> None:
                 deleted_local, cleanup_error = cleanup_local_uploads(art, state, keep_count_local)
             elif kind == "local_file":
                 deleted_local, cleanup_error = cleanup_local_uploads(art, state, keep_count_local)
+            elif kind == "cover_art_outpaint":
+                deleted_local, cleanup_error = cleanup_frame_uploads(art, state, "cover_uploaded_ids", keep_count_local)
             save_state(state)
 
             log_event(
@@ -602,6 +750,7 @@ def main() -> None:
                     "tv_ip": tv_ip,
                     "kind": kind,
                     "value": request_value,
+                    "requested_at": str(restore_payload.get("requested_at", "")) if isinstance(restore_payload, dict) else "",
                     "resolved_folder": resolved_folder,
                     "file_count": file_count,
                     "chosen_index": chosen_index,
@@ -620,6 +769,10 @@ def main() -> None:
                     "cleanup_error": cleanup_error,
                     "verified": verified,
                     "verification_skipped": verification_skipped,
+                    "cache_key": locals().get("cache_key"),
+                    "source_path": str(locals().get("src_path")) if "src_path" in locals() else None,
+                    "widescreen_path": str(locals().get("wide_path")) if "wide_path" in locals() else None,
+                    "fallback_path": str(locals().get("fallback_path")) if "fallback_path" in locals() and locals().get("fallback_path") else None,
                 }
             )
 
