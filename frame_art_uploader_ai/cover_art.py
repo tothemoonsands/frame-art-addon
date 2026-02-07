@@ -121,7 +121,6 @@ def outpaint_mode_b(
             "model": openai_model,
             "prompt": OUTPAINT_PROMPT,
             "size": "1536x1024",
-            "response_format": "b64_json",
         }
         response = requests.post(
             "https://api.openai.com/v1/images/edits",
