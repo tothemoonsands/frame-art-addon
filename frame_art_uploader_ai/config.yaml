@@ -1,6 +1,6 @@
 name: Frame Art Uploader AI
 slug: frame_art_uploader_ai
-version: "0.2.2"
+version: "0.2.3"
 description: >
   Upload the newest AI-generated image to Samsung Frame Art Mode,
   enforce true full-bleed display (16:9 crop + 4K upscale),
@@ -21,6 +21,39 @@ options:
   tv_ip: "192.168.1.38"
   keep_count: 20
   keep_count_local: 30
+  pick_samsung_pct: 60
+  samsung_pools:
+    holidays:
+      halloween:
+        day: ["SAM-S10000900", "SAM-S10004033", "SAM-S10004035"]
+        evening: ["SAM-S10000898", "SAM-S10004117", "SAM-S10004393"]
+      christmas:
+        day: ["SAM-S10001053", "SAM-S10004755"]
+        evening: ["SAM-S10001016", "SAM-S10004846", "SAM-S10001566", "SAM-S10001058", "SAM-S10004951"]
+      thanksgiving: ["SAM-S10000899", "SAM-S10004342", "SAM-S10004345", "SAM-S10004805", "SAM-S10004344"]
+      independence: ["SAM-S10001328"]
+      newyear: ["SAM-S10001054", "SAM-S10004755"]
+    ambient:
+      winter:
+        pre_dawn: ["SAM-S10004505", "SAM-S3513", "SAM-S10004581", "SAM-S10004580"]
+        midday: ["SAM-S10001625", "SAM-S10001017", "SAM-S10002519", "SAM-S10004372", "SAM-S10003939", "SAM-S10004683", "SAM-S10003661", "SAM-S10001771", "SAM-S10004834"]
+        evening: ["SAM-S10004581", "SAM-S5590", "SAM-S10001884", "SAM-S10001626", "SAM-S3513"]
+        night: ["SAM-S10004580", "SAM-S10001417", "SAM-S10001052", "SAM-S10001884", "SAM-S5590"]
+      spring:
+        pre_dawn: ["SAM-S9815", "SAM-S03880", "SAM-S0330"]
+        midday: ["SAM-S100930", "SAM-S10001986", "SAM-S10003233", "SAM-S10003235"]
+        evening: ["SAM-S0334", "SAM-S2701", "SAM-S10003880"]
+        night: ["SAM-S10001417", "SAM-S10001052"]
+      summer:
+        pre_dawn: ["SAM-S9815", "SAM-S0330", "SAM-S10003880"]
+        midday: ["SAM-S9943", "SAM-S100921", "SAM-S100930", "SAM-S9948", "SAM-S10002571", "SAM-S10001302", "SAM-S03233"]
+        evening: ["SAM-S2663", "SAM-S5654", "SAM-S02323", "SAM-S0334", "SAM-S10002882", "SAM-S2701"]
+        night: ["SAM-S10001417", "SAM-S10001052"]
+      autumn:
+        pre_dawn: ["SAM-S9815", "SAM-S0330", "SAM-S10003541"]
+        midday: ["SAM-S10001712", "SAM-S10001075", "SAM-S5216", "SAM-S5219", "SAM-S100000205", "SAM-S10000902", "SAM-S10000930", "SAM-S10001331", "SAM-S10003039", "SAM-S10002549", "SAM-S10004126", "SAM-S10004274", "SAM-S10000941"]
+        evening: ["SAM-S2701", "SAM-S10002882", "SAM-S2663", "SAM-S10003691", "SAM-S0330", "SAM-S10003541", "SAM-S10001387", "SAM-S10004198"]
+        night: ["SAM-S10001417", "SAM-S10001052"]
   inbox_dir: "/media/frame_ai/inbox"
   filename_prefix: "ai_"
   select_after_upload: true
@@ -29,6 +62,8 @@ schema:
   tv_ip: str
   keep_count: int
   keep_count_local: int
+  pick_samsung_pct: int
+  samsung_pools: dict
   inbox_dir: str
   filename_prefix: str
   select_after_upload: bool
