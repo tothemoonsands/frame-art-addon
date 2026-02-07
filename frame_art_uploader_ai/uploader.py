@@ -27,7 +27,11 @@ PHASE_SALT = {
 UNKNOWN_PHASE = "night"
 
 RUNTIME_OPTIONS: dict[str, Any] = {}
-ADDON_VERSION = "0.2.7"
+ADDON_VERSION = "0.2.8"
+
+HOLIDAY_ALIASES = {
+    "football": "huskers",
+}
 
 
 # ------------------------------------------------------------
@@ -201,7 +205,8 @@ def list_local_images(folder: Path) -> list[Path]:
 def choose_pick_file(payload: dict, state: dict) -> tuple[Optional[Path], str, int, int]:
     phase = str(payload.get("phase", "")).strip().lower()
     season = str(payload.get("season", "")).strip().lower()
-    holiday = str(payload.get("holiday", "none")).strip().lower()
+    holiday_raw = str(payload.get("holiday", "none")).strip().lower()
+    holiday = HOLIDAY_ALIASES.get(holiday_raw, holiday_raw)
 
     try:
         rng = int(payload.get("rng", 0))
@@ -265,7 +270,8 @@ def choose_pick_samsung_id(payload: dict, rng: int, phase: str) -> Optional[str]
     ambient_pool = samsung_pools.get("ambient") if isinstance(samsung_pools.get("ambient"), dict) else {}
 
     season = str(payload.get("season", "")).strip().lower()
-    holiday = str(payload.get("holiday", "none")).strip().lower()
+    holiday_raw = str(payload.get("holiday", "none")).strip().lower()
+    holiday = HOLIDAY_ALIASES.get(holiday_raw, holiday_raw)
 
     pool: list[str] = []
 
