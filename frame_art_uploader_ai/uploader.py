@@ -406,7 +406,7 @@ def clear_restore_request() -> None:
         pass
 
 
-def prepare_for_frame(img_bytes: bytes) -> bytes:
+def prepare_for_frame(img_bytes: bytes) -> tuple[bytes, str]:
     im = Image.open(BytesIO(img_bytes))
 
     if im.mode not in {"RGB", "RGBA", "L"}:
@@ -428,8 +428,16 @@ def prepare_for_frame(img_bytes: bytes) -> bytes:
     im = im.resize((3840, 2160), Image.Resampling.LANCZOS)
 
     out = BytesIO()
-    im.save(out, format="PNG", optimize=True)
-    return out.getvalue()
+    im.save(out, format="PNG", optimize=True, compress_level=9)
+    png_bytes = out.getvalue()
+    if len(png_bytes) <= 4_500_000:
+        return png_bytes, "PNG"
+
+    if im.mode != "RGB":
+        im = im.convert("RGB")
+    out = BytesIO()
+    im.save(out, format="JPEG", quality=92, optimize=True, progressive=True)
+    return out.getvalue(), "JPEG"
 
 
 def resolve_local_path(value: str) -> Optional[Path]:
@@ -461,8 +469,8 @@ def pick_cover_fallback(cache_key: str) -> Optional[Path]:
 
 def upload_local_file(art: Any, file_path: Path) -> Optional[str]:
     raw_bytes = file_path.read_bytes()
-    processed_bytes = prepare_for_frame(raw_bytes)
-    art.upload(processed_bytes, file_type="PNG", matte="none")
+    processed_bytes, file_type = prepare_for_frame(raw_bytes)
+    art.upload(processed_bytes, file_type=file_type, matte="none")
     available = art.available()
     myf = extract_myf_ids(available)
     return myf[-1][1] if myf else None
@@ -573,6 +581,8 @@ def main() -> None:
             chosen_index = -1
             selected_name = None
             pick_source = None
+            encoded_type = None
+            encoded_bytes = None
             rng = None
             phase_roll = None
             bucket = None
@@ -648,7 +658,9 @@ def main() -> None:
 
                 cache_key = normalize_key(collection_id, artist, album)
                 src_path = SOURCE_DIR / f"{cache_key}.jpg"
-                wide_path = WIDESCREEN_DIR / f"{cache_key}.png"
+                wide_png_path = WIDESCREEN_DIR / f"{cache_key}.png"
+                wide_jpg_path = WIDESCREEN_DIR / f"{cache_key}.jpg"
+                wide_path = wide_png_path if wide_png_path.exists() else wide_jpg_path
 
                 resolved_folder = str(WIDESCREEN_DIR)
                 selected_name = wide_path.name
@@ -656,6 +668,8 @@ def main() -> None:
                 chosen_index = 0
 
                 if wide_path.exists():
+                    encoded_type = guess_file_type(wide_path)
+                    encoded_bytes = wide_path.stat().st_size
                     art, target_cid = upload_local_file_with_reconnect(tv_ip, art, wide_path)
                     if not target_cid:
                         raise ValueError("Cached widescreen upload succeeded but content_id was not found")
@@ -695,7 +709,11 @@ def main() -> None:
                             openai_model=openai_model,
                             timeout_s=90,
                         )
-                        processed_bytes = prepare_for_frame(outpaint_bytes)
+                        processed_bytes, file_type = prepare_for_frame(outpaint_bytes)
+                        encoded_type = file_type
+                        encoded_bytes = len(processed_bytes)
+                        wide_path = wide_png_path if file_type == "PNG" else wide_jpg_path
+                        selected_name = wide_path.name
                         wide_path.write_bytes(processed_bytes)
 
                         art, target_cid = upload_local_file_with_reconnect(tv_ip, art, wide_path)
@@ -795,6 +813,8 @@ def main() -> None:
                     "source_path": str(locals().get("src_path")) if "src_path" in locals() else None,
                     "widescreen_path": str(locals().get("wide_path")) if "wide_path" in locals() else None,
                     "fallback_path": str(locals().get("fallback_path")) if "fallback_path" in locals() and locals().get("fallback_path") else None,
+                    "encoded_type": encoded_type if kind == "cover_art_outpaint" else None,
+                    "encoded_bytes": encoded_bytes if kind == "cover_art_outpaint" else None,
                 }
             )
 
@@ -840,9 +860,9 @@ def main() -> None:
 
     raw_bytes = img_path.read_bytes()
     original_type = guess_file_type(img_path)
-    processed_bytes = prepare_for_frame(raw_bytes)
+    processed_bytes, file_type = prepare_for_frame(raw_bytes)
 
-    art.upload(processed_bytes, file_type="PNG", matte="none")
+    art.upload(processed_bytes, file_type=file_type, matte="none")
 
     available = art.available()
     myf = extract_myf_ids(available)
@@ -865,7 +885,7 @@ def main() -> None:
             "tv_ip": tv_ip,
             "uploaded_file": str(img_path),
             "original_file_type": original_type,
-            "uploaded_file_type": "PNG",
+            "uploaded_file_type": file_type,
             "selected_content_id": newest,
             "keep_count": keep_count,
             "myf_count": len(myf),
