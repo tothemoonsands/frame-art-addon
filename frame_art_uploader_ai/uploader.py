@@ -12,6 +12,7 @@ from samsungtvws import SamsungTVWS
 from cover_art import (
     SOURCE_DIR,
     WIDESCREEN_DIR,
+    build_outpaint_canvas_and_mask,
     download_artwork,
     ensure_dirs,
     itunes_lookup,
@@ -703,8 +704,10 @@ def main() -> None:
                         if not src_path.exists():
                             download_artwork(source_url, str(src_path), timeout_s=15)
 
+                        canvas_path, mask_path = build_outpaint_canvas_and_mask(str(src_path))
                         outpaint_bytes = outpaint_mode_b(
-                            str(src_path),
+                            str(canvas_path),
+                            str(mask_path),
                             openai_api_key=openai_api_key,
                             openai_model=openai_model,
                             timeout_s=90,

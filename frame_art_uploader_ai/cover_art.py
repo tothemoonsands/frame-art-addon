@@ -1,11 +1,13 @@
 import hashlib
 import json
 import re
+import tempfile
 from pathlib import Path
 from typing import Any, Optional
 from urllib.parse import quote_plus
 
 import requests
+from PIL import Image
 
 COVER_ART_BASE = Path("/media/frame_ai/cover_art")
 SOURCE_DIR = COVER_ART_BASE / "source"
@@ -14,11 +16,12 @@ WIDESCREEN_DIR = COVER_ART_BASE / "widescreen"
 OUTPAINT_PROMPT = (
     "Outpaint this square album cover into a seamless full-bleed 16:9 image.\n"
     "CRITICAL RULES:\n"
-    "- Preserve the original album cover EXACTLY in the center\n"
-    "- Do NOT alter, redraw, stylize, reinterpret, extend, or regenerate any text\n"
+    "- Do not modify any pixels inside the original center square.\n"
+    "- Do not move, re-render, crop, warp, or alter existing text/logos.\n"
+    "- Do NOT alter, redraw, stylize, reinterpret, extend, or regenerate any text.\n"
     "- Do NOT invent new text, letters, logos, or typography.\n"
-    "- All existing text must remain unchanged and confined to the original square area only.\n"
-    "Outpaint ONLY the left and right areas beyond the original image.\n"
+    "- No new text.\n"
+    "- Only extend background/scene into the left/right areas.\n"
     "Use abstract, photographic, painterly, or atmospheric extensions that match the album’s mood.\n"
     "No borders, no frames, no mats.\n"
     "Gallery-grade, natural continuation."
@@ -113,8 +116,52 @@ def download_artwork(url: str, dest_path: str, timeout_s: int = 15) -> None:
     Path(dest_path).write_bytes(resp.content)
 
 
+def build_outpaint_canvas_and_mask(src_path: str) -> tuple[Path, Path]:
+    """Build a 1536x1024 outpaint canvas and mask for strict center-square protection.
+
+    NOTE: If this outpaint algorithm changes, previously cached widescreen images may need
+    to be deleted so they can be regenerated with the updated masking behavior.
+    """
+    canvas_w, canvas_h = 1536, 1024
+    center_x, center_y = 256, 0
+    center_size = 1024
+    feather_px = 24
+
+    with Image.open(src_path) as src:
+        cover = src.convert("RGB").resize((center_size, center_size), Image.Resampling.LANCZOS)
+        canvas = Image.new("RGB", (canvas_w, canvas_h), (0, 0, 0))
+        canvas.paste(cover, (center_x, center_y))
+
+    mask = Image.new("RGBA", (canvas_w, canvas_h), (255, 255, 255, 0))
+    center_end_x = center_x + center_size
+
+    # Protect center square entirely (opaque alpha means non-editable).
+    for y in range(canvas_h):
+        for x in range(center_x, center_end_x):
+            mask.putpixel((x, y), (255, 255, 255, 255))
+
+    # Feather seam only inside gutters to blend extensions while keeping center protected.
+    for y in range(canvas_h):
+        for i in range(feather_px):
+            alpha = int(round(255 * (i + 1) / (feather_px + 1)))
+            left_x = center_x - 1 - i
+            right_x = center_end_x + i
+            if left_x >= 0:
+                mask.putpixel((left_x, y), (255, 255, 255, alpha))
+            if right_x < canvas_w:
+                mask.putpixel((right_x, y), (255, 255, 255, alpha))
+
+    temp_dir = Path(tempfile.mkdtemp(prefix="frame_art_outpaint_"))
+    canvas_path = temp_dir / "canvas.png"
+    mask_path = temp_dir / "mask.png"
+    canvas.save(canvas_path, format="PNG")
+    mask.save(mask_path, format="PNG")
+    return canvas_path, mask_path
+
+
 def outpaint_mode_b(
     input_image_path: str,
+    input_mask_path: str,
     openai_api_key: str,
     openai_model: str,
     timeout_s: int = 60,
@@ -122,12 +169,16 @@ def outpaint_mode_b(
     if not openai_api_key:
         raise ValueError("Missing OpenAI API key")
     headers = {"Authorization": f"Bearer {openai_api_key}"}
-    with open(input_image_path, "rb") as image_file:
-        files = {"image": (Path(input_image_path).name, image_file, "image/jpeg")}
+    with open(input_image_path, "rb") as image_file, open(input_mask_path, "rb") as mask_file:
+        files = {
+            "image": (Path(input_image_path).name, image_file, "image/png"),
+            "mask": (Path(input_mask_path).name, mask_file, "image/png"),
+        }
         data = {
             "model": openai_model,
             "prompt": OUTPAINT_PROMPT,
             "size": "1536x1024",
+            "response_format": "b64_json",
         }
         response = requests.post(
             "https://api.openai.com/v1/images/edits",
