@@ -12,9 +12,16 @@ SOURCE_DIR = COVER_ART_BASE / "source"
 WIDESCREEN_DIR = COVER_ART_BASE / "widescreen"
 
 OUTPAINT_PROMPT = (
-    "Outpaint this square album cover into seamless full-bleed 16:9. "
-    "Preserve the original cover exactly in the center; extend naturally beyond left/right edges. "
-    "Do not add or modify any text/logos. No borders, no mat. Gallery-grade."
+    "Outpaint this square album cover into a seamless full-bleed 16:9 image.\n\n"
+    "CRITICAL RULES:\n"
+    "- Preserve the original album cover EXACTLY in the center.\n"
+    "- Do NOT alter, redraw, stylize, reinterpret, extend, or regenerate any text.\n"
+    "- Do NOT invent new text, letters, logos, or typography.\n"
+    "- All existing text must remain unchanged and confined to the original square area only.\n\n"
+    "Outpaint ONLY the left and right areas beyond the original image.\n"
+    "Use abstract, photographic, painterly, or atmospheric extensions that match the album’s mood.\n"
+    "No borders, no frames, no mats.\n"
+    "Gallery-grade, natural continuation."
 )
 
 
