@@ -27,7 +27,7 @@ PHASE_SALT = {
 UNKNOWN_PHASE = "night"
 
 RUNTIME_OPTIONS: dict[str, Any] = {}
-ADDON_VERSION = "0.2.5"
+ADDON_VERSION = "0.2.7"
 
 
 # ------------------------------------------------------------

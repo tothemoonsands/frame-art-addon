@@ -1,6 +1,6 @@
 name: Frame Art Uploader AI
 slug: frame_art_uploader_ai
-version: "0.2.6"
+version: "0.2.7"
 description: >
   Upload the newest AI-generated image to Samsung Frame Art Mode,
   enforce true full-bleed display (16:9 crop + 4K upscale),
@@ -33,6 +33,7 @@ options:
       thanksgiving: ["SAM-S10000899", "SAM-S10004342", "SAM-S10004345", "SAM-S10004805", "SAM-S10004344"]
       independence: ["SAM-S10001328"]
       newyear: ["SAM-S10001054", "SAM-S10004755"]
+      easter: []
     ambient:
       winter:
         pre_dawn: ["SAM-S10004505", "SAM-S3513", "SAM-S10004581", "SAM-S10004580"]
@@ -80,6 +81,8 @@ schema:
       independence:
         - str
       newyear:
+        - str
+      easter:
         - str
     ambient:
       winter:
