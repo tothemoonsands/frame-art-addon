@@ -147,14 +147,13 @@ def outpaint_mode_b(
     headers = {"Authorization": f"Bearer {openai_api_key}"}
     with open(input_image_path, "rb") as image_file, open(input_mask_path, "rb") as mask_file:
         files = {
-            "image": (Path(input_image_path).name, image_file, "image/png"),
+            "image[]": (Path(input_image_path).name, image_file, "image/png"),
             "mask": (Path(input_mask_path).name, mask_file, "image/png"),
         }
         data = {
             "model": openai_model,
             "prompt": OUTPAINT_PROMPT,
             "size": "1536x1024",
-            "response_format": "b64_json",
         }
         response = requests.post(
             "https://api.openai.com/v1/images/edits",
@@ -163,7 +162,14 @@ def outpaint_mode_b(
             data=data,
             timeout=timeout_s,
         )
-    response.raise_for_status()
+    try:
+        response.raise_for_status()
+    except requests.HTTPError as e:
+        rid = response.headers.get("x-request-id") or response.headers.get("X-Request-Id")
+        body = (response.text or "")[:800]
+        raise ValueError(
+            f"OpenAI edits failed: {response.status_code} request_id={rid} body={body}"
+        ) from e
     payload = response.json() if response.text else {}
     items = payload.get("data") if isinstance(payload, dict) else None
     if not isinstance(items, list) or not items:
@@ -174,10 +180,4 @@ def outpaint_mode_b(
         import base64
 
         return base64.b64decode(b64_json)
-
-    url = str(first.get("url", "")).strip()
-    if not url:
-        raise ValueError("OpenAI response missing image payload")
-    img_resp = requests.get(url, timeout=timeout_s)
-    img_resp.raise_for_status()
-    return img_resp.content
+    raise ValueError(f"OpenAI response missing b64_json: {json.dumps(payload)[:300]}")
