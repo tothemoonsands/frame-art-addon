@@ -468,6 +468,28 @@ def upload_local_file(art: Any, file_path: Path) -> Optional[str]:
     return myf[-1][1] if myf else None
 
 
+def is_broken_pipe_error(exc: Exception) -> bool:
+    if isinstance(exc, BrokenPipeError):
+        return True
+    message = repr(exc).lower()
+    return "broken pipe" in message
+
+
+def upload_local_file_with_reconnect(tv_ip: str, art: Any, file_path: Path) -> tuple[Any, Optional[str]]:
+    try:
+        return art, upload_local_file(art, file_path)
+    except Exception as exc:
+        if not is_broken_pipe_error(exc):
+            raise
+
+        log_event("upload_retry", reason=repr(exc), file=str(file_path), action="reconnect_art_socket")
+        retry_tv = SamsungTVWS(tv_ip)
+        retry_art = retry_tv.art()
+        if not retry_art.supported():
+            raise
+        return retry_art, upload_local_file(retry_art, file_path)
+
+
 def cleanup_local_uploads(art: Any, state: dict, keep_count_local: int) -> tuple[list[str], Optional[str]]:
     return cleanup_frame_uploads(art, state, "local_uploaded_ids", keep_count_local)
 
@@ -569,7 +591,7 @@ def main() -> None:
                     raise ValueError(
                         f"Invalid restore request: local_file must be an existing jpg/png under /media/frame_ai (kind={kind}, value={request_value!r}, resolved_folder={resolved_folder})"
                     )
-                target_cid = upload_local_file(art, local_path)
+                art, target_cid = upload_local_file_with_reconnect(tv_ip, art, local_path)
                 if not target_cid:
                     raise ValueError(
                         f"Upload completed but content_id was not discovered (kind={kind}, value={request_value!r}, resolved_folder={local_path.parent})"
@@ -601,7 +623,7 @@ def main() -> None:
                         raise ValueError(
                             f"No candidate files found for pick request (kind={kind}, value={request_value!r}, resolved_folder={resolved_folder})"
                         )
-                    target_cid = upload_local_file(art, pick_file)
+                    art, target_cid = upload_local_file_with_reconnect(tv_ip, art, pick_file)
                     if not target_cid:
                         raise ValueError(
                             f"Upload completed but content_id was not discovered (kind={kind}, value={request_value!r}, resolved_folder={resolved_folder})"
@@ -634,7 +656,7 @@ def main() -> None:
                 chosen_index = 0
 
                 if wide_path.exists():
-                    target_cid = upload_local_file(art, wide_path)
+                    art, target_cid = upload_local_file_with_reconnect(tv_ip, art, wide_path)
                     if not target_cid:
                         raise ValueError("Cached widescreen upload succeeded but content_id was not found")
                     append_uploaded_id(state, "cover_uploaded_ids", target_cid)
@@ -676,7 +698,7 @@ def main() -> None:
                         processed_bytes = prepare_for_frame(outpaint_bytes)
                         wide_path.write_bytes(processed_bytes)
 
-                        target_cid = upload_local_file(art, wide_path)
+                        art, target_cid = upload_local_file_with_reconnect(tv_ip, art, wide_path)
                         if not target_cid:
                             raise ValueError("Outpaint upload succeeded but content_id was not found")
                         append_uploaded_id(state, "cover_uploaded_ids", target_cid)
@@ -687,7 +709,7 @@ def main() -> None:
                         fallback_path = pick_cover_fallback(cache_key)
                         if fallback_path is None:
                             raise cover_error
-                        target_cid = upload_local_file(art, fallback_path)
+                        art, target_cid = upload_local_file_with_reconnect(tv_ip, art, fallback_path)
                         if not target_cid:
                             raise ValueError("Fallback upload completed but content_id was not discovered")
                         append_uploaded_id(state, "cover_uploaded_ids", target_cid)
