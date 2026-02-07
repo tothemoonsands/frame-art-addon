@@ -59,6 +59,8 @@ options:
   inbox_dir: "/media/frame_ai/inbox"
   filename_prefix: "ai_"
   select_after_upload: true
+  openai_api_key: ""
+  openai_model: "gpt-image-1"
 
 schema:
   tv_ip: str
@@ -127,3 +129,5 @@ schema:
   inbox_dir: str
   filename_prefix: str
   select_after_upload: bool
+  openai_api_key: str
+  openai_model: str

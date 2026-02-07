@@ -18,10 +18,12 @@ RUN apk add --no-cache \
 RUN python3 -m pip install --no-cache-dir --break-system-packages --upgrade pip setuptools wheel
 
 RUN python3 -m pip install --no-cache-dir --break-system-packages \
+  requests \
   "samsungtvws[async] @ git+https://github.com/NickWaterton/samsung-tv-ws-api.git"
 
 COPY run.sh /app/run.sh
 COPY uploader.py /app/uploader.py
+COPY cover_art.py /app/cover_art.py
 
 RUN chmod +x /app/run.sh
 
