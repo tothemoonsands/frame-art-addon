@@ -14,17 +14,10 @@ SOURCE_DIR = COVER_ART_BASE / "source"
 WIDESCREEN_DIR = COVER_ART_BASE / "widescreen"
 
 OUTPAINT_PROMPT = (
-    "Outpaint this square album cover into a seamless full-bleed 16:9 image.\n"
-    "CRITICAL RULES:\n"
-    "- Do not modify any pixels inside the original center square.\n"
-    "- Do not move, re-render, crop, warp, or alter existing text/logos.\n"
-    "- Do NOT alter, redraw, stylize, reinterpret, extend, or regenerate any text.\n"
-    "- Do NOT invent new text, letters, logos, or typography.\n"
-    "- No new text.\n"
-    "- Only extend background/scene into the left/right areas.\n"
-    "Use abstract, photographic, painterly, or atmospheric extensions that match the album’s mood.\n"
-    "No borders, no frames, no mats.\n"
-    "Gallery-grade, natural continuation."
+    "Remove ALL text, typography, logos, label marks, and signatures from the entire image. "
+    "Do not add any new text. Reconstruct removed areas as coherent artwork matching the existing style. "
+    "Then outpaint the image into seamless full-bleed 16:9 by extending naturally beyond the left/right edges. "
+    "No borders, no mat, no frames, no captions."
 )
 
 
@@ -117,7 +110,7 @@ def download_artwork(url: str, dest_path: str, timeout_s: int = 15) -> None:
 
 
 def build_outpaint_canvas_and_mask(src_path: str) -> tuple[Path, Path]:
-    """Build a 1536x1024 outpaint canvas and mask for strict center-square protection.
+    """Build a 1536x1024 outpaint canvas and mask that allows text-band repainting.
 
     NOTE: If this outpaint algorithm changes, previously cached widescreen images may need
     to be deleted so they can be regenerated with the updated masking behavior.
@@ -125,31 +118,42 @@ def build_outpaint_canvas_and_mask(src_path: str) -> tuple[Path, Path]:
     canvas_w, canvas_h = 1536, 1024
     center_x, center_y = 256, 0
     center_size = 1024
-    feather_px = 24
+    top_text_band = int(round(center_size * 0.22))
+    bottom_text_band = int(round(center_size * 0.18))
+    edge_margin = int(round(center_size * 0.05))
 
     with Image.open(src_path) as src:
         cover = src.convert("RGB").resize((center_size, center_size), Image.Resampling.LANCZOS)
         canvas = Image.new("RGB", (canvas_w, canvas_h), (0, 0, 0))
         canvas.paste(cover, (center_x, center_y))
 
-    mask = Image.new("RGBA", (canvas_w, canvas_h), (255, 255, 255, 0))
+    mask = Image.new("L", (canvas_w, canvas_h), 0)
     center_end_x = center_x + center_size
 
-    # Protect center square entirely (opaque alpha means non-editable).
+    # Outpaint gutters are fully editable.
     for y in range(canvas_h):
-        for x in range(center_x, center_end_x):
-            mask.putpixel((x, y), (255, 255, 255, 255))
+        for x in range(0, center_x):
+            mask.putpixel((x, y), 255)
+        for x in range(center_end_x, canvas_w):
+            mask.putpixel((x, y), 255)
 
-    # Feather seam only inside gutters to blend extensions while keeping center protected.
-    for y in range(canvas_h):
-        for i in range(feather_px):
-            alpha = int(round(255 * (i + 1) / (feather_px + 1)))
-            left_x = center_x - 1 - i
-            right_x = center_end_x + i
-            if left_x >= 0:
-                mask.putpixel((left_x, y), (255, 255, 255, alpha))
-            if right_x < canvas_w:
-                mask.putpixel((right_x, y), (255, 255, 255, alpha))
+    # Top/bottom bands inside the original square are editable to remove album text.
+    for y in range(0, top_text_band):
+        for x in range(center_x, center_end_x):
+            mask.putpixel((x, y), 255)
+    for y in range(center_size - bottom_text_band, center_size):
+        for x in range(center_x, center_end_x):
+            mask.putpixel((x, y), 255)
+
+    # Small edge margin around the square helps catch edge typography and logos.
+    for y in range(0, center_size):
+        for i in range(edge_margin):
+            left_x = center_x + i
+            right_x = center_end_x - 1 - i
+            if left_x < center_end_x:
+                mask.putpixel((left_x, y), 255)
+            if right_x >= center_x:
+                mask.putpixel((right_x, y), 255)
 
     temp_dir = Path(tempfile.mkdtemp(prefix="frame_art_outpaint_"))
     canvas_path = temp_dir / "canvas.png"
