@@ -27,6 +27,7 @@ PHASE_SALT = {
 UNKNOWN_PHASE = "night"
 
 RUNTIME_OPTIONS: dict[str, Any] = {}
+ADDON_VERSION = "0.2.5"
 
 
 # ------------------------------------------------------------
@@ -239,9 +240,22 @@ def compute_phase_roll(payload: dict) -> tuple[int, int, str]:
     return rng, phase_roll, phase
 
 
-def should_pick_samsung_phase(phase_roll: int, pick_samsung_pct: int) -> bool:
-    pct = max(0, min(100, int(pick_samsung_pct)))
-    return phase_roll < pct
+def should_pick_samsung_bucket(rng: int, pick_samsung_pct: int) -> tuple[bool, int, int]:
+    bucket = abs(int(rng)) % 10
+    pct = int(pick_samsung_pct)
+
+    if pct >= 100:
+        samsung_buckets = 10
+        return True, bucket, samsung_buckets
+
+    if pct <= 0:
+        samsung_buckets = 0
+        return False, bucket, samsung_buckets
+
+    samsung_buckets = pct // 10
+    samsung_buckets = max(0, min(10, samsung_buckets))
+    prefer_samsung = bucket < samsung_buckets
+    return prefer_samsung, bucket, samsung_buckets
 
 
 def choose_pick_samsung_id(payload: dict, rng: int, phase: str) -> Optional[str]:
@@ -472,6 +486,8 @@ def main() -> None:
             pick_source = None
             rng = None
             phase_roll = None
+            bucket = None
+            samsung_buckets = None
 
             if kind == "content_id":
                 target_cid = request_value
@@ -499,7 +515,7 @@ def main() -> None:
                 selected_name = local_path.name
             elif kind == "pick":
                 rng, phase_roll, phase = compute_phase_roll(restore_payload)
-                prefer_samsung = should_pick_samsung_phase(phase_roll, pick_samsung_pct)
+                prefer_samsung, bucket, samsung_buckets = should_pick_samsung_bucket(rng, pick_samsung_pct)
 
                 if prefer_samsung:
                     target_cid = choose_pick_samsung_id(restore_payload, rng, phase)
@@ -566,6 +582,8 @@ def main() -> None:
                 pick_source=pick_source,
                 rng=rng,
                 phase_roll=phase_roll,
+                bucket=bucket,
+                samsung_buckets=samsung_buckets,
                 pick_samsung_pct=pick_samsung_pct,
                 cleanup_deletions=len(deleted_local),
                 cleanup_error=cleanup_error,
@@ -586,7 +604,10 @@ def main() -> None:
                     "pick_source": pick_source,
                     "rng": rng,
                     "phase_roll": phase_roll,
+                    "bucket": bucket,
+                    "samsung_buckets": samsung_buckets,
                     "pick_samsung_pct": pick_samsung_pct,
+                    "addon_version": ADDON_VERSION,
                     "selected_content_id": target_cid,
                     "chosen": selected_name or target_cid,
                     "deleted_local": deleted_local,
