@@ -430,7 +430,11 @@ def main() -> None:
     tv_ip = str(opts.get("tv_ip", "")).strip()
     keep_count = int(opts.get("keep_count", 20))
     keep_count_local = int(opts.get("keep_count_local", 30))
-    pick_samsung_pct = int(opts.get("pick_samsung_pct", 60))
+    try:
+        pick_samsung_pct = int(opts.get("pick_samsung_pct", 60))
+    except Exception:
+        pick_samsung_pct = 60
+    pick_samsung_pct = max(0, min(100, pick_samsung_pct))
     inbox_dir = str(opts.get("inbox_dir", "/media/frame_ai/inbox"))
     prefix = str(opts.get("filename_prefix", "ai_"))
     select_after = bool(opts.get("select_after_upload", True))
