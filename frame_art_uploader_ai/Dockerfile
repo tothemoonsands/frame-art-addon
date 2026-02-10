@@ -19,6 +19,7 @@ RUN python3 -m pip install --no-cache-dir --break-system-packages --upgrade pip 
 
 RUN python3 -m pip install --no-cache-dir --break-system-packages \
   requests \
+  rapidfuzz \
   "samsungtvws[async] @ git+https://github.com/NickWaterton/samsung-tv-ws-api.git"
 
 COPY run.sh /app/run.sh
