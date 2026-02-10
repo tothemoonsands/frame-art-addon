@@ -344,7 +344,9 @@ class MusicAssociationLookupTests(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.root = Path(self.tmp.name)
         self.assoc = self.root / "music_associations.json"
+        self.catalog = self.root / "music_catalog.json"
         uploader.MUSIC_ASSOCIATIONS_PATH = self.assoc
+        uploader.MUSIC_CATALOG_PATH = self.catalog
 
     def tearDown(self) -> None:
         self.tmp.cleanup()
@@ -393,6 +395,58 @@ class MusicAssociationLookupTests(unittest.TestCase):
         )
         self.assertIsInstance(matched, dict)
         self.assertEqual("legacy__3840x2160.jpg", matched.get("catalog_key"))
+
+    def test_fuzzy_lookup_from_association_record(self):
+        uploader.update_music_association(
+            {
+                "artist": "Milt Jackson",
+                "album": "Sunflower (40th Anniversary Edition)",
+                "key_source": "sonos",
+            },
+            cache_key="sunflower_k1",
+            catalog_key="aa_milt-jackson-sunflower-40th-anniversary-edition_8d74a5e9__3840x2160.jpg",
+            content_id="MY_F1001",
+        )
+
+        matched = uploader.lookup_music_association(
+            {
+                "artist": "Milt Jackson",
+                "album": "Sunflower 40th Anniversary",
+            }
+        )
+
+        self.assertIsInstance(matched, dict)
+        self.assertEqual("MY_F1001", matched.get("content_id"))
+        self.assertEqual("association_fuzzy", matched.get("match_source"))
+
+    def test_fuzzy_lookup_from_catalog_filename(self):
+        uploader.atomic_write_json(
+            self.catalog,
+            {
+                "version": 1,
+                "updated_at": "",
+                "entries": {
+                    "aa_milt-jackson-sunflower-40th-anniversary-edition_8d74a5e9__3840x2160.jpg": {
+                        "content_id": "MY_F2002",
+                        "updated_at": "",
+                    }
+                },
+            },
+        )
+
+        matched = uploader.lookup_music_association(
+            {
+                "artist": "Milt Jackson",
+                "album": "Sunflower 40th Anniversary Edition",
+            }
+        )
+
+        self.assertIsInstance(matched, dict)
+        self.assertEqual(
+            "aa_milt-jackson-sunflower-40th-anniversary-edition_8d74a5e9__3840x2160.jpg",
+            matched.get("catalog_key"),
+        )
+        self.assertEqual("catalog_filename_fuzzy", matched.get("match_source"))
 
 
 if __name__ == "__main__":
