@@ -4,6 +4,7 @@ import hashlib
 import json
 import re
 import tempfile
+from io import BytesIO
 from pathlib import Path
 from typing import Any, Optional
 from urllib.parse import quote_plus
@@ -21,6 +22,15 @@ REFERENCE_BACKGROUND_PROMPT = (
     "and cohesive for a TV backdrop. Do not include any text, logos, labels, signatures, "
     "watermarks, faces, or copyrighted characters. Do not recreate the exact album cover composition."
 )
+
+HA_EDIT_WIDTH = 1536
+HA_EDIT_HEIGHT = 1024
+HA_EDIT_PASTE_X = 256
+HA_EDIT_PASTE_Y = 0
+HA_EDIT_SIZE = f"{HA_EDIT_WIDTH}x{HA_EDIT_HEIGHT}"
+
+FRAME_FINAL_WIDTH = 3840
+FRAME_FINAL_HEIGHT = 2160
 
 _slug_re = re.compile(r"[^a-z0-9]+")
 ALLOWED_EXTENSIONS = {".jpg", ".jpeg", ".png"}
@@ -111,18 +121,23 @@ def download_artwork(url: str, dest_path: str, timeout_s: int = 15) -> None:
     Path(dest_path).write_bytes(resp.content)
 
 
-def build_reference_canvas(src_path: str) -> Path:
-    canvas_w, canvas_h = 1536, 1024
-    center_x, center_y = 256, 0
-
+def build_reference_canvas_from_album(src_path: str) -> bytes:
     with Image.open(src_path) as src:
         cover = src.convert("RGB").resize((1024, 1024), Image.Resampling.LANCZOS)
-        canvas = Image.new("RGB", (canvas_w, canvas_h), (0, 0, 0))
-        canvas.paste(cover, (center_x, center_y))
+        canvas = Image.new("RGB", (HA_EDIT_WIDTH, HA_EDIT_HEIGHT), (0, 0, 0))
+        canvas.paste(cover, (HA_EDIT_PASTE_X, HA_EDIT_PASTE_Y))
+
+    out = BytesIO()
+    canvas.save(out, format="PNG")
+    return out.getvalue()
+
+
+def build_reference_canvas(src_path: str) -> Path:
+    canvas_bytes = build_reference_canvas_from_album(src_path)
 
     temp_dir = Path(tempfile.mkdtemp(prefix="frame_art_reference_"))
     canvas_path = temp_dir / "reference_canvas.png"
-    canvas.save(canvas_path, format="PNG")
+    canvas_path.write_bytes(canvas_bytes)
     return canvas_path
 
 
@@ -132,10 +147,23 @@ def build_outpaint_canvas_and_mask(src_path: str) -> tuple[Path, Path]:
     return canvas_path, canvas_path
 
 
-def generate_reference_background(
-    input_image_path: str,
+def _validate_openai_multipart_payload(
+    files: list[tuple[str, tuple[str, Any, str]]],
+    data: dict[str, Any],
+) -> None:
+    keys = [key for key, _ in files]
+    if keys != ["image[]"]:
+        raise ValueError(f"OpenAI edits must use only multipart key ['image[]']; got {keys}")
+    forbidden = {"image", "image[]"} & set(data.keys())
+    if forbidden:
+        raise ValueError(f"OpenAI edits form data must not include image fields: {sorted(forbidden)}")
+
+
+def _request_openai_reference_background_once(
+    input_canvas_png: bytes,
     openai_api_key: str,
     openai_model: str,
+    prompt: str,
     seed: Optional[int] = None,
     timeout_s: int = 60,
 ) -> tuple[bytes, Optional[str], Optional[str]]:
@@ -143,26 +171,23 @@ def generate_reference_background(
         raise ValueError("Missing OpenAI API key")
 
     headers = {"Authorization": f"Bearer {openai_api_key}"}
-    with open(input_image_path, "rb") as image_file:
-        # gpt-image-1 edits uses multipart key `image[]` for reference images.
-        # Using the legacy `image` field can route requests through old edit
-        # validation paths that report misleading mask-format errors.
-        files = [("image[]", (Path(input_image_path).name, image_file, "image/png"))]
-        data: dict[str, Any] = {
-            "model": openai_model,
-            "prompt": REFERENCE_BACKGROUND_PROMPT,
-            "size": "1536x1024",
-        }
-        if seed is not None:
-            data["seed"] = str(seed)
+    files = [("image[]", ("input.png", BytesIO(input_canvas_png), "image/png"))]
+    data: dict[str, Any] = {
+        "model": openai_model,
+        "prompt": prompt,
+        "size": HA_EDIT_SIZE,
+    }
+    if seed is not None:
+        data["seed"] = str(seed)
+    _validate_openai_multipart_payload(files, data)
 
-        response = requests.post(
-            "https://api.openai.com/v1/images/edits",
-            headers=headers,
-            files=files,
-            data=data,
-            timeout=timeout_s,
-        )
+    response = requests.post(
+        "https://api.openai.com/v1/images/edits",
+        headers=headers,
+        files=files,
+        data=data,
+        timeout=timeout_s,
+    )
 
     request_id = response.headers.get("x-request-id") or response.headers.get("X-Request-Id")
     try:
@@ -190,6 +215,39 @@ def generate_reference_background(
     return base64.b64decode(b64_json), request_id, model_used if isinstance(model_used, str) else None
 
 
+def _request_openai_reference_background(
+    input_canvas_png: bytes,
+    openai_api_key: str,
+    openai_model: str,
+    seed: Optional[int] = None,
+    timeout_s: int = 60,
+) -> tuple[bytes, Optional[str], Optional[str]]:
+    return _request_openai_reference_background_once(
+        input_canvas_png=input_canvas_png,
+        openai_api_key=openai_api_key,
+        openai_model=openai_model,
+        prompt=REFERENCE_BACKGROUND_PROMPT,
+        seed=seed,
+        timeout_s=timeout_s,
+    )
+
+
+def generate_reference_background(
+    input_image_path: str,
+    openai_api_key: str,
+    openai_model: str,
+    seed: Optional[int] = None,
+    timeout_s: int = 60,
+) -> tuple[bytes, Optional[str], Optional[str]]:
+    return _request_openai_reference_background(
+        input_canvas_png=Path(input_image_path).read_bytes(),
+        openai_api_key=openai_api_key,
+        openai_model=openai_model,
+        seed=seed,
+        timeout_s=timeout_s,
+    )
+
+
 def outpaint_mode_b(
     input_image_path: str,
     input_mask_path: str,
@@ -208,20 +266,20 @@ def outpaint_mode_b(
 
 
 def convert_generated_to_background(generated_bytes: bytes) -> Image.Image:
-    from io import BytesIO
-
     with Image.open(BytesIO(generated_bytes)) as generated:
         im = generated.convert("RGB")
-    if im.size != (1536, 1024):
-        raise ValueError(f"Generated image size must be 1536x1024; got {im.size[0]}x{im.size[1]}")
+    if im.size != (HA_EDIT_WIDTH, HA_EDIT_HEIGHT):
+        raise ValueError(
+            f"Generated image size must be {HA_EDIT_WIDTH}x{HA_EDIT_HEIGHT}; got {im.size[0]}x{im.size[1]}"
+        )
 
-    target_w = 3840
+    target_w = FRAME_FINAL_WIDTH
     upscale_h = int(round(im.height * (target_w / im.width)))
     im = im.resize((target_w, upscale_h), Image.Resampling.LANCZOS)
-    if upscale_h < 2160:
+    if upscale_h < FRAME_FINAL_HEIGHT:
         raise ValueError(f"Upscaled image height too small for center-crop: {upscale_h}")
-    top = (upscale_h - 2160) // 2
-    return im.crop((0, top, 3840, top + 2160))
+    top = (upscale_h - FRAME_FINAL_HEIGHT) // 2
+    return im.crop((0, top, FRAME_FINAL_WIDTH, top + FRAME_FINAL_HEIGHT))
 
 
 def composite_album(
@@ -229,24 +287,26 @@ def composite_album(
     source_album_path: Path,
     album_shadow: bool = True,
 ) -> Image.Image:
-    if background.size != (3840, 2160):
-        raise ValueError(f"Background must be 3840x2160; got {background.size[0]}x{background.size[1]}")
+    if background.size != (FRAME_FINAL_WIDTH, FRAME_FINAL_HEIGHT):
+        raise ValueError(
+            f"Background must be {FRAME_FINAL_WIDTH}x{FRAME_FINAL_HEIGHT}; got {background.size[0]}x{background.size[1]}"
+        )
 
-    x = (3840 - 1536) // 2
-    y = (2160 - 1536) // 2
+    x = (FRAME_FINAL_WIDTH - 1536) // 2
+    y = (FRAME_FINAL_HEIGHT - 1536) // 2
     with Image.open(source_album_path) as src:
         album = src.convert("RGBA").resize((1536, 1536), Image.Resampling.LANCZOS)
 
     final = background.convert("RGBA")
 
     if album_shadow:
-        shadow_layer = Image.new("RGBA", (3840, 2160), (0, 0, 0, 0))
+        shadow_layer = Image.new("RGBA", (FRAME_FINAL_WIDTH, FRAME_FINAL_HEIGHT), (0, 0, 0, 0))
         shadow_rect = Image.new("RGBA", (1536, 1536), (0, 0, 0, 88))
         shadow_layer.paste(shadow_rect, (x + 0, y + 16), shadow_rect)
         shadow_layer = shadow_layer.filter(ImageFilter.GaussianBlur(radius=26))
         final = Image.alpha_composite(final, shadow_layer)
 
-    album_layer = Image.new("RGBA", (3840, 2160), (0, 0, 0, 0))
+    album_layer = Image.new("RGBA", (FRAME_FINAL_WIDTH, FRAME_FINAL_HEIGHT), (0, 0, 0, 0))
     album_layer.paste(album, (x, y), album)
     final = Image.alpha_composite(final, album_layer)
     return final.convert("RGB")
@@ -297,9 +357,9 @@ def process_source_file(
     }
 
     try:
-        reference_canvas = build_reference_canvas(str(source_path))
-        generated_bytes, request_id, model_used = generate_reference_background(
-            str(reference_canvas),
+        reference_canvas_png = build_reference_canvas_from_album(str(source_path))
+        generated_bytes, request_id, model_used = _request_openai_reference_background(
+            input_canvas_png=reference_canvas_png,
             openai_api_key=api_key,
             openai_model=model,
             seed=seed,
@@ -318,7 +378,7 @@ def process_source_file(
         result["output_bytes"] = output_path.stat().st_size
 
         with Image.open(output_path) as out_im:
-            if out_im.size != (3840, 2160):
+            if out_im.size != (FRAME_FINAL_WIDTH, FRAME_FINAL_HEIGHT):
                 raise ValueError(f"Final output dimensions invalid: {out_im.size}")
 
         if save_background_layer and not background_path.exists():
