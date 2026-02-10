@@ -45,6 +45,10 @@ AMBIENT_CATALOG_PATH = Path("/share/frame_art_ambient_catalog.json")
 MUSIC_CATALOG_PATH = Path("/share/frame_art_music_catalog.json")
 MUSIC_ASSOCIATIONS_PATH = Path("/share/frame_art_music_associations.json")
 MUSIC_ERRORS_PATH = Path("/share/frame_art_music_errors.json")
+MUSIC_INDEX_PATHS = [
+    Path("/media/frame_ai/music/index.json"),
+    Path("/root/media/frame_ai/music/index.json"),
+]
 
 MYF_RE = re.compile(r"^MY[_-]F(\d+)", re.IGNORECASE)
 ALLOWED_EXTENSIONS = {".jpg", ".jpeg", ".png"}
@@ -594,12 +598,94 @@ def parse_music_catalog_slug(catalog_key: str) -> str:
     filename = Path(key).name
     stem = filename.rsplit(".", 1)[0]
     stem = re.sub(r"__\d+x\d+(?:__background)?$", "", stem)
+    if stem.isdigit():
+        return ""
     m = re.match(r"^aa_(.+)_[0-9a-f]{8}$", stem)
     if m:
         return m.group(1).replace("-", " ")
     if stem.startswith("itc_"):
         return ""
     return stem.replace("-", " ")
+
+
+def load_music_index_entries() -> dict[str, Any]:
+    for path in MUSIC_INDEX_PATHS:
+        if not path.exists():
+            continue
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        if not isinstance(payload, dict):
+            continue
+        entries = payload.get("entries")
+        if isinstance(entries, dict):
+            return entries
+    return {}
+
+
+def music_text_key(artist: str, album: str) -> str:
+    artist_norm = normalize_music_text(artist)
+    album_norm = normalize_music_text(album)
+    if artist_norm and album_norm:
+        return f"{artist_norm} — {album_norm}"
+    return artist_norm or album_norm
+
+
+def music_index_entry_key(*, collection_id: Optional[int], catalog_key: str, cache_key: str) -> str:
+    if isinstance(collection_id, int):
+        return str(collection_id)
+    stem = Path(catalog_key).name.rsplit(".", 1)[0] if catalog_key else ""
+    stem = re.sub(r"__\d+x\d+(?:__background)?$", "", stem)
+    return stem or cache_key
+
+
+def select_music_index_write_path() -> Path:
+    for path in MUSIC_INDEX_PATHS:
+        parent = path.parent
+        if parent.exists() and parent.is_dir():
+            return path
+    return MUSIC_INDEX_PATHS[0]
+
+
+def update_music_index_entry(
+    *,
+    artist: str,
+    album: str,
+    collection_id: Optional[int],
+    catalog_key: str,
+    cache_key: str,
+    content_id: str,
+    wide_path: Path,
+    compressed_path: Path,
+    request_id: Optional[str],
+) -> None:
+    index_path = select_music_index_write_path()
+    catalog = load_frame_art_catalog(index_path)
+    entries = catalog.setdefault("entries", {})
+    if not isinstance(entries, dict):
+        entries = {}
+        catalog["entries"] = entries
+
+    entry_key = music_index_entry_key(collection_id=collection_id, catalog_key=catalog_key, cache_key=cache_key)
+    if not entry_key:
+        return
+
+    existing = entries.get(entry_key) if isinstance(entries.get(entry_key), dict) else {}
+    text_key = music_text_key(artist, album)
+    payload = dict(existing)
+    if text_key:
+        payload["text_key"] = text_key
+    payload["status"] = "ok"
+    payload["content_id"] = str(content_id or "").strip()
+    payload["prompt_variant"] = "reference_background_nomask"
+    payload["output_path"] = str(wide_path)
+    payload["compressed_output_path"] = str(compressed_path)
+    if request_id:
+        payload["request_id"] = request_id
+    payload["updated_at"] = datetime.now(timezone.utc).isoformat()
+    entries[entry_key] = payload
+    persist_frame_art_catalog(index_path, catalog)
 
 
 def lookup_music_association_fuzzy(restore_payload: dict[str, Any]) -> Optional[dict[str, Any]]:
@@ -652,23 +738,51 @@ def lookup_music_association_fuzzy(restore_payload: dict[str, Any]) -> Optional[
 
     music_catalog = load_frame_art_catalog(MUSIC_CATALOG_PATH)
     catalog_entries = music_catalog.get("entries") if isinstance(music_catalog.get("entries"), dict) else {}
+    index_entries = load_music_index_entries()
+    text_key_by_catalog_name: dict[str, str] = {}
+    if isinstance(index_entries, dict):
+        for collection_id, index_item in index_entries.items():
+            if not isinstance(index_item, dict):
+                continue
+            text_key = str(index_item.get("text_key", "")).strip()
+            if not text_key:
+                continue
+            if isinstance(collection_id, str) and collection_id.strip():
+                cid = collection_id.strip()
+                text_key_by_catalog_name[f"{cid}__3840x2160.jpg"] = text_key
+                text_key_by_catalog_name[f"{cid}__3840x2160.png"] = text_key
+            compressed_path = str(index_item.get("compressed_output_path", "")).strip()
+            if compressed_path:
+                text_key_by_catalog_name[Path(compressed_path).name] = text_key
+            output_path = str(index_item.get("output_path", "")).strip()
+            if output_path:
+                text_key_by_catalog_name[Path(output_path).name] = text_key
+
     if isinstance(catalog_entries, dict):
         for catalog_key, entry in catalog_entries.items():
             if not isinstance(catalog_key, str):
                 continue
+            filename = Path(catalog_key).name
+            stem = filename.rsplit(".", 1)[0]
+            stem = re.sub(r"__\d+x\d+(?:__background)?$", "", stem)
             slug_text = parse_music_catalog_slug(catalog_key)
-            if not slug_text:
+            candidate_text = slug_text
+            source = "catalog_filename_fuzzy"
+            if not candidate_text:
+                index_text_key = text_key_by_catalog_name.get(filename, "")
+                if index_text_key:
+                    candidate_text = index_text_key
+                    source = "catalog_index_text_key"
+            if not candidate_text:
                 continue
-            score = music_similarity(query_album_artist, slug_text)
+            score = music_similarity(query_album_artist, candidate_text)
             if score <= best_score:
                 continue
             content_id = ""
             if isinstance(entry, dict):
                 content_id = str(entry.get("content_id", "")).strip()
-            stem = Path(catalog_key).name.rsplit(".", 1)[0]
-            stem = re.sub(r"__\d+x\d+(?:__background)?$", "", stem)
             best_score = score
-            best_source = "catalog_filename_fuzzy"
+            best_source = source
             best_record = {
                 "cache_key": stem,
                 "catalog_key": catalog_key,
@@ -676,8 +790,13 @@ def lookup_music_association_fuzzy(restore_payload: dict[str, Any]) -> Optional[
                 "artist": artist,
                 "album": album,
             }
+            if stem.isdigit():
+                try:
+                    best_record["collection_id"] = int(stem)
+                except Exception:
+                    pass
 
-    if best_score >= 0.88 and isinstance(best_record, dict):
+    if best_score >= 0.78 and isinstance(best_record, dict):
         best_record["match_confidence"] = round(best_score, 4)
         best_record["match_source"] = best_source
         return best_record
@@ -1300,6 +1419,17 @@ def main() -> None:
                                 catalog_key=catalog_key,
                                 content_id=target_cid,
                             )
+                            update_music_index_entry(
+                                artist=artist,
+                                album=album,
+                                collection_id=collection_id,
+                                catalog_key=catalog_key,
+                                cache_key=cache_key,
+                                content_id=target_cid,
+                                wide_path=wide_path,
+                                compressed_path=wide_path if wide_path.suffix.lower() in {".jpg", ".jpeg"} else compressed_jpg_path,
+                                request_id=None,
+                            )
                             pick_source = "music_cache_catalog_hit"
                         else:
                             encoded_type = guess_file_type(wide_path)
@@ -1314,6 +1444,17 @@ def main() -> None:
                                 cache_key=cache_key,
                                 catalog_key=catalog_key,
                                 content_id=target_cid,
+                            )
+                            update_music_index_entry(
+                                artist=artist,
+                                album=album,
+                                collection_id=collection_id,
+                                catalog_key=catalog_key,
+                                cache_key=cache_key,
+                                content_id=target_cid,
+                                wide_path=wide_path,
+                                compressed_path=wide_path if wide_path.suffix.lower() in {".jpg", ".jpeg"} else compressed_jpg_path,
+                                request_id=None,
                             )
                             pick_source = "music_cache_uploaded"
                     else:
@@ -1400,6 +1541,17 @@ def main() -> None:
                                 cache_key=cache_key,
                                 catalog_key=catalog_key,
                                 content_id=target_cid,
+                            )
+                            update_music_index_entry(
+                                artist=artist,
+                                album=album,
+                                collection_id=collection_id,
+                                catalog_key=catalog_key,
+                                cache_key=cache_key,
+                                content_id=target_cid,
+                                wide_path=wide_path,
+                                compressed_path=compressed_jpg_path if compressed_jpg_path.exists() else wide_path,
+                                request_id=request_id,
                             )
                             pick_source = generation_mode
                             log_event(
