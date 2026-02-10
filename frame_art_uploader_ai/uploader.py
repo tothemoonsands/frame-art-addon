@@ -606,22 +606,34 @@ def delete_art_content_id(art: Any, content_id: str) -> dict[str, Any]:
 
     method_errors: list[str] = []
     deleted_call = False
-    for method_name in ("delete", "delete_image", "delete_list", "delete_list_items"):
-        method = getattr(art, method_name, None)
-        if not callable(method):
-            continue
+
+    # Match samsungtv_artmode's concrete delete path:
+    # delete(content_id) -> delete_list([content_id]) -> request "delete_image_list".
+    delete_list = getattr(art, "delete_list", None)
+    if callable(delete_list):
         try:
-            try:
-                method(cid)
-            except TypeError:
-                try:
-                    method([cid])
-                except TypeError:
-                    method(content_id=cid)
+            delete_list([cid])
             deleted_call = True
-            break
         except Exception as exc:
-            method_errors.append(f"{method_name}:{repr(exc)}")
+            method_errors.append(f"delete_list:{repr(exc)}")
+
+    if not deleted_call:
+        delete = getattr(art, "delete", None)
+        if callable(delete):
+            try:
+                delete(cid)
+                deleted_call = True
+            except Exception as exc:
+                method_errors.append(f"delete:{repr(exc)}")
+
+    if not deleted_call:
+        delete_image = getattr(art, "delete_image", None)
+        if callable(delete_image):
+            try:
+                delete_image(cid)
+                deleted_call = True
+            except Exception as exc:
+                method_errors.append(f"delete_image:{repr(exc)}")
 
     remaining_ids = available_content_ids(art)
     verified = cid not in remaining_ids
