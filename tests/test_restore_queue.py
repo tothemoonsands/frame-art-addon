@@ -197,6 +197,21 @@ class AmbientSeedTests(unittest.TestCase):
         self.assertEqual(str(self.ambient), normalized["ambient_dir"])
         self.assertEqual(str(self.catalog), normalized["catalog_path"])
         self.assertTrue(normalized["force_reupload"])
+        self.assertTrue(normalized["apply_deletions"])
+        self.assertTrue(normalized["auto_queue_missing"])
+        self.assertEqual(25, normalized["delete_limit"])
+
+    def test_parse_dispatch_holiday_and_music_seed_defaults(self):
+        holiday, _, err_holiday = uploader.parse_restore_request_payload({"kind": "holiday_seed"})
+        music, _, err_music = uploader.parse_restore_request_payload({"kind": "music_seed"})
+        self.assertIsNone(err_holiday)
+        self.assertIsNone(err_music)
+        self.assertEqual("holiday_seed", holiday["kind"])
+        self.assertEqual("music_seed", music["kind"])
+        self.assertTrue(holiday["apply_deletions"])
+        self.assertTrue(music["auto_queue_missing"])
+        self.assertEqual(25, holiday["delete_limit"])
+        self.assertEqual(25, music["delete_limit"])
 
     def test_empty_dir_errors_clearly(self):
         with self.assertRaisesRegex(ValueError, "no supported images"):
@@ -338,6 +353,195 @@ class AmbientSeedTests(unittest.TestCase):
         self.assertIsNone(requested_show)
         self.assertNotIn("ambient_dir", normalized)
 
+    @mock.patch("frame_art_uploader_ai.uploader.delete_art_content_id")
+    @mock.patch("frame_art_uploader_ai.uploader.maybe_swap_current_art")
+    def test_pending_delete_is_processed_and_marked_deleted(self, mocked_swap, mocked_delete):
+        (self.ambient / "keep.jpg").write_bytes(b"k")
+        uploader.atomic_write_json(
+            self.catalog,
+            {
+                "version": 1,
+                "updated_at": "",
+                "entries": {
+                    "old.jpg": {
+                        "content_id": "MY_F111",
+                        "state": "pending_delete",
+                    }
+                },
+            },
+        )
+        mocked_swap.return_value = (True, False, None)
+        mocked_delete.return_value = {"ok": True, "verified": True, "error": None}
+
+        status = uploader.handle_ambient_seed_restore(
+            tv_ip="127.0.0.1",
+            art=mock.Mock(),
+            restore_payload={
+                "kind": "ambient_seed",
+                "ambient_dir": str(self.ambient),
+                "catalog_path": str(self.catalog),
+                "force_reupload": False,
+            },
+            requested_at="",
+        )
+
+        self.assertEqual(1, status["deletion_candidates"])
+        self.assertEqual(1, status["deletion_processed"])
+        data = json.loads(self.catalog.read_text(encoding="utf-8"))
+        self.assertEqual("deleted", data["entries"]["old.jpg"]["state"])
+
+    @mock.patch("frame_art_uploader_ai.uploader.delete_art_content_id")
+    @mock.patch("frame_art_uploader_ai.uploader.maybe_swap_current_art")
+    def test_current_display_swap_failure_leaves_pending_delete(self, mocked_swap, mocked_delete):
+        (self.ambient / "keep.jpg").write_bytes(b"k")
+        uploader.atomic_write_json(
+            self.catalog,
+            {
+                "version": 1,
+                "updated_at": "",
+                "entries": {
+                    "old.jpg": {
+                        "content_id": "MY_F111",
+                        "state": "pending_delete",
+                    }
+                },
+            },
+        )
+        mocked_swap.return_value = (False, False, "swap_failed_for_current:MY_F111")
+
+        status = uploader.handle_ambient_seed_restore(
+            tv_ip="127.0.0.1",
+            art=mock.Mock(),
+            restore_payload={
+                "kind": "ambient_seed",
+                "ambient_dir": str(self.ambient),
+                "catalog_path": str(self.catalog),
+                "force_reupload": False,
+            },
+            requested_at="",
+        )
+
+        self.assertEqual(1, status["deletion_failed"])
+        self.assertEqual(1, status["deletion_skipped_currently_displayed"])
+        self.assertEqual(0, mocked_delete.call_count)
+        data = json.loads(self.catalog.read_text(encoding="utf-8"))
+        self.assertEqual("pending_delete", data["entries"]["old.jpg"]["state"])
+
+    @mock.patch("frame_art_uploader_ai.uploader.delete_art_content_id")
+    @mock.patch("frame_art_uploader_ai.uploader.maybe_swap_current_art")
+    def test_missing_file_is_auto_queued_and_deleted(self, mocked_swap, mocked_delete):
+        (self.ambient / "keep.jpg").write_bytes(b"k")
+        uploader.atomic_write_json(
+            self.catalog,
+            {
+                "version": 1,
+                "updated_at": "",
+                "entries": {
+                    "missing.jpg": {
+                        "content_id": "MY_F404",
+                        "state": "active",
+                    }
+                },
+            },
+        )
+        mocked_swap.return_value = (True, False, None)
+        mocked_delete.return_value = {"ok": True, "verified": True, "error": None}
+
+        status = uploader.handle_ambient_seed_restore(
+            tv_ip="127.0.0.1",
+            art=mock.Mock(),
+            restore_payload={
+                "kind": "ambient_seed",
+                "ambient_dir": str(self.ambient),
+                "catalog_path": str(self.catalog),
+                "auto_queue_missing": True,
+            },
+            requested_at="",
+        )
+
+        self.assertEqual(1, status["auto_queued_missing_count"])
+        self.assertEqual(1, status["deletion_processed"])
+        data = json.loads(self.catalog.read_text(encoding="utf-8"))
+        self.assertEqual("deleted", data["entries"]["missing.jpg"]["state"])
+
+    @mock.patch("frame_art_uploader_ai.uploader.delete_art_content_id")
+    @mock.patch("frame_art_uploader_ai.uploader.maybe_swap_current_art")
+    def test_delete_failure_keeps_pending_and_reports_status_fields(self, mocked_swap, mocked_delete):
+        (self.ambient / "keep.jpg").write_bytes(b"k")
+        uploader.atomic_write_json(
+            self.catalog,
+            {
+                "version": 1,
+                "updated_at": "",
+                "entries": {
+                    "old.jpg": {
+                        "content_id": "MY_FAIL",
+                        "state": "pending_delete",
+                    }
+                },
+            },
+        )
+        mocked_swap.return_value = (True, False, None)
+        mocked_delete.return_value = {"ok": False, "verified": False, "error": "delete_unverified:MY_FAIL"}
+
+        status = uploader.handle_ambient_seed_restore(
+            tv_ip="127.0.0.1",
+            art=mock.Mock(),
+            restore_payload={
+                "kind": "ambient_seed",
+                "ambient_dir": str(self.ambient),
+                "catalog_path": str(self.catalog),
+            },
+            requested_at="",
+        )
+
+        self.assertIn("deletion_candidates", status)
+        self.assertIn("deletion_processed", status)
+        self.assertIn("deletion_failed", status)
+        self.assertIn("deletion_skipped_currently_displayed", status)
+        self.assertIn("deletion_swap_fallback_used", status)
+        self.assertIn("deletion_errors", status)
+        self.assertEqual(1, status["deletion_failed"])
+        data = json.loads(self.catalog.read_text(encoding="utf-8"))
+        self.assertEqual("pending_delete", data["entries"]["old.jpg"]["state"])
+
+    @mock.patch("frame_art_uploader_ai.uploader.delete_art_content_id")
+    @mock.patch("frame_art_uploader_ai.uploader.maybe_swap_current_art")
+    def test_delete_idempotency_second_run_no_duplicate_failures(self, mocked_swap, mocked_delete):
+        (self.ambient / "keep.jpg").write_bytes(b"k")
+        uploader.atomic_write_json(
+            self.catalog,
+            {
+                "version": 1,
+                "updated_at": "",
+                "entries": {
+                    "old.jpg": {
+                        "content_id": "MY_F111",
+                        "state": "pending_delete",
+                    }
+                },
+            },
+        )
+        mocked_swap.return_value = (True, False, None)
+        mocked_delete.return_value = {"ok": True, "verified": True, "error": None}
+
+        first = uploader.handle_ambient_seed_restore(
+            tv_ip="127.0.0.1",
+            art=mock.Mock(),
+            restore_payload={"kind": "ambient_seed", "ambient_dir": str(self.ambient), "catalog_path": str(self.catalog)},
+            requested_at="",
+        )
+        second = uploader.handle_ambient_seed_restore(
+            tv_ip="127.0.0.1",
+            art=mock.Mock(),
+            restore_payload={"kind": "ambient_seed", "ambient_dir": str(self.ambient), "catalog_path": str(self.catalog)},
+            requested_at="",
+        )
+
+        self.assertEqual(1, first["deletion_processed"])
+        self.assertEqual(0, second["deletion_processed"])
+        self.assertEqual(0, second["deletion_failed"])
+
 
 class PickCatalogTests(unittest.TestCase):
     def setUp(self) -> None:
@@ -373,6 +577,115 @@ class PickCatalogTests(unittest.TestCase):
         cached = uploader.lookup_catalog_content_id(self.ambient, "winter/night/missing.jpg")
         self.assertIsNone(cached)
 
+
+class MusicSeedDeletionTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+        self.music_dir = self.root / "music_seed"
+        self.catalog = self.root / "music_catalog.json"
+        self.assoc = self.root / "music_assoc.json"
+        self.index = self.root / "music_index.json"
+        self.widescreen = self.root / "widescreen"
+        self.compressed = self.root / "compressed"
+        self.background = self.root / "background"
+        self.source = self.root / "source"
+        self.music_dir.mkdir(parents=True)
+        self.widescreen.mkdir(parents=True)
+        self.compressed.mkdir(parents=True)
+        self.background.mkdir(parents=True)
+        self.source.mkdir(parents=True)
+        (self.music_dir / "keep.jpg").write_bytes(b"keep")
+
+        self.old_music_catalog = uploader.MUSIC_CATALOG_PATH
+        self.old_music_assoc = uploader.MUSIC_ASSOCIATIONS_PATH
+        self.old_index_paths = uploader.MUSIC_INDEX_PATHS
+        self.old_widescreen = uploader.WIDESCREEN_DIR
+        self.old_compressed = uploader.COMPRESSED_DIR
+        self.old_background = uploader.BACKGROUND_DIR
+        self.old_source = uploader.SOURCE_DIR
+        uploader.MUSIC_CATALOG_PATH = self.catalog
+        uploader.MUSIC_ASSOCIATIONS_PATH = self.assoc
+        uploader.MUSIC_INDEX_PATHS = [self.index]
+        uploader.WIDESCREEN_DIR = self.widescreen
+        uploader.COMPRESSED_DIR = self.compressed
+        uploader.BACKGROUND_DIR = self.background
+        uploader.SOURCE_DIR = self.source
+
+    def tearDown(self) -> None:
+        uploader.MUSIC_CATALOG_PATH = self.old_music_catalog
+        uploader.MUSIC_ASSOCIATIONS_PATH = self.old_music_assoc
+        uploader.MUSIC_INDEX_PATHS = self.old_index_paths
+        uploader.WIDESCREEN_DIR = self.old_widescreen
+        uploader.COMPRESSED_DIR = self.old_compressed
+        uploader.BACKGROUND_DIR = self.old_background
+        uploader.SOURCE_DIR = self.old_source
+        self.tmp.cleanup()
+
+    @mock.patch("frame_art_uploader_ai.uploader.delete_art_content_id")
+    @mock.patch("frame_art_uploader_ai.uploader.maybe_swap_current_art")
+    def test_music_pending_delete_cleans_graph_and_files(self, mocked_swap, mocked_delete):
+        key = "123__3840x2160.jpg"
+        uploader.atomic_write_json(
+            self.catalog,
+            {
+                "version": 1,
+                "updated_at": "",
+                "entries": {
+                    key: {"content_id": "MY_F123", "state": "pending_delete"},
+                },
+            },
+        )
+        uploader.atomic_write_json(
+            self.assoc,
+            {
+                "version": 1,
+                "updated_at": "",
+                "entries": {
+                    "cache::123": {"catalog_key": key, "content_id": "MY_F123"},
+                    "album_norm::x": {"catalog_key": "other.jpg", "content_id": "MY_OTHER"},
+                },
+            },
+        )
+        uploader.atomic_write_json(
+            self.index,
+            {
+                "version": 1,
+                "updated_at": "",
+                "entries": {
+                    "123": {"content_id": "MY_F123", "compressed_output_path": str(self.compressed / key)},
+                    "keep": {"content_id": "MY_KEEP"},
+                },
+            },
+        )
+        (self.compressed / key).write_bytes(b"x")
+        (self.widescreen / key).write_bytes(b"x")
+        (self.background / "123__3840x2160__background.png").write_bytes(b"x")
+        (self.source / "123.jpg").write_bytes(b"x")
+
+        mocked_swap.return_value = (True, False, None)
+        mocked_delete.return_value = {"ok": True, "verified": True, "error": None}
+
+        status = uploader.handle_music_seed_restore(
+            tv_ip="127.0.0.1",
+            art=mock.Mock(),
+            restore_payload={
+                "kind": "music_seed",
+                "music_dir": str(self.music_dir),
+                "catalog_path": str(self.catalog),
+            },
+            requested_at="",
+        )
+
+        self.assertEqual(1, status["deletion_processed"])
+        assoc = json.loads(self.assoc.read_text(encoding="utf-8"))
+        self.assertNotIn("cache::123", assoc["entries"])
+        index = json.loads(self.index.read_text(encoding="utf-8"))
+        self.assertNotIn("123", index["entries"])
+        self.assertFalse((self.compressed / key).exists())
+        self.assertFalse((self.widescreen / key).exists())
+        self.assertFalse((self.background / "123__3840x2160__background.png").exists())
+        self.assertFalse((self.source / "123.jpg").exists())
 
 class CoverArtPayloadNormalizationTests(unittest.TestCase):
     def test_non_shazam_source_clears_shazam_key(self):
