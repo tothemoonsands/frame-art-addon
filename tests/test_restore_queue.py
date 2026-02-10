@@ -18,13 +18,18 @@ if "samsungtvws" not in sys.modules:
 if "cover_art" not in sys.modules:
     cover = types.ModuleType("cover_art")
     cover.SOURCE_DIR = Path(".")
+    cover.BACKGROUND_DIR = Path(".")
+    cover.COMPRESSED_DIR = Path(".")
     cover.WIDESCREEN_DIR = Path(".")
+    cover.JPEG_MAX_BYTES = 4 * 1024 * 1024
     cover.download_artwork = lambda *a, **k: None
+    cover.compress_png_path_to_jpeg_max_bytes = lambda *a, **k: (True, 0)
     cover.ensure_dirs = lambda *a, **k: None
     cover.itunes_lookup = lambda *a, **k: {}
     cover.itunes_search = lambda *a, **k: {}
     cover.normalize_key = lambda *a, **k: "k"
     cover.generate_reference_frame_from_album = lambda *a, **k: (b"", b"", None, None)
+    cover.generate_local_fallback_frame_from_album = lambda *a, **k: (b"", b"")
     cover.resolve_artwork_url = lambda *a, **k: ""
     sys.modules["cover_art"] = cover
 
@@ -303,6 +308,91 @@ class PickCatalogTests(unittest.TestCase):
     def test_lookup_catalog_content_id_returns_none_for_missing(self):
         cached = uploader.lookup_catalog_content_id(self.ambient, "winter/night/missing.jpg")
         self.assertIsNone(cached)
+
+
+class CoverArtPayloadNormalizationTests(unittest.TestCase):
+    def test_non_shazam_source_clears_shazam_key(self):
+        payload = {
+            "kind": "cover_art_reference",
+            "key_source": "sonos",
+            "shazam_key": "album:yes|stale",
+            "artist": "Michael Kiwanuka",
+            "album": "Home Again",
+        }
+        normalized, _, err = uploader.parse_restore_request_payload(payload)
+        self.assertIsNone(err)
+        self.assertEqual("cover_art_reference_background", normalized["kind"])
+        self.assertEqual("sonos", normalized["key_source"])
+        self.assertEqual("", normalized["shazam_key"])
+
+    def test_shazam_source_keeps_shazam_key(self):
+        payload = {
+            "kind": "cover_art_reference",
+            "key_source": "shazam",
+            "shazam_key": "album:yes|home-again",
+            "artist": "Michael Kiwanuka",
+            "album": "Home Again",
+        }
+        normalized, _, err = uploader.parse_restore_request_payload(payload)
+        self.assertIsNone(err)
+        self.assertEqual("shazam", normalized["key_source"])
+        self.assertEqual("album:yes|home-again", normalized["shazam_key"])
+
+
+class MusicAssociationLookupTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+        self.assoc = self.root / "music_associations.json"
+        uploader.MUSIC_ASSOCIATIONS_PATH = self.assoc
+
+    def tearDown(self) -> None:
+        self.tmp.cleanup()
+
+    def test_lookup_by_normalized_album_key(self):
+        uploader.update_music_association(
+            {
+                "artist": "Michael Kiwanuka",
+                "album": "Home Again",
+                "track": "Tell Me a Tale",
+                "key_source": "sonos",
+            },
+            cache_key="k1",
+            catalog_key="k1__3840x2160.jpg",
+            content_id="MY_F123",
+        )
+
+        matched = uploader.lookup_music_association(
+            {
+                "artist": "michael   kiwanuka",
+                "album": "HOME AGAIN",
+            }
+        )
+        self.assertIsInstance(matched, dict)
+        self.assertEqual("k1__3840x2160.jpg", matched.get("catalog_key"))
+
+    def test_lookup_legacy_album_key_without_album_norm(self):
+        uploader.atomic_write_json(
+            self.assoc,
+            {
+                "version": 1,
+                "updated_at": "",
+                "entries": {
+                    "album::Michael Kiwanuka — Home Again": {
+                        "catalog_key": "legacy__3840x2160.jpg",
+                        "content_id": "MY_F999",
+                    }
+                },
+            },
+        )
+        matched = uploader.lookup_music_association(
+            {
+                "artist": "michael kiwanuka",
+                "album": "home again",
+            }
+        )
+        self.assertIsInstance(matched, dict)
+        self.assertEqual("legacy__3840x2160.jpg", matched.get("catalog_key"))
 
 
 if __name__ == "__main__":
