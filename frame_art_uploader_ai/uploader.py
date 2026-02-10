@@ -672,6 +672,51 @@ def parse_music_catalog_slug(catalog_key: str) -> str:
     return stem.replace("-", " ")
 
 
+def music_catalog_stem(catalog_key: str) -> str:
+    filename = Path(str(catalog_key or "")).name
+    stem = filename.rsplit(".", 1)[0]
+    return re.sub(r"__\d+x\d+(?:__background)?$", "", stem)
+
+
+def is_numeric_catalog_key(catalog_key: str) -> bool:
+    return music_catalog_stem(catalog_key).isdigit()
+
+
+def is_aa_catalog_key(catalog_key: str, cache_key: str = "") -> bool:
+    stem = music_catalog_stem(catalog_key)
+    if stem.startswith("aa_"):
+        return True
+    return str(cache_key or "").startswith("aa_")
+
+
+def parse_collection_id_value(value: Any) -> Optional[int]:
+    if isinstance(value, int):
+        return value
+    if value in (None, ""):
+        return None
+    try:
+        return int(str(value).strip())
+    except Exception:
+        return None
+
+
+def music_candidate_adjusted_score(
+    score: float,
+    *,
+    catalog_key: str,
+    cache_key: str = "",
+    verified: bool = False,
+) -> float:
+    adjusted = score
+    if is_aa_catalog_key(catalog_key, cache_key):
+        adjusted -= 0.08
+    if is_numeric_catalog_key(catalog_key):
+        adjusted += 0.02
+    if verified:
+        adjusted += 0.03
+    return max(0.0, min(1.0, adjusted))
+
+
 def load_music_index_entries() -> dict[str, Any]:
     for path in MUSIC_INDEX_PATHS:
         if not path.exists():
@@ -778,6 +823,42 @@ def find_exact_music_index_match(artist: str, album: str) -> Optional[dict[str, 
     return None
 
 
+def find_music_match_by_collection_id(collection_id: Optional[int]) -> Optional[dict[str, Any]]:
+    if not isinstance(collection_id, int):
+        return None
+
+    music_catalog = load_frame_art_catalog(MUSIC_CATALOG_PATH)
+    catalog_entries = music_catalog.get("entries") if isinstance(music_catalog.get("entries"), dict) else {}
+    index_entries = load_music_index_entries()
+    collection_key = str(collection_id)
+
+    candidate_names = [f"{collection_key}__3840x2160.jpg", f"{collection_key}__3840x2160.png"]
+    if isinstance(index_entries, dict):
+        index_item = index_entries.get(collection_key)
+        if isinstance(index_item, dict):
+            for name in index_item_candidate_catalog_names(collection_key, index_item):
+                if name not in candidate_names:
+                    candidate_names.append(name)
+
+    for name in candidate_names:
+        entry = catalog_entries.get(name) if isinstance(catalog_entries, dict) and isinstance(catalog_entries.get(name), dict) else {}
+        content_id = str(entry.get("content_id", "")).strip() if entry else ""
+        if not content_id and isinstance(index_entries, dict):
+            index_item = index_entries.get(collection_key)
+            if isinstance(index_item, dict):
+                content_id = str(index_item.get("content_id", "")).strip()
+        if entry or find_music_file_candidate_by_name(name):
+            return {
+                "cache_key": music_catalog_stem(name),
+                "catalog_key": name,
+                "content_id": content_id,
+                "collection_id": collection_id,
+                "match_confidence": 1.0,
+                "match_source": "collection_id_catalog_exact",
+            }
+    return None
+
+
 def music_text_key(artist: str, album: str) -> str:
     artist_norm = normalize_music_text(artist)
     album_norm = normalize_music_text(album)
@@ -855,14 +936,18 @@ def lookup_music_association_fuzzy(restore_payload: dict[str, Any]) -> Optional[
     if not (artist or album or query_album_artist):
         return None
 
+    collection_id = parse_collection_id_value(restore_payload.get("collection_id"))
+    collection_match = find_music_match_by_collection_id(collection_id)
+    if isinstance(collection_match, dict):
+        collection_match["artist"] = artist
+        collection_match["album"] = album
+        return collection_match
+
     exact_index_match = find_exact_music_index_match(artist, album)
     if isinstance(exact_index_match, dict):
         return exact_index_match
 
-    best_record: Optional[dict[str, Any]] = None
-    best_score = 0.0
-    second_best_score = 0.0
-    best_source = ""
+    candidates: list[dict[str, Any]] = []
 
     assoc_catalog = load_frame_art_catalog(MUSIC_ASSOCIATIONS_PATH)
     assoc_entries = assoc_catalog.get("entries") if isinstance(assoc_catalog.get("entries"), dict) else {}
@@ -889,20 +974,21 @@ def lookup_music_association_fuzzy(restore_payload: dict[str, Any]) -> Optional[
             artist_score = music_similarity(artist, rec_artist) if artist and rec_artist else 0.0
             album_score = music_similarity(album, rec_album) if album and rec_album else 0.0
             combo_score = music_similarity(query_album_artist, rec_combo) if query_album_artist and rec_combo else 0.0
-            score = max(combo_score, (0.5 * artist_score) + (0.5 * album_score))
-
-            if score > best_score:
-                second_best_score = best_score
-                best_score = score
-                best_source = "association_fuzzy"
-                best_record = dict(record)
-            elif score > second_best_score:
-                second_best_score = score
-
-    if best_score >= 0.78 and (best_score - second_best_score >= 0.05 or second_best_score == 0.0) and isinstance(best_record, dict):
-        best_record["match_confidence"] = round(best_score, 4)
-        best_record["match_source"] = best_source
-        return best_record
+            raw_score = max(combo_score, (0.5 * artist_score) + (0.5 * album_score))
+            catalog_key = str(record.get("catalog_key", "")).strip()
+            cache_key = str(record.get("cache_key", "")).strip()
+            verified = bool(record.get("verified", False))
+            score = music_candidate_adjusted_score(
+                raw_score,
+                catalog_key=catalog_key,
+                cache_key=cache_key,
+                verified=verified,
+            )
+            payload = dict(record)
+            payload["match_source"] = "association_fuzzy"
+            payload["match_confidence_raw"] = round(raw_score, 4)
+            payload["match_confidence"] = round(score, 4)
+            candidates.append(payload)
 
     music_catalog = load_frame_art_catalog(MUSIC_CATALOG_PATH)
     catalog_entries = music_catalog.get("entries") if isinstance(music_catalog.get("entries"), dict) else {}
@@ -943,38 +1029,78 @@ def lookup_music_association_fuzzy(restore_payload: dict[str, Any]) -> Optional[
                     source = "catalog_index_text_key"
             if not candidate_text:
                 continue
-            score = music_similarity(query_album_artist, candidate_text)
-            if score > best_score:
-                second_best_score = best_score
-                content_id = ""
-                if isinstance(entry, dict):
-                    content_id = str(entry.get("content_id", "")).strip()
-                best_score = score
-                best_source = source
-                best_record = {
-                    "cache_key": stem,
-                    "catalog_key": catalog_key,
-                    "content_id": content_id,
-                    "artist": artist,
-                    "album": album,
-                }
-                if stem.isdigit():
-                    try:
-                        best_record["collection_id"] = int(stem)
-                    except Exception:
-                        pass
-            elif score > second_best_score:
-                second_best_score = score
+            raw_score = music_similarity(query_album_artist, candidate_text)
+            score = music_candidate_adjusted_score(
+                raw_score,
+                catalog_key=catalog_key,
+                cache_key=stem,
+                verified=is_numeric_catalog_key(catalog_key),
+            )
+            content_id = ""
+            if isinstance(entry, dict):
+                content_id = str(entry.get("content_id", "")).strip()
+            payload = {
+                "cache_key": stem,
+                "catalog_key": catalog_key,
+                "content_id": content_id,
+                "artist": artist,
+                "album": album,
+                "match_source": source,
+                "match_confidence_raw": round(raw_score, 4),
+                "match_confidence": round(score, 4),
+            }
+            if stem.isdigit():
+                try:
+                    payload["collection_id"] = int(stem)
+                except Exception:
+                    pass
+            candidates.append(payload)
 
-    if best_score >= 0.78 and (best_score - second_best_score >= 0.05 or second_best_score == 0.0) and isinstance(best_record, dict):
-        best_record["match_confidence"] = round(best_score, 4)
-        best_record["match_source"] = best_source
+    if not candidates:
+        return None
+
+    candidates.sort(key=lambda c: float(c.get("match_confidence", 0.0)), reverse=True)
+    best_record = dict(candidates[0])
+    best_score = float(best_record.get("match_confidence", 0.0))
+    second_best_score = float(candidates[1].get("match_confidence", 0.0)) if len(candidates) > 1 else 0.0
+
+    top_candidates = []
+    for item in candidates[:3]:
+        top_candidates.append(
+            {
+                "source": item.get("match_source"),
+                "catalog_key": item.get("catalog_key"),
+                "score": item.get("match_confidence"),
+                "score_raw": item.get("match_confidence_raw"),
+            }
+        )
+
+    if best_score >= 0.78 and (best_score - second_best_score >= 0.05 or second_best_score == 0.0):
+        best_record["match_candidates"] = top_candidates
         return best_record
+
+    if best_score >= 0.74 and second_best_score >= 0.70 and (best_score - second_best_score) < 0.05:
+        return {
+            "generation_blocked": True,
+            "match_source": "fuzzy_ambiguous_blocked",
+            "match_confidence": round(best_score, 4),
+            "second_match_confidence": round(second_best_score, 4),
+            "match_candidates": top_candidates,
+            "artist": artist,
+            "album": album,
+        }
 
     return None
 
 
 def lookup_music_association(restore_payload: dict[str, Any]) -> Optional[dict[str, Any]]:
+    collection_id = parse_collection_id_value(restore_payload.get("collection_id"))
+    collection_match = find_music_match_by_collection_id(collection_id)
+    if isinstance(collection_match, dict):
+        collection_match["artist"] = str(restore_payload.get("artist", "")).strip()
+        collection_match["album"] = str(restore_payload.get("album", "")).strip()
+        return collection_match
+
     catalog = load_frame_art_catalog(MUSIC_ASSOCIATIONS_PATH)
     entries = catalog.get("entries") if isinstance(catalog.get("entries"), dict) else {}
     if not isinstance(entries, dict) or not entries:
@@ -996,6 +1122,9 @@ def lookup_music_association(restore_payload: dict[str, Any]) -> Optional[dict[s
         candidate_keys.append(f"album::{album_key_raw}")
     if album_key_norm:
         candidate_keys.append(f"album_norm::{album_key_norm}")
+    album_loose = normalize_music_text_loose(f"{artist} {album}".strip())
+    if album_loose:
+        candidate_keys.append(f"album_loose::{album_loose}")
 
     for key in candidate_keys:
         record = entries.get(key)
@@ -1020,6 +1149,8 @@ def update_music_association(
     cache_key: str,
     catalog_key: str,
     content_id: str,
+    verified: Optional[bool] = None,
+    source_quality: Optional[str] = None,
 ) -> None:
     catalog = load_frame_art_catalog(MUSIC_ASSOCIATIONS_PATH)
     entries = catalog.setdefault("entries", {})
@@ -1032,7 +1163,9 @@ def update_music_association(
     key_source = str(restore_payload.get("key_source", "")).strip().lower() or "unknown"
     artist = str(restore_payload.get("artist", "")).strip()
     album = str(restore_payload.get("album", "")).strip()
-    collection_id = restore_payload.get("collection_id")
+    collection_id = parse_collection_id_value(restore_payload.get("collection_id"))
+    verified_flag = bool(is_numeric_catalog_key(catalog_key)) if verified is None else bool(verified)
+    quality = source_quality or ("trusted_cache" if verified_flag else "generated")
 
     record = {
         "cache_key": cache_key,
@@ -1042,6 +1175,8 @@ def update_music_association(
         "artist": artist,
         "album": album,
         "collection_id": collection_id if isinstance(collection_id, int) else None,
+        "verified": verified_flag,
+        "source_quality": quality,
         "updated_at": datetime.now(timezone.utc).isoformat(),
     }
 
@@ -1054,6 +1189,9 @@ def update_music_association(
         album_norm = normalized_album_association(artist, album)
         if album_norm:
             entries[f"album_norm::{album_norm}"] = record
+        album_loose = normalize_music_text_loose(f"{artist} {album}".strip())
+        if album_loose:
+            entries[f"album_loose::{album_loose}"] = record
     entries[f"cache::{cache_key}"] = record
 
     persist_frame_art_catalog(MUSIC_ASSOCIATIONS_PATH, catalog)
@@ -1512,6 +1650,13 @@ def main() -> None:
                             cache_key=association_record.get("cache_key"),
                             content_id=association_record.get("content_id"),
                         )
+                        match_candidates = association_record.get("match_candidates")
+                        if isinstance(match_candidates, list) and match_candidates:
+                            log_event(
+                                "music_match_candidates",
+                                candidates=match_candidates,
+                                blocked=bool(association_record.get("generation_blocked", False)),
+                            )
                     collection_id_raw = restore_payload.get("collection_id")
                     collection_id: Optional[int] = None
                     if collection_id_raw not in (None, ""):
@@ -1592,6 +1737,8 @@ def main() -> None:
                                 cache_key=cache_key,
                                 catalog_key=catalog_key,
                                 content_id=target_cid,
+                                verified=True,
+                                source_quality="trusted_cache",
                             )
                             update_music_index_entry(
                                 artist=artist,
@@ -1615,6 +1762,8 @@ def main() -> None:
                                 cache_key=cache_key,
                                 catalog_key=catalog_key,
                                 content_id=target_cid,
+                                verified=True,
+                                source_quality="trusted_cache",
                             )
                             update_music_index_entry(
                                 artist=artist,
@@ -1641,6 +1790,8 @@ def main() -> None:
                                 cache_key=cache_key,
                                 catalog_key=catalog_key,
                                 content_id=target_cid,
+                                verified=True,
+                                source_quality="trusted_cache",
                             )
                             update_music_index_entry(
                                 artist=artist,
@@ -1659,6 +1810,17 @@ def main() -> None:
                         cover_error: Optional[Exception] = None
                         fallback_path: Optional[Path] = None
                         try:
+                            if isinstance(association_record, dict) and bool(association_record.get("generation_blocked", False)):
+                                log_event(
+                                    "music_generation_blocked",
+                                    reason="ambiguous_match",
+                                    match_source=association_record.get("match_source"),
+                                    match_confidence=association_record.get("match_confidence"),
+                                    second_match_confidence=association_record.get("second_match_confidence"),
+                                    candidates=association_record.get("match_candidates"),
+                                )
+                                raise ValueError("Ambiguous music match; generation blocked to prevent duplicate cache entries")
+
                             if not source_url:
                                 if collection_id is not None:
                                     lookup = itunes_lookup(collection_id, timeout_s=10)
@@ -1738,6 +1900,8 @@ def main() -> None:
                                 cache_key=cache_key,
                                 catalog_key=catalog_key,
                                 content_id=target_cid,
+                                verified=False,
+                                source_quality="generated",
                             )
                             update_music_index_entry(
                                 artist=artist,
