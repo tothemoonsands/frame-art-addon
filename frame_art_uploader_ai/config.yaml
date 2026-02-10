@@ -1,6 +1,6 @@
 name: Frame Art Uploader AI
 slug: frame_art_uploader_ai
-version: "0.4.2"
+version: "0.4.3"
 description: >
   Upload the newest AI-generated image to Samsung Frame Art Mode,
   enforce true full-bleed display (16:9 crop + 4K upscale),
