@@ -270,5 +270,40 @@ class AmbientSeedTests(unittest.TestCase):
         self.assertNotIn("ambient_dir", normalized)
 
 
+class PickCatalogTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+        self.holidays = self.root / "holidays_catalog.json"
+        self.ambient = self.root / "ambient_catalog.json"
+
+        uploader.HOLIDAY_CATALOG_PATH = self.holidays
+        uploader.AMBIENT_CATALOG_PATH = self.ambient
+
+    def tearDown(self) -> None:
+        self.tmp.cleanup()
+
+    def test_get_catalog_for_local_pick_holiday(self):
+        pick_file = Path("/media/frame_ai/holidays/christmas/day/scene.jpg")
+        catalog_path, catalog_key = uploader.get_catalog_for_local_pick(pick_file)
+        self.assertEqual(self.holidays, catalog_path)
+        self.assertEqual("christmas/day/scene.jpg", catalog_key)
+
+    def test_get_catalog_for_local_pick_ambient(self):
+        pick_file = Path("/media/frame_ai/ambient/winter/night/snow.png")
+        catalog_path, catalog_key = uploader.get_catalog_for_local_pick(pick_file)
+        self.assertEqual(self.ambient, catalog_path)
+        self.assertEqual("winter/night/snow.png", catalog_key)
+
+    def test_update_and_lookup_catalog_content_id(self):
+        uploader.update_catalog_content_id(self.holidays, "christmas/day/scene.jpg", "MY_F123")
+        cached = uploader.lookup_catalog_content_id(self.holidays, "christmas/day/scene.jpg")
+        self.assertEqual("MY_F123", cached)
+
+    def test_lookup_catalog_content_id_returns_none_for_missing(self):
+        cached = uploader.lookup_catalog_content_id(self.ambient, "winter/night/missing.jpg")
+        self.assertIsNone(cached)
+
+
 if __name__ == "__main__":
     unittest.main()
