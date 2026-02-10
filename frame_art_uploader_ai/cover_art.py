@@ -10,11 +10,14 @@ from typing import Any, Optional
 from urllib.parse import quote_plus
 
 import requests
-from PIL import Image, ImageFilter
+from PIL import Image, ImageDraw, ImageEnhance, ImageFilter, ImageOps
 
-COVER_ART_BASE = Path("/media/frame_ai/cover_art")
-SOURCE_DIR = COVER_ART_BASE / "source"
-WIDESCREEN_DIR = COVER_ART_BASE / "widescreen"
+MUSIC_BASE = Path("/media/frame_ai/music")
+SOURCE_DIR = MUSIC_BASE / "source"
+WIDESCREEN_DIR = MUSIC_BASE / "widescreen"
+BACKGROUND_DIR = MUSIC_BASE / "background"
+COMPRESSED_DIR = MUSIC_BASE / "widescreen-compressed"
+JPEG_MAX_BYTES = 4 * 1024 * 1024
 
 REFERENCE_BACKGROUND_PROMPT = (
     "Create an original seamless 16:9 full-bleed background inspired by the reference album "
@@ -56,6 +59,8 @@ def normalize_key(collection_id: Optional[int], artist: str, album: str) -> str:
 def ensure_dirs() -> None:
     SOURCE_DIR.mkdir(parents=True, exist_ok=True)
     WIDESCREEN_DIR.mkdir(parents=True, exist_ok=True)
+    BACKGROUND_DIR.mkdir(parents=True, exist_ok=True)
+    COMPRESSED_DIR.mkdir(parents=True, exist_ok=True)
 
 
 def itunes_lookup(collection_id: int, timeout_s: int = 10) -> dict:
@@ -343,6 +348,94 @@ def generate_reference_frame_from_album(
     final.save(final_out, format="PNG", optimize=True, compress_level=9)
 
     return final_out.getvalue(), background_out.getvalue(), request_id, model_used
+
+
+def generate_local_fallback_frame_from_album(
+    source_album_path: Path,
+    album_shadow: bool = True,
+) -> tuple[bytes, bytes]:
+    with Image.open(source_album_path) as src:
+        source_rgb = src.convert("RGB")
+    background = ImageOps.fit(
+        source_rgb,
+        (FRAME_FINAL_WIDTH, FRAME_FINAL_HEIGHT),
+        method=Image.Resampling.LANCZOS,
+        centering=(0.5, 0.5),
+    )
+    background = background.filter(ImageFilter.GaussianBlur(radius=62))
+    background = ImageEnhance.Color(background).enhance(0.92)
+    background = ImageEnhance.Brightness(background).enhance(0.75)
+
+    vignette_mask = Image.new("L", (FRAME_FINAL_WIDTH, FRAME_FINAL_HEIGHT), 0)
+    draw = ImageDraw.Draw(vignette_mask)
+    max_radius = int((FRAME_FINAL_WIDTH**2 + FRAME_FINAL_HEIGHT**2) ** 0.5 / 2)
+    for radius in range(max_radius, 0, -20):
+        alpha = int(205 * (1 - radius / max_radius) ** 1.8)
+        draw.ellipse(
+            (
+                FRAME_FINAL_WIDTH // 2 - radius,
+                FRAME_FINAL_HEIGHT // 2 - radius,
+                FRAME_FINAL_WIDTH // 2 + radius,
+                FRAME_FINAL_HEIGHT // 2 + radius,
+            ),
+            fill=alpha,
+        )
+    background = Image.composite(
+        background,
+        Image.new("RGB", (FRAME_FINAL_WIDTH, FRAME_FINAL_HEIGHT), (10, 10, 10)),
+        vignette_mask,
+    )
+
+    final = composite_album(background, source_album_path, album_shadow=album_shadow)
+
+    background_out = BytesIO()
+    background.save(background_out, format="PNG", optimize=True, compress_level=9)
+    final_out = BytesIO()
+    final.save(final_out, format="PNG", optimize=True, compress_level=9)
+    return final_out.getvalue(), background_out.getvalue()
+
+
+def compress_png_path_to_jpeg_max_bytes(
+    input_png_path: Path,
+    output_jpg_path: Path,
+    max_bytes: int = JPEG_MAX_BYTES,
+) -> tuple[bool, int]:
+    if max_bytes <= 0:
+        raise ValueError("max_bytes must be > 0")
+
+    with Image.open(input_png_path) as img:
+        work = img.convert("RGB")
+
+    output_jpg_path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = output_jpg_path.with_suffix(".jpg.part")
+
+    def _save(image: Image.Image, quality: int) -> int:
+        image.save(tmp_path, format="JPEG", quality=quality, optimize=True, progressive=True)
+        return tmp_path.stat().st_size
+
+    selected_size = 0
+    selected_ok = False
+    for quality in (92, 88, 84, 80, 76, 72, 68, 64, 60, 56, 52, 48, 44, 40, 36, 32, 28, 24):
+        size = _save(work, quality)
+        selected_size = size
+        if size <= max_bytes:
+            selected_ok = True
+            break
+
+    if not selected_ok:
+        for scale in (0.95, 0.9, 0.85, 0.8):
+            resized = work.resize(
+                (max(1, int(work.width * scale)), max(1, int(work.height * scale))),
+                Image.Resampling.LANCZOS,
+            )
+            size = _save(resized, 40)
+            selected_size = size
+            if size <= max_bytes:
+                selected_ok = True
+                break
+
+    tmp_path.replace(output_jpg_path)
+    return selected_ok, selected_size
 
 
 def infer_content_id(path: Path) -> Optional[str]:
