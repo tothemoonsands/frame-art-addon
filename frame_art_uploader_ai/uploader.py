@@ -624,6 +624,97 @@ def load_music_index_entries() -> dict[str, Any]:
     return {}
 
 
+def find_music_file_candidate_by_name(filename: str) -> Optional[Path]:
+    name = str(filename or "").strip()
+    if not name:
+        return None
+    candidate = Path(name)
+    if candidate.is_absolute() and candidate.exists():
+        return candidate
+    for root in (COMPRESSED_DIR, WIDESCREEN_DIR):
+        path = root / name
+        if path.exists():
+            return path
+    return None
+
+
+def index_item_candidate_catalog_names(index_key: str, index_item: dict[str, Any]) -> list[str]:
+    names: list[str] = []
+    seen: set[str] = set()
+
+    def add(name: str) -> None:
+        n = str(name or "").strip()
+        if not n or n in seen:
+            return
+        seen.add(n)
+        names.append(n)
+
+    compressed_path = str(index_item.get("compressed_output_path", "")).strip()
+    output_path = str(index_item.get("output_path", "")).strip()
+    if compressed_path:
+        add(Path(compressed_path).name)
+    if output_path:
+        add(Path(output_path).name)
+
+    key = str(index_key or "").strip()
+    if key:
+        stem = re.sub(r"__\d+x\d+(?:__background)?$", "", key)
+        if stem:
+            add(f"{stem}__3840x2160.jpg")
+            add(f"{stem}__3840x2160.png")
+    return names
+
+
+def find_exact_music_index_match(artist: str, album: str) -> Optional[dict[str, Any]]:
+    query_text_key = music_text_key(artist, album)
+    query_norm = normalize_music_text(query_text_key)
+    if not query_norm:
+        return None
+
+    index_entries = load_music_index_entries()
+    if not isinstance(index_entries, dict):
+        return None
+
+    for index_key, index_item in index_entries.items():
+        if not isinstance(index_item, dict):
+            continue
+        text_key = str(index_item.get("text_key", "")).strip()
+        if not text_key:
+            continue
+        if normalize_music_text(text_key) != query_norm:
+            continue
+
+        catalog_key = ""
+        for name in index_item_candidate_catalog_names(str(index_key), index_item):
+            if find_music_file_candidate_by_name(name) is not None:
+                catalog_key = name
+                break
+            if not catalog_key:
+                catalog_key = name
+
+        if not catalog_key:
+            continue
+
+        record: dict[str, Any] = {
+            "cache_key": Path(catalog_key).name.rsplit(".", 1)[0],
+            "catalog_key": catalog_key,
+            "content_id": str(index_item.get("content_id", "")).strip(),
+            "artist": artist,
+            "album": album,
+            "match_confidence": 1.0,
+            "match_source": "index_text_key_exact",
+        }
+        stem = Path(catalog_key).name.rsplit(".", 1)[0]
+        stem = re.sub(r"__\d+x\d+(?:__background)?$", "", stem)
+        if stem.isdigit():
+            try:
+                record["collection_id"] = int(stem)
+            except Exception:
+                pass
+        return record
+    return None
+
+
 def music_text_key(artist: str, album: str) -> str:
     artist_norm = normalize_music_text(artist)
     album_norm = normalize_music_text(album)
@@ -695,8 +786,13 @@ def lookup_music_association_fuzzy(restore_payload: dict[str, Any]) -> Optional[
     if not (artist or album or query_album_artist):
         return None
 
+    exact_index_match = find_exact_music_index_match(artist, album)
+    if isinstance(exact_index_match, dict):
+        return exact_index_match
+
     best_record: Optional[dict[str, Any]] = None
     best_score = 0.0
+    second_best_score = 0.0
     best_source = ""
 
     assoc_catalog = load_frame_art_catalog(MUSIC_ASSOCIATIONS_PATH)
@@ -727,11 +823,14 @@ def lookup_music_association_fuzzy(restore_payload: dict[str, Any]) -> Optional[
             score = max(combo_score, (0.5 * artist_score) + (0.5 * album_score))
 
             if score > best_score:
+                second_best_score = best_score
                 best_score = score
                 best_source = "association_fuzzy"
                 best_record = dict(record)
+            elif score > second_best_score:
+                second_best_score = score
 
-    if best_score >= 0.78 and isinstance(best_record, dict):
+    if best_score >= 0.78 and (best_score - second_best_score >= 0.05 or second_best_score == 0.0) and isinstance(best_record, dict):
         best_record["match_confidence"] = round(best_score, 4)
         best_record["match_source"] = best_source
         return best_record
@@ -776,27 +875,29 @@ def lookup_music_association_fuzzy(restore_payload: dict[str, Any]) -> Optional[
             if not candidate_text:
                 continue
             score = music_similarity(query_album_artist, candidate_text)
-            if score <= best_score:
-                continue
-            content_id = ""
-            if isinstance(entry, dict):
-                content_id = str(entry.get("content_id", "")).strip()
-            best_score = score
-            best_source = source
-            best_record = {
-                "cache_key": stem,
-                "catalog_key": catalog_key,
-                "content_id": content_id,
-                "artist": artist,
-                "album": album,
-            }
-            if stem.isdigit():
-                try:
-                    best_record["collection_id"] = int(stem)
-                except Exception:
-                    pass
+            if score > best_score:
+                second_best_score = best_score
+                content_id = ""
+                if isinstance(entry, dict):
+                    content_id = str(entry.get("content_id", "")).strip()
+                best_score = score
+                best_source = source
+                best_record = {
+                    "cache_key": stem,
+                    "catalog_key": catalog_key,
+                    "content_id": content_id,
+                    "artist": artist,
+                    "album": album,
+                }
+                if stem.isdigit():
+                    try:
+                        best_record["collection_id"] = int(stem)
+                    except Exception:
+                        pass
+            elif score > second_best_score:
+                second_best_score = score
 
-    if best_score >= 0.78 and isinstance(best_record, dict):
+    if best_score >= 0.78 and (best_score - second_best_score >= 0.05 or second_best_score == 0.0) and isinstance(best_record, dict):
         best_record["match_confidence"] = round(best_score, 4)
         best_record["match_source"] = best_source
         return best_record

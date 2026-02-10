@@ -346,11 +346,19 @@ class MusicAssociationLookupTests(unittest.TestCase):
         self.assoc = self.root / "music_associations.json"
         self.catalog = self.root / "music_catalog.json"
         self.index = self.root / "index.json"
+        self.old_compressed_dir = uploader.COMPRESSED_DIR
+        self.old_widescreen_dir = uploader.WIDESCREEN_DIR
+        uploader.COMPRESSED_DIR = self.root / "widescreen-compressed"
+        uploader.WIDESCREEN_DIR = self.root / "widescreen"
+        uploader.COMPRESSED_DIR.mkdir(parents=True, exist_ok=True)
+        uploader.WIDESCREEN_DIR.mkdir(parents=True, exist_ok=True)
         uploader.MUSIC_ASSOCIATIONS_PATH = self.assoc
         uploader.MUSIC_CATALOG_PATH = self.catalog
         uploader.MUSIC_INDEX_PATHS = [self.index]
 
     def tearDown(self) -> None:
+        uploader.COMPRESSED_DIR = self.old_compressed_dir
+        uploader.WIDESCREEN_DIR = self.old_widescreen_dir
         self.tmp.cleanup()
 
     def test_lookup_by_normalized_album_key(self):
@@ -488,7 +496,72 @@ class MusicAssociationLookupTests(unittest.TestCase):
         self.assertIsInstance(matched, dict)
         self.assertEqual("1440795324__3840x2160.jpg", matched.get("catalog_key"))
         self.assertEqual(1440795324, matched.get("collection_id"))
-        self.assertEqual("catalog_index_text_key", matched.get("match_source"))
+        self.assertEqual("index_text_key_exact", matched.get("match_source"))
+
+    def test_exact_index_text_key_match_finds_existing_numeric_cache_file(self):
+        expected_file = uploader.COMPRESSED_DIR / "135132797__3840x2160.jpg"
+        expected_file.write_bytes(b"jpg")
+        uploader.atomic_write_json(
+            self.index,
+            {
+                "version": 1,
+                "updated_at": "",
+                "entries": {
+                    "135132797": {
+                        "text_key": "Tom Misch — Six Songs EP",
+                        "compressed_output_path": str(expected_file),
+                        "content_id": "MY_F555",
+                    }
+                },
+            },
+        )
+
+        matched = uploader.lookup_music_association(
+            {
+                "artist": "tom misch",
+                "album": "six songs ep",
+            }
+        )
+
+        self.assertIsInstance(matched, dict)
+        self.assertEqual("135132797__3840x2160.jpg", matched.get("catalog_key"))
+        self.assertEqual(135132797, matched.get("collection_id"))
+        self.assertEqual("index_text_key_exact", matched.get("match_source"))
+        self.assertEqual("MY_F555", matched.get("content_id"))
+
+    def test_fuzzy_lookup_requires_clear_winner_margin(self):
+        uploader.atomic_write_json(
+            self.assoc,
+            {
+                "version": 1,
+                "updated_at": "",
+                "entries": {
+                    "album::Tom Misch — Six Songs EP": {
+                        "cache_key": "aa_tom-misch-six-songs-ep_a1b2c3d4",
+                        "catalog_key": "aa_tom-misch-six-songs-ep_a1b2c3d4__3840x2160.jpg",
+                        "content_id": "MY_F1",
+                        "artist": "Tom Misch",
+                        "album": "Six Songs EP",
+                    },
+                    "album::Tom Misch — Six Songs EP (Alt)": {
+                        "cache_key": "aa_tom-misch-six-songs-ep_z9y8x7w6",
+                        "catalog_key": "aa_tom-misch-six-songs-ep_z9y8x7w6__3840x2160.jpg",
+                        "content_id": "MY_F2",
+                        "artist": "Tom Misch",
+                        "album": "Six Songs EP",
+                    },
+                },
+            },
+        )
+
+        matched = uploader.lookup_music_association_fuzzy(
+            {
+                "artist": "Tom Misch",
+                "album": "Six Songs EP",
+            }
+        )
+
+        self.assertIsNone(matched)
 
     def test_update_music_index_entry_uses_collection_id_key(self):
         wide = self.root / "1440795324__3840x2160.jpg"
