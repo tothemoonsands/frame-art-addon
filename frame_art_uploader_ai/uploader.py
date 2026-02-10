@@ -60,6 +60,7 @@ def write_status(payload: dict) -> None:
     payload["ts"] = time.time()
     with open(STATUS_PATH, "w", encoding="utf-8") as f:
         json.dump(payload, f, indent=2)
+    log_event("status", **payload)
 
 
 def load_options() -> dict:
