@@ -3,6 +3,7 @@ import os
 import re
 import time
 import uuid
+from difflib import SequenceMatcher
 from datetime import datetime, timedelta, timezone
 from contextlib import contextmanager
 import fcntl
@@ -537,11 +538,158 @@ def normalized_album_association(artist: str, album: str) -> str:
     return re.sub(r"\s+", " ", merged).strip()
 
 
+def normalize_music_text(value: str) -> str:
+    cleaned = str(value or "").lower()
+    cleaned = re.sub(r"\([^)]*\)", " ", cleaned)
+    cleaned = re.sub(r"\[[^\]]*\]", " ", cleaned)
+    cleaned = re.sub(r"[^a-z0-9]+", " ", cleaned)
+    return re.sub(r"\s+", " ", cleaned).strip()
+
+
+def music_token_set(value: str) -> set[str]:
+    stopwords = {
+        "a",
+        "an",
+        "and",
+        "the",
+        "of",
+        "feat",
+        "featuring",
+        "ft",
+        "with",
+        "deluxe",
+        "edition",
+        "remaster",
+        "remastered",
+        "version",
+        "anniversary",
+    }
+    return {token for token in normalize_music_text(value).split() if len(token) > 1 and token not in stopwords}
+
+
+def music_similarity(query: str, candidate: str) -> float:
+    query_norm = normalize_music_text(query)
+    candidate_norm = normalize_music_text(candidate)
+    if not query_norm or not candidate_norm:
+        return 0.0
+    if query_norm == candidate_norm:
+        return 1.0
+    if query_norm in candidate_norm or candidate_norm in query_norm:
+        return 0.93
+
+    ratio = SequenceMatcher(None, query_norm, candidate_norm).ratio()
+    q_tokens = music_token_set(query_norm)
+    c_tokens = music_token_set(candidate_norm)
+    if q_tokens and c_tokens:
+        overlap = len(q_tokens & c_tokens) / float(len(q_tokens | c_tokens))
+    else:
+        overlap = 0.0
+    return (0.65 * ratio) + (0.35 * overlap)
+
+
+def parse_music_catalog_slug(catalog_key: str) -> str:
+    key = str(catalog_key or "").strip()
+    if not key:
+        return ""
+    filename = Path(key).name
+    stem = filename.rsplit(".", 1)[0]
+    stem = re.sub(r"__\d+x\d+(?:__background)?$", "", stem)
+    m = re.match(r"^aa_(.+)_[0-9a-f]{8}$", stem)
+    if m:
+        return m.group(1).replace("-", " ")
+    if stem.startswith("itc_"):
+        return ""
+    return stem.replace("-", " ")
+
+
+def lookup_music_association_fuzzy(restore_payload: dict[str, Any]) -> Optional[dict[str, Any]]:
+    artist = str(restore_payload.get("artist", "")).strip()
+    album = str(restore_payload.get("album", "")).strip()
+    query_album_artist = normalize_music_text(f"{artist} {album}".strip())
+    if not (artist or album or query_album_artist):
+        return None
+
+    best_record: Optional[dict[str, Any]] = None
+    best_score = 0.0
+    best_source = ""
+
+    assoc_catalog = load_frame_art_catalog(MUSIC_ASSOCIATIONS_PATH)
+    assoc_entries = assoc_catalog.get("entries") if isinstance(assoc_catalog.get("entries"), dict) else {}
+    if isinstance(assoc_entries, dict):
+        seen_keys: set[str] = set()
+        for record in assoc_entries.values():
+            if not isinstance(record, dict):
+                continue
+            dedupe_key = "|".join(
+                [
+                    str(record.get("cache_key", "")).strip(),
+                    str(record.get("catalog_key", "")).strip(),
+                    str(record.get("content_id", "")).strip(),
+                ]
+            )
+            if dedupe_key in seen_keys:
+                continue
+            seen_keys.add(dedupe_key)
+
+            rec_artist = str(record.get("artist", "")).strip()
+            rec_album = str(record.get("album", "")).strip()
+            rec_combo = normalize_music_text(f"{rec_artist} {rec_album}".strip())
+
+            artist_score = music_similarity(artist, rec_artist) if artist and rec_artist else 0.0
+            album_score = music_similarity(album, rec_album) if album and rec_album else 0.0
+            combo_score = music_similarity(query_album_artist, rec_combo) if query_album_artist and rec_combo else 0.0
+            score = max(combo_score, (0.5 * artist_score) + (0.5 * album_score))
+
+            if score > best_score:
+                best_score = score
+                best_source = "association_fuzzy"
+                best_record = dict(record)
+
+    if best_score >= 0.78 and isinstance(best_record, dict):
+        best_record["match_confidence"] = round(best_score, 4)
+        best_record["match_source"] = best_source
+        return best_record
+
+    music_catalog = load_frame_art_catalog(MUSIC_CATALOG_PATH)
+    catalog_entries = music_catalog.get("entries") if isinstance(music_catalog.get("entries"), dict) else {}
+    if isinstance(catalog_entries, dict):
+        for catalog_key, entry in catalog_entries.items():
+            if not isinstance(catalog_key, str):
+                continue
+            slug_text = parse_music_catalog_slug(catalog_key)
+            if not slug_text:
+                continue
+            score = music_similarity(query_album_artist, slug_text)
+            if score <= best_score:
+                continue
+            content_id = ""
+            if isinstance(entry, dict):
+                content_id = str(entry.get("content_id", "")).strip()
+            stem = Path(catalog_key).name.rsplit(".", 1)[0]
+            stem = re.sub(r"__\d+x\d+(?:__background)?$", "", stem)
+            best_score = score
+            best_source = "catalog_filename_fuzzy"
+            best_record = {
+                "cache_key": stem,
+                "catalog_key": catalog_key,
+                "content_id": content_id,
+                "artist": artist,
+                "album": album,
+            }
+
+    if best_score >= 0.88 and isinstance(best_record, dict):
+        best_record["match_confidence"] = round(best_score, 4)
+        best_record["match_source"] = best_source
+        return best_record
+
+    return None
+
+
 def lookup_music_association(restore_payload: dict[str, Any]) -> Optional[dict[str, Any]]:
     catalog = load_frame_art_catalog(MUSIC_ASSOCIATIONS_PATH)
     entries = catalog.get("entries") if isinstance(catalog.get("entries"), dict) else {}
     if not isinstance(entries, dict) or not entries:
-        return None
+        return lookup_music_association_fuzzy(restore_payload)
 
     music_session_key = str(restore_payload.get("music_session_key", "")).strip()
     shazam_key = str(restore_payload.get("shazam_key", "")).strip()
@@ -574,7 +722,7 @@ def lookup_music_association(restore_payload: dict[str, Any]) -> Optional[dict[s
             if raw_norm == album_key_norm:
                 return record
 
-    return None
+    return lookup_music_association_fuzzy(restore_payload)
 
 
 def update_music_association(
@@ -595,7 +743,6 @@ def update_music_association(
     key_source = str(restore_payload.get("key_source", "")).strip().lower() or "unknown"
     artist = str(restore_payload.get("artist", "")).strip()
     album = str(restore_payload.get("album", "")).strip()
-    track = str(restore_payload.get("track", "")).strip()
     collection_id = restore_payload.get("collection_id")
 
     record = {
@@ -605,7 +752,6 @@ def update_music_association(
         "key_source": key_source,
         "artist": artist,
         "album": album,
-        "track": track,
         "collection_id": collection_id if isinstance(collection_id, int) else None,
         "updated_at": datetime.now(timezone.utc).isoformat(),
     }
@@ -971,6 +1117,9 @@ def main() -> None:
                 phase_roll = None
                 bucket = None
                 samsung_buckets = None
+                artist = ""
+                album = ""
+                track = ""
 
                 if kind == "content_id":
                     target_cid = request_value
@@ -1066,6 +1215,15 @@ def main() -> None:
                     album = str(restore_payload.get("album", "")).strip()
                     track = str(restore_payload.get("track", "")).strip()
                     association_record = lookup_music_association(restore_payload)
+                    if isinstance(association_record, dict):
+                        log_event(
+                            "music_association_hit",
+                            match_source=str(association_record.get("match_source", "exact")),
+                            match_confidence=association_record.get("match_confidence"),
+                            catalog_key=association_record.get("catalog_key"),
+                            cache_key=association_record.get("cache_key"),
+                            content_id=association_record.get("content_id"),
+                        )
                     collection_id_raw = restore_payload.get("collection_id")
                     collection_id: Optional[int] = None
                     if collection_id_raw not in (None, ""):
@@ -1136,6 +1294,12 @@ def main() -> None:
                             target_cid = cached_content_id
                             encoded_type = guess_file_type(wide_path)
                             encoded_bytes = wide_path.stat().st_size
+                            update_music_association(
+                                restore_payload,
+                                cache_key=cache_key,
+                                catalog_key=catalog_key,
+                                content_id=target_cid,
+                            )
                             pick_source = "music_cache_catalog_hit"
                         else:
                             encoded_type = guess_file_type(wide_path)
