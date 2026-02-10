@@ -419,15 +419,17 @@ def list_ambient_images(folder: Path) -> list[Path]:
     if not folder.exists() or not folder.is_dir():
         return []
     out: list[Path] = []
-    for p in folder.iterdir():
+    for p in folder.rglob("*"):
         if not p.is_file():
+            continue
+        if any(part.startswith(".") for part in p.relative_to(folder).parts):
             continue
         if p.name.startswith(".") or p.name.startswith("._") or p.name == ".DS_Store":
             continue
         if p.suffix.lower() not in AMBIENT_EXTENSIONS:
             continue
         out.append(p)
-    out.sort(key=lambda p: p.name.lower())
+    out.sort(key=lambda p: p.relative_to(folder).as_posix().lower())
     return out
 
 
@@ -485,8 +487,12 @@ def handle_ambient_seed_restore(tv_ip: str, art: Any, restore_payload: dict, req
     last_cid: Optional[str] = None
 
     for image_path in files:
-        key = image_path.name
+        key = image_path.relative_to(ambient_dir).as_posix()
         entry = entries.get(key) if isinstance(entries.get(key), dict) else {}
+        if not entry and "/" in key:
+            legacy_key = image_path.name
+            if isinstance(entries.get(legacy_key), dict):
+                entry = entries.get(legacy_key)
         cached_id = str(entry.get("content_id", "")).strip() if entry else ""
 
         if cached_id and not force_reupload:

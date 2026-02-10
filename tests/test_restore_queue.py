@@ -173,6 +173,64 @@ class AmbientSeedTests(unittest.TestCase):
         self.assertEqual("CID-b.webp", catalog["entries"]["b.webp"]["content_id"])
 
     @mock.patch("frame_art_uploader_ai.uploader.upload_local_file_with_reconnect")
+    def test_nested_directories_are_scanned_and_cataloged_by_relative_path(self, mocked_upload):
+        nested = self.ambient / "fall" / "night"
+        nested.mkdir(parents=True)
+        image = nested / "image.jpg"
+        image.write_bytes(b"x")
+        mocked_upload.return_value = (object(), "CID-NESTED")
+
+        status = uploader.handle_ambient_seed_restore(
+            tv_ip="127.0.0.1",
+            art=object(),
+            restore_payload={
+                "kind": "ambient_seed",
+                "ambient_dir": str(self.ambient),
+                "catalog_path": str(self.catalog),
+                "force_reupload": False,
+            },
+            requested_at="",
+        )
+
+        self.assertTrue(status["ok"])
+        self.assertEqual(1, status["uploaded_count"])
+        catalog = json.loads(self.catalog.read_text(encoding="utf-8"))
+        self.assertEqual("CID-NESTED", catalog["entries"]["fall/night/image.jpg"]["content_id"])
+
+    @mock.patch("frame_art_uploader_ai.uploader.upload_local_file_with_reconnect")
+    def test_nested_files_reuse_legacy_basename_catalog_entry(self, mocked_upload):
+        nested = self.ambient / "fall" / "night"
+        nested.mkdir(parents=True)
+        image = nested / "image.jpg"
+        image.write_bytes(b"x")
+        uploader.atomic_write_json(
+            self.catalog,
+            {
+                "version": 1,
+                "updated_at": "",
+                "entries": {
+                    "image.jpg": {"content_id": "LEGACY", "updated_at": ""},
+                },
+            },
+        )
+
+        status = uploader.handle_ambient_seed_restore(
+            tv_ip="127.0.0.1",
+            art=object(),
+            restore_payload={
+                "kind": "ambient_seed",
+                "ambient_dir": str(self.ambient),
+                "catalog_path": str(self.catalog),
+                "force_reupload": False,
+            },
+            requested_at="",
+        )
+
+        self.assertEqual(0, status["uploaded_count"])
+        self.assertEqual(1, status["skipped_count"])
+        self.assertEqual(0, mocked_upload.call_count)
+
+    @mock.patch("frame_art_uploader_ai.uploader.upload_local_file_with_reconnect")
     def test_force_reupload_bypasses_cached_ids(self, mocked_upload):
         (self.ambient / "a.png").write_bytes(b"a")
         uploader.atomic_write_json(
