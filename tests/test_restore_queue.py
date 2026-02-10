@@ -345,8 +345,10 @@ class MusicAssociationLookupTests(unittest.TestCase):
         self.root = Path(self.tmp.name)
         self.assoc = self.root / "music_associations.json"
         self.catalog = self.root / "music_catalog.json"
+        self.index = self.root / "index.json"
         uploader.MUSIC_ASSOCIATIONS_PATH = self.assoc
         uploader.MUSIC_CATALOG_PATH = self.catalog
+        uploader.MUSIC_INDEX_PATHS = [self.index]
 
     def tearDown(self) -> None:
         self.tmp.cleanup()
@@ -447,6 +449,88 @@ class MusicAssociationLookupTests(unittest.TestCase):
             matched.get("catalog_key"),
         )
         self.assertEqual("catalog_filename_fuzzy", matched.get("match_source"))
+
+    def test_fuzzy_lookup_from_index_text_key_for_numeric_catalog(self):
+        uploader.atomic_write_json(
+            self.catalog,
+            {
+                "version": 1,
+                "updated_at": "",
+                "entries": {
+                    "1440795324__3840x2160.jpg": {
+                        "content_id": "MY_F1226",
+                        "updated_at": "",
+                    }
+                },
+            },
+        )
+        uploader.atomic_write_json(
+            self.index,
+            {
+                "version": 1,
+                "updated_at": "",
+                "entries": {
+                    "1440795324": {
+                        "text_key": "michael kiwanuka — home again",
+                        "compressed_output_path": "/tmp/out/widescreen-compressed/1440795324__3840x2160.jpg",
+                    }
+                },
+            },
+        )
+
+        matched = uploader.lookup_music_association(
+            {
+                "artist": "Michael Kiwanuka",
+                "album": "Home Again",
+            }
+        )
+
+        self.assertIsInstance(matched, dict)
+        self.assertEqual("1440795324__3840x2160.jpg", matched.get("catalog_key"))
+        self.assertEqual(1440795324, matched.get("collection_id"))
+        self.assertEqual("catalog_index_text_key", matched.get("match_source"))
+
+    def test_update_music_index_entry_uses_collection_id_key(self):
+        wide = self.root / "1440795324__3840x2160.jpg"
+        wide.write_bytes(b"x")
+        uploader.update_music_index_entry(
+            artist="Michael Kiwanuka",
+            album="Home Again",
+            collection_id=1440795324,
+            catalog_key="1440795324__3840x2160.jpg",
+            cache_key="itc_1440795324",
+            content_id="MY_F1226",
+            wide_path=wide,
+            compressed_path=wide,
+            request_id="req_123",
+        )
+        index = json.loads(self.index.read_text(encoding="utf-8"))
+        entry = index["entries"]["1440795324"]
+        self.assertEqual("michael kiwanuka — home again", entry["text_key"])
+        self.assertEqual("ok", entry["status"])
+        self.assertEqual("MY_F1226", entry["content_id"])
+        self.assertEqual("reference_background_nomask", entry["prompt_variant"])
+        self.assertEqual("req_123", entry["request_id"])
+
+    def test_update_music_index_entry_uses_cache_stem_key_without_collection_id(self):
+        wide = self.root / "aa_milt-jackson-sunflower-40th-anniversary-edition_8d74a5e9__3840x2160.jpg"
+        wide.write_bytes(b"x")
+        uploader.update_music_index_entry(
+            artist="Milt Jackson",
+            album="Sunflower 40th Anniversary Edition",
+            collection_id=None,
+            catalog_key=wide.name,
+            cache_key="aa_milt-jackson-sunflower-40th-anniversary-edition_8d74a5e9",
+            content_id="MY_F2002",
+            wide_path=wide,
+            compressed_path=wide,
+            request_id=None,
+        )
+        index = json.loads(self.index.read_text(encoding="utf-8"))
+        entry_key = "aa_milt-jackson-sunflower-40th-anniversary-edition_8d74a5e9"
+        self.assertIn(entry_key, index["entries"])
+        self.assertEqual("milt jackson — sunflower 40th anniversary edition", index["entries"][entry_key]["text_key"])
+        self.assertEqual("MY_F2002", index["entries"][entry_key]["content_id"])
 
 
 if __name__ == "__main__":
