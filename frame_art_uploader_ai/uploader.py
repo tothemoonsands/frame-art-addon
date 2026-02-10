@@ -1011,6 +1011,7 @@ def main() -> None:
                     source_url = str(restore_payload.get("artwork_url", "")).strip()
                     artist = str(restore_payload.get("artist", "")).strip()
                     album = str(restore_payload.get("album", "")).strip()
+                    track = str(restore_payload.get("track", "")).strip()
                     collection_id_raw = restore_payload.get("collection_id")
                     collection_id: Optional[int] = None
                     if collection_id_raw not in (None, ""):
