@@ -1,7 +1,11 @@
 import json
+import os
 import re
 import time
+import uuid
 from datetime import datetime, timedelta, timezone
+from contextlib import contextmanager
+import fcntl
 from io import BytesIO
 from pathlib import Path
 from typing import Any, Optional
@@ -27,6 +31,8 @@ STATE_PATH = "/data/frame_art_uploader_state.json"
 
 # One-shot restore request written by Home Assistant.
 RESTORE_REQUEST_PATH = "/share/frame_art_restore_request.json"
+RESTORE_QUEUE_DIR = Path("/share/frame_art_restore_queue")
+WORKER_LOCK_PATH = Path("/share/frame_art_uploader_worker.lock")
 FALLBACK_DIR = Path("/media/frame_ai/cover_art/fallback")
 
 MYF_RE = re.compile(r"^MY[_-]F(\d+)", re.IGNORECASE)
@@ -57,7 +63,7 @@ def log_event(event: str, **fields: Any) -> None:
 
 
 def write_status(payload: dict) -> None:
-    payload["ts"] = time.time()
+    payload["ts"] = time.monotonic()
     with open(STATUS_PATH, "w", encoding="utf-8") as f:
         json.dump(payload, f, indent=2)
     log_event("status", **payload)
@@ -322,24 +328,9 @@ def choose_pick_samsung_id(payload: dict, rng: int, phase: str) -> Optional[str]
     return pool[idx]
 
 
-def read_restore_request() -> tuple[Optional[dict], bool, Optional[bool]]:
-    p = Path(RESTORE_REQUEST_PATH)
-    if not p.exists():
-        return None, False, None
-
-    try:
-        payload = json.loads(p.read_text(encoding="utf-8"))
-    except Exception as e:
-        write_status(
-            {
-                "ok": False,
-                "mode": "restore",
-                "error": "Malformed restore JSON",
-                "exception": repr(e),
-            }
-        )
-        clear_restore_request()
-        return None, True, None
+def parse_restore_request_payload(payload: Any) -> tuple[Optional[dict], Optional[bool], Optional[str]]:
+    if not isinstance(payload, dict):
+        return None, None, "Invalid restore payload: expected JSON object"
 
     requested_show = parse_bool(payload.get("show"))
 
@@ -351,22 +342,9 @@ def read_restore_request() -> tuple[Optional[dict], bool, Optional[bool]]:
                 req = req.replace(tzinfo=timezone.utc)
             age = datetime.now(timezone.utc) - req.astimezone(timezone.utc)
             if age > timedelta(hours=8):
-                clear_restore_request()
-                return None, True, requested_show
-        except Exception as e:
-            write_status(
-                {
-                    "ok": False,
-                    "mode": "restore",
-                    "error": "Malformed restore timestamp",
-                    "exception": repr(e),
-                }
-            )
-            clear_restore_request()
-            return None, True, requested_show
-
-    if not isinstance(payload, dict):
-        return None, True, requested_show
+                return None, requested_show, "Restore request expired (>8h old)"
+        except Exception:
+            return None, requested_show, "Malformed restore timestamp"
 
     normalized = dict(payload)
     kind = str(payload.get("kind", "")).strip().lower()
@@ -403,14 +381,65 @@ def read_restore_request() -> tuple[Optional[dict], bool, Optional[bool]]:
             except Exception:
                 normalized["collection_id"] = None
 
-    return normalized, True, requested_show
+    return normalized, requested_show, None
 
 
-def clear_restore_request() -> None:
+def _queue_sort_key(path: Path) -> tuple[float, str]:
     try:
-        Path(RESTORE_REQUEST_PATH).unlink()
+        return path.stat().st_mtime, path.name
     except Exception:
-        pass
+        return 0.0, path.name
+
+
+def list_queued_requests() -> list[Path]:
+    if not RESTORE_QUEUE_DIR.exists():
+        return []
+    files = [p for p in RESTORE_QUEUE_DIR.iterdir() if p.is_file() and p.suffix == ".json"]
+    return sorted(files, key=_queue_sort_key)
+
+
+def enqueue_restore_inbox_if_present() -> Optional[Path]:
+    inbox = Path(RESTORE_REQUEST_PATH)
+    if not inbox.exists():
+        return None
+
+    RESTORE_QUEUE_DIR.mkdir(parents=True, exist_ok=True)
+    unique = f"{time.time_ns()}_{os.getpid()}_{uuid.uuid4().hex}.json"
+    queued = RESTORE_QUEUE_DIR / unique
+    os.replace(inbox, queued)
+    return queued
+
+
+def dequeue_next_restore_work_item() -> Optional[Path]:
+    queued = list_queued_requests()
+    if not queued:
+        return None
+    return queued[0]
+
+
+@contextmanager
+def worker_lock() -> Any:
+    WORKER_LOCK_PATH.parent.mkdir(parents=True, exist_ok=True)
+    with open(WORKER_LOCK_PATH, "a+", encoding="utf-8") as lock_file:
+        try:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            got_lock = True
+        except BlockingIOError:
+            got_lock = False
+        try:
+            yield got_lock
+        finally:
+            if got_lock:
+                fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+
+
+def load_restore_work_item(path: Path) -> tuple[Optional[dict], Optional[bool], Optional[str]]:
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return None, None, "Malformed restore JSON"
+
+    return parse_restore_request_payload(payload)
 
 
 def prepare_for_frame(img_bytes: bytes) -> tuple[bytes, str]:
@@ -574,298 +603,313 @@ def main() -> None:
         )
         return
 
-    restore_payload, had_restore_request, requested_show = read_restore_request()
-    if restore_payload:
-        try:
-            current_info = get_current_info(art)
-            is_art_mode = bool(current_info) or extract_content_id(current_info) is not None
-            show_flag = requested_show if requested_show is not None else is_art_mode
+    enqueue_restore_inbox_if_present()
 
-            kind = str(restore_payload.get("kind", "")).strip().lower()
-            request_value = str(restore_payload.get("value", "")).strip()
-            resolved_folder = None
-            file_count = 0
-            chosen_index = -1
-            selected_name = None
-            pick_source = None
-            encoded_type = None
-            encoded_bytes = None
-            rng = None
-            phase_roll = None
-            bucket = None
-            samsung_buckets = None
+    with worker_lock() as has_lock:
+        if not has_lock:
+            write_status(
+                {
+                    "ok": True,
+                    "mode": "queue",
+                    "kind": "queue_busy",
+                    "requested_at": "",
+                    "error": "worker_already_processing",
+                }
+            )
+            return
 
-            if kind == "content_id":
-                target_cid = request_value
-                if not target_cid:
-                    raise ValueError(
-                        f"Invalid restore request: missing content_id value (kind={kind}, value={request_value!r}, resolved_folder={resolved_folder})"
-                    )
-                selected_name = target_cid
-            elif kind == "local_file":
-                local_path = resolve_local_path(request_value)
-                if local_path is None:
-                    raise ValueError(
-                        f"Invalid restore request: local_file must be an existing jpg/png under /media/frame_ai (kind={kind}, value={request_value!r}, resolved_folder={resolved_folder})"
-                    )
-                art, target_cid = upload_local_file_with_reconnect(tv_ip, art, local_path)
-                if not target_cid:
-                    raise ValueError(
-                        f"Upload completed but content_id was not discovered (kind={kind}, value={request_value!r}, resolved_folder={local_path.parent})"
-                    )
-                append_local_uploaded_id(state, target_cid)
-                state["last_applied"] = str(local_path)
-                resolved_folder = str(local_path.parent)
-                file_count = 1
-                chosen_index = 0
-                selected_name = local_path.name
-            elif kind == "pick":
-                rng, phase_roll, phase = compute_phase_roll(restore_payload)
-                prefer_samsung, bucket, samsung_buckets = should_pick_samsung_bucket(rng, pick_samsung_pct)
+        while True:
+            enqueue_restore_inbox_if_present()
+            work_item = dequeue_next_restore_work_item()
+            if work_item is None:
+                break
 
-                if prefer_samsung:
-                    target_cid = choose_pick_samsung_id(restore_payload, rng, phase)
-                    if target_cid:
-                        pick_source = "samsung"
-                        resolved_folder = "samsung_pool"
-                        selected_name = target_cid
-                    else:
-                        pick_source = "local"
-                else:
-                    pick_source = "local"
+            requested_at = ""
+            payload_kind = None
+            try:
+                restore_payload, requested_show, parse_error = load_restore_work_item(work_item)
+                if restore_payload:
+                    payload_kind = str(restore_payload.get("kind", "")).strip().lower() or None
+                    requested_at = str(restore_payload.get("requested_at", "")).strip()
+                if parse_error:
+                    raise ValueError(parse_error)
+                if not restore_payload:
+                    raise ValueError("Invalid restore payload")
 
-                if pick_source == "local":
-                    pick_file, resolved_folder, file_count, chosen_index = choose_pick_file(restore_payload, state)
-                    if not pick_file:
-                        raise ValueError(
-                            f"No candidate files found for pick request (kind={kind}, value={request_value!r}, resolved_folder={resolved_folder})"
-                        )
-                    art, target_cid = upload_local_file_with_reconnect(tv_ip, art, pick_file)
+                current_info = get_current_info(art)
+                is_art_mode = bool(current_info) or extract_content_id(current_info) is not None
+                show_flag = requested_show if requested_show is not None else is_art_mode
+
+                kind = str(restore_payload.get("kind", "")).strip().lower()
+                request_value = str(restore_payload.get("value", "")).strip()
+                resolved_folder = None
+                file_count = 0
+                chosen_index = -1
+                selected_name = None
+                pick_source = None
+                encoded_type = None
+                encoded_bytes = None
+                rng = None
+                phase_roll = None
+                bucket = None
+                samsung_buckets = None
+
+                if kind == "content_id":
+                    target_cid = request_value
                     if not target_cid:
                         raise ValueError(
-                            f"Upload completed but content_id was not discovered (kind={kind}, value={request_value!r}, resolved_folder={resolved_folder})"
+                            f"Invalid restore request: missing content_id value (kind={kind}, value={request_value!r}, resolved_folder={resolved_folder})"
+                        )
+                    selected_name = target_cid
+                elif kind == "local_file":
+                    local_path = resolve_local_path(request_value)
+                    if local_path is None:
+                        raise ValueError(
+                            f"Invalid restore request: local_file must be an existing jpg/png under /media/frame_ai (kind={kind}, value={request_value!r}, resolved_folder={resolved_folder})"
+                        )
+                    art, target_cid = upload_local_file_with_reconnect(tv_ip, art, local_path)
+                    if not target_cid:
+                        raise ValueError(
+                            f"Upload completed but content_id was not discovered (kind={kind}, value={request_value!r}, resolved_folder={local_path.parent})"
                         )
                     append_local_uploaded_id(state, target_cid)
-                    state["last_applied"] = str(pick_file)
-                    selected_name = pick_file.name
-                else:
-                    state["last_applied"] = f"samsung:{target_cid}"
-            elif kind in {"cover_art_reference_background", "cover_art_outpaint"}:
-                ensure_dirs()
-                source_url = str(restore_payload.get("artwork_url", "")).strip()
-                artist = str(restore_payload.get("artist", "")).strip()
-                album = str(restore_payload.get("album", "")).strip()
-                collection_id_raw = restore_payload.get("collection_id")
-                collection_id: Optional[int] = None
-                if collection_id_raw not in (None, ""):
-                    try:
-                        collection_id = int(collection_id_raw)
-                    except Exception:
-                        collection_id = None
+                    state["last_applied"] = str(local_path)
+                    resolved_folder = str(local_path.parent)
+                    file_count = 1
+                    chosen_index = 0
+                    selected_name = local_path.name
+                elif kind == "pick":
+                    rng, phase_roll, phase = compute_phase_roll(restore_payload)
+                    prefer_samsung, bucket, samsung_buckets = should_pick_samsung_bucket(rng, pick_samsung_pct)
 
-                cache_key = normalize_key(collection_id, artist, album)
-                src_path = SOURCE_DIR / f"{cache_key}.jpg"
-                wide_png_path = WIDESCREEN_DIR / f"{cache_key}.png"
-                wide_jpg_path = WIDESCREEN_DIR / f"{cache_key}.jpg"
-                wide_path = wide_png_path if wide_png_path.exists() else wide_jpg_path
+                    if prefer_samsung:
+                        target_cid = choose_pick_samsung_id(restore_payload, rng, phase)
+                        if target_cid:
+                            pick_source = "samsung"
+                            resolved_folder = "samsung_pool"
+                            selected_name = target_cid
+                        else:
+                            pick_source = "local"
+                    else:
+                        pick_source = "local"
 
-                resolved_folder = str(WIDESCREEN_DIR)
-                selected_name = wide_path.name
-                file_count = 1
-                chosen_index = 0
+                    if pick_source == "local":
+                        pick_file, resolved_folder, file_count, chosen_index = choose_pick_file(restore_payload, state)
+                        if not pick_file:
+                            raise ValueError(
+                                f"No candidate files found for pick request (kind={kind}, value={request_value!r}, resolved_folder={resolved_folder})"
+                            )
+                        art, target_cid = upload_local_file_with_reconnect(tv_ip, art, pick_file)
+                        if not target_cid:
+                            raise ValueError(
+                                f"Upload completed but content_id was not discovered (kind={kind}, value={request_value!r}, resolved_folder={resolved_folder})"
+                            )
+                        append_local_uploaded_id(state, target_cid)
+                        state["last_applied"] = str(pick_file)
+                        selected_name = pick_file.name
+                    else:
+                        state["last_applied"] = f"samsung:{target_cid}"
+                elif kind in {"cover_art_reference_background", "cover_art_outpaint"}:
+                    ensure_dirs()
+                    source_url = str(restore_payload.get("artwork_url", "")).strip()
+                    artist = str(restore_payload.get("artist", "")).strip()
+                    album = str(restore_payload.get("album", "")).strip()
+                    collection_id_raw = restore_payload.get("collection_id")
+                    collection_id: Optional[int] = None
+                    if collection_id_raw not in (None, ""):
+                        try:
+                            collection_id = int(collection_id_raw)
+                        except Exception:
+                            collection_id = None
 
-                if wide_path.exists():
-                    encoded_type = guess_file_type(wide_path)
-                    encoded_bytes = wide_path.stat().st_size
-                    art, target_cid = upload_local_file_with_reconnect(tv_ip, art, wide_path)
-                    if not target_cid:
-                        raise ValueError("Cached widescreen upload succeeded but content_id was not found")
-                    append_uploaded_id(state, "cover_uploaded_ids", target_cid)
-                    pick_source = "cover_art_cache"
-                else:
-                    FALLBACK_DIR.mkdir(parents=True, exist_ok=True)
-                    cover_error: Optional[Exception] = None
-                    fallback_path: Optional[Path] = None
-                    try:
-                        if not source_url:
-                            if collection_id is not None:
-                                lookup = itunes_lookup(collection_id, timeout_s=10)
-                                results = lookup.get("results") if isinstance(lookup, dict) else []
-                                album_info = {}
-                                if isinstance(results, list):
-                                    for item in results:
-                                        if isinstance(item, dict) and (item.get("artworkUrl100") or item.get("artworkUrl60")):
-                                            album_info = item
-                                            break
-                                source_url = resolve_artwork_url(album_info)
-                            elif artist and album:
-                                album_info = itunes_search(artist, album, timeout_s=10)
-                                source_url = resolve_artwork_url(album_info)
-                            else:
-                                raise ValueError("unsupported metadata; provide artwork_url, collection_id, or artist+album")
+                    cache_key = normalize_key(collection_id, artist, album)
+                    src_path = SOURCE_DIR / f"{cache_key}.jpg"
+                    wide_png_path = WIDESCREEN_DIR / f"{cache_key}.png"
+                    wide_jpg_path = WIDESCREEN_DIR / f"{cache_key}.jpg"
+                    wide_path = wide_png_path if wide_png_path.exists() else wide_jpg_path
 
-                        if not source_url:
-                            raise ValueError("Unable to resolve artwork URL from request metadata")
+                    resolved_folder = str(WIDESCREEN_DIR)
+                    selected_name = wide_path.name
+                    file_count = 1
+                    chosen_index = 0
 
-                        if not src_path.exists():
-                            download_artwork(source_url, str(src_path), timeout_s=15)
-
-                        use_legacy_masked = bool(RUNTIME_OPTIONS.get("legacy_masked_outpaint", False))
-                        if use_legacy_masked:
-                            log_event("legacy_masked_outpaint_requested", enabled=True, note="using reference_no_mask pipeline")
-
-                        final_png, background_png, request_id, model_used = generate_reference_frame_from_album(
-                            source_album_path=src_path,
-                            openai_api_key=openai_api_key,
-                            openai_model=openai_model,
-                            timeout_s=90,
-                            album_shadow=True,
-                        )
-                        encoded_type = "PNG"
-                        encoded_bytes = len(final_png)
-                        wide_path = wide_png_path
-                        selected_name = wide_path.name
-                        wide_path.write_bytes(final_png)
-
-                        save_bg = bool(RUNTIME_OPTIONS.get("save_background_layer", True))
-                        if save_bg:
-                            background_path = WIDESCREEN_DIR / f"{cache_key}__background.png"
-                            background_path.write_bytes(background_png)
-
+                    if wide_path.exists():
+                        encoded_type = guess_file_type(wide_path)
+                        encoded_bytes = wide_path.stat().st_size
                         art, target_cid = upload_local_file_with_reconnect(tv_ip, art, wide_path)
                         if not target_cid:
-                            raise ValueError("Outpaint upload succeeded but content_id was not found")
+                            raise ValueError("Cached widescreen upload succeeded but content_id was not found")
                         append_uploaded_id(state, "cover_uploaded_ids", target_cid)
+                        pick_source = "cover_art_cache"
+                    else:
+                        FALLBACK_DIR.mkdir(parents=True, exist_ok=True)
+                        cover_error: Optional[Exception] = None
+                        fallback_path: Optional[Path] = None
+                        try:
+                            if not source_url:
+                                if collection_id is not None:
+                                    lookup = itunes_lookup(collection_id, timeout_s=10)
+                                    results = lookup.get("results") if isinstance(lookup, dict) else []
+                                    album_info = {}
+                                    if isinstance(results, list):
+                                        for item in results:
+                                            if isinstance(item, dict) and (item.get("artworkUrl100") or item.get("artworkUrl60")):
+                                                album_info = item
+                                                break
+                                    source_url = resolve_artwork_url(album_info)
+                                elif artist and album:
+                                    album_info = itunes_search(artist, album, timeout_s=10)
+                                    source_url = resolve_artwork_url(album_info)
+                                else:
+                                    raise ValueError("unsupported metadata; provide artwork_url, collection_id, or artist+album")
 
-                        pick_source = "cover_art_reference_background"
-                    except Exception as e:
-                        cover_error = e
-                        fallback_path = pick_cover_fallback(cache_key)
-                        if fallback_path is None:
-                            raise cover_error
-                        art, target_cid = upload_local_file_with_reconnect(tv_ip, art, fallback_path)
-                        if not target_cid:
-                            raise ValueError("Fallback upload completed but content_id was not discovered")
-                        append_uploaded_id(state, "cover_uploaded_ids", target_cid)
-                        pick_source = "cover_art_fallback"
-                        selected_name = fallback_path.name
-                        resolved_folder = str(FALLBACK_DIR)
-                        file_count = 1
-                        chosen_index = 0
-            else:
-                raise ValueError(
-                    f"Unsupported restore kind (kind={kind!r}, value={request_value!r}, resolved_folder={resolved_folder})"
-                )
+                            if not source_url:
+                                raise ValueError("Unable to resolve artwork URL from request metadata")
 
-            art.select_image(target_cid, show=show_flag)
+                            if not src_path.exists():
+                                download_artwork(source_url, str(src_path), timeout_s=15)
 
-            verified: Optional[bool] = None
-            verification_skipped = not show_flag
-            if show_flag:
+                            use_legacy_masked = bool(RUNTIME_OPTIONS.get("legacy_masked_outpaint", False))
+                            if use_legacy_masked:
+                                log_event("legacy_masked_outpaint_requested", enabled=True, note="using reference_no_mask pipeline")
+
+                            final_png, background_png, request_id, model_used = generate_reference_frame_from_album(
+                                source_album_path=src_path,
+                                openai_api_key=openai_api_key,
+                                openai_model=openai_model,
+                                timeout_s=90,
+                                album_shadow=True,
+                            )
+                            encoded_type = "PNG"
+                            encoded_bytes = len(final_png)
+                            wide_path = wide_png_path
+                            wide_path.write_bytes(final_png)
+                            art.upload(final_png, file_type="PNG", matte="none")
+                            available = art.available()
+                            myf = extract_myf_ids(available)
+                            target_cid = myf[-1][1] if myf else None
+                            if not target_cid:
+                                raise ValueError("Generated cover upload succeeded but content_id was not found")
+                            append_uploaded_id(state, "cover_uploaded_ids", target_cid)
+                            pick_source = "cover_art_generated"
+                        except Exception as e:
+                            cover_error = e
+                            fallback_path = pick_cover_fallback(cache_key)
+                            if fallback_path is None:
+                                raise
+                            encoded_type = guess_file_type(fallback_path)
+                            encoded_bytes = fallback_path.stat().st_size
+                            art, target_cid = upload_local_file_with_reconnect(tv_ip, art, fallback_path)
+                            if not target_cid:
+                                raise ValueError("Fallback cover upload succeeded but content_id was not found")
+                            append_uploaded_id(state, "cover_uploaded_ids", target_cid)
+                            pick_source = "cover_art_fallback"
+                            log_event("cover_art_fallback", cache_key=cache_key, error=repr(cover_error), fallback=str(fallback_path))
+                else:
+                    raise ValueError(f"Unsupported restore kind: {kind!r}")
+
                 verified = False
-                for _ in range(3):
-                    time.sleep(1.0)
-                    current_info = get_current_info(art)
+                verification_skipped = False
+
+                if show_flag and target_cid:
                     current_id = extract_content_id(current_info)
                     if current_id == target_cid:
                         verified = True
-                        break
-                    art.select_image(target_cid, show=True)
+                    else:
+                        art.select_image(target_cid, show=True)
+                        for _ in range(3):
+                            time.sleep(1.0)
+                            current_info = get_current_info(art)
+                            current_id = extract_content_id(current_info)
+                            if current_id == target_cid:
+                                verified = True
+                                break
+                            art.select_image(target_cid, show=True)
+                else:
+                    verification_skipped = True
 
-            deleted_local: list[str] = []
-            cleanup_error: Optional[str] = None
-            if kind == "pick" and pick_source == "local":
-                deleted_local, cleanup_error = cleanup_local_uploads(art, state, keep_count_local)
-            elif kind == "local_file":
-                deleted_local, cleanup_error = cleanup_local_uploads(art, state, keep_count_local)
-            elif kind in {"cover_art_reference_background", "cover_art_outpaint"}:
-                deleted_local, cleanup_error = cleanup_frame_uploads(art, state, "cover_uploaded_ids", keep_count_local)
-            save_state(state)
+                deleted_local: list[str] = []
+                cleanup_error: Optional[str] = None
+                if kind == "pick" and pick_source == "local":
+                    deleted_local, cleanup_error = cleanup_local_uploads(art, state, keep_count_local)
+                elif kind == "local_file":
+                    deleted_local, cleanup_error = cleanup_local_uploads(art, state, keep_count_local)
+                elif kind in {"cover_art_reference_background", "cover_art_outpaint"}:
+                    deleted_local, cleanup_error = cleanup_frame_uploads(art, state, "cover_uploaded_ids", keep_count_local)
+                save_state(state)
 
-            log_event(
-                "restore_request",
-                kind=kind,
-                resolved_folder=resolved_folder,
-                file_count=file_count,
-                chosen_index=chosen_index,
-                chosen=selected_name or target_cid,
-                pick_source=pick_source,
-                rng=rng,
-                phase_roll=phase_roll,
-                bucket=bucket,
-                samsung_buckets=samsung_buckets,
-                pick_samsung_pct=pick_samsung_pct,
-                cleanup_deletions=len(deleted_local),
-                cleanup_error=cleanup_error,
-            )
+                log_event(
+                    "restore_request",
+                    kind=kind,
+                    resolved_folder=resolved_folder,
+                    file_count=file_count,
+                    chosen_index=chosen_index,
+                    chosen=selected_name or target_cid,
+                    pick_source=pick_source,
+                    rng=rng,
+                    phase_roll=phase_roll,
+                    bucket=bucket,
+                    samsung_buckets=samsung_buckets,
+                    pick_samsung_pct=pick_samsung_pct,
+                    cleanup_deletions=len(deleted_local),
+                    cleanup_error=cleanup_error,
+                )
 
-            write_status(
-                {
-                    "ok": True if not show_flag else bool(verified),
-                    "mode": "restore",
-                    "tv_ip": tv_ip,
-                    "kind": kind,
-                    "value": request_value,
-                    "requested_at": str(restore_payload.get("requested_at", "")) if isinstance(restore_payload, dict) else "",
-                    "resolved_folder": resolved_folder,
-                    "file_count": file_count,
-                    "chosen_index": chosen_index,
-                    "requested_show": requested_show,
-                    "art_mode": is_art_mode,
-                    "pick_source": pick_source,
-                    "rng": rng,
-                    "phase_roll": phase_roll,
-                    "bucket": bucket,
-                    "samsung_buckets": samsung_buckets,
-                    "pick_samsung_pct": pick_samsung_pct,
-                    "addon_version": ADDON_VERSION,
-                    "selected_content_id": target_cid,
-                    "chosen": selected_name or target_cid,
-                    "deleted_local": deleted_local,
-                    "cleanup_error": cleanup_error,
-                    "verified": verified,
-                    "verification_skipped": verification_skipped,
-                    "cache_key": locals().get("cache_key"),
-                    "source_path": str(locals().get("src_path")) if "src_path" in locals() else None,
-                    "widescreen_path": str(locals().get("wide_path")) if "wide_path" in locals() else None,
-                    "fallback_path": str(locals().get("fallback_path")) if "fallback_path" in locals() and locals().get("fallback_path") else None,
-                    "encoded_type": encoded_type if kind in {"cover_art_outpaint", "cover_art_reference_background"} else None,
-                    "encoded_bytes": encoded_bytes if kind in {"cover_art_outpaint", "cover_art_reference_background"} else None,
-                    "prompt_variant": "reference_background_nomask" if kind in {"cover_art_outpaint", "cover_art_reference_background"} else None,
-                    "pipeline": "reference_no_mask" if kind in {"cover_art_outpaint", "cover_art_reference_background"} else None,
-                    "mask_mode": "none" if kind in {"cover_art_outpaint", "cover_art_reference_background"} else None,
-                    "openai_request_id": locals().get("request_id"),
-                    "openai_model_used": locals().get("model_used"),
-                }
-            )
-
-        except Exception as e:
-            write_status(
-                {
-                    "ok": False,
-                    "mode": "restore",
-                    "tv_ip": tv_ip,
-                    "kind": restore_payload.get("kind") if isinstance(restore_payload, dict) else None,
-                    "value": str(restore_payload.get("value", "")) if isinstance(restore_payload, dict) else None,
-                    "resolved_folder": locals().get("resolved_folder"),
-                    "error": repr(e),
-                }
-            )
-
-        clear_restore_request()
-        return
-    elif had_restore_request:
-        write_status(
-            {
-                "ok": False,
-                "mode": "restore",
-                "tv_ip": tv_ip,
-                "error": "Invalid or missing restore content_id",
-                "requested_show": requested_show,
-            }
-        )
-        clear_restore_request()
-        return
+                write_status(
+                    {
+                        "ok": True if not show_flag else bool(verified),
+                        "mode": "restore",
+                        "tv_ip": tv_ip,
+                        "kind": kind,
+                        "value": request_value,
+                        "requested_at": requested_at,
+                        "resolved_folder": resolved_folder,
+                        "file_count": file_count,
+                        "chosen_index": chosen_index,
+                        "requested_show": requested_show,
+                        "art_mode": is_art_mode,
+                        "pick_source": pick_source,
+                        "rng": rng,
+                        "phase_roll": phase_roll,
+                        "bucket": bucket,
+                        "samsung_buckets": samsung_buckets,
+                        "pick_samsung_pct": pick_samsung_pct,
+                        "addon_version": ADDON_VERSION,
+                        "selected_content_id": target_cid,
+                        "chosen": selected_name or target_cid,
+                        "deleted_local": deleted_local,
+                        "cleanup_error": cleanup_error,
+                        "verified": verified,
+                        "verification_skipped": verification_skipped,
+                        "cache_key": locals().get("cache_key"),
+                        "source_path": str(locals().get("src_path")) if "src_path" in locals() else None,
+                        "widescreen_path": str(locals().get("wide_path")) if "wide_path" in locals() else None,
+                        "fallback_path": str(locals().get("fallback_path")) if "fallback_path" in locals() and locals().get("fallback_path") else None,
+                        "encoded_type": encoded_type if kind in {"cover_art_outpaint", "cover_art_reference_background"} else None,
+                        "encoded_bytes": encoded_bytes if kind in {"cover_art_outpaint", "cover_art_reference_background"} else None,
+                        "prompt_variant": "reference_background_nomask" if kind in {"cover_art_outpaint", "cover_art_reference_background"} else None,
+                        "pipeline": "reference_no_mask" if kind in {"cover_art_outpaint", "cover_art_reference_background"} else None,
+                        "mask_mode": "none" if kind in {"cover_art_outpaint", "cover_art_reference_background"} else None,
+                        "openai_request_id": locals().get("request_id"),
+                        "openai_model_used": locals().get("model_used"),
+                    }
+                )
+            except Exception as e:
+                write_status(
+                    {
+                        "ok": False,
+                        "mode": "restore",
+                        "tv_ip": tv_ip,
+                        "kind": payload_kind,
+                        "requested_at": requested_at,
+                        "error": repr(e),
+                    }
+                )
+            finally:
+                try:
+                    work_item.unlink()
+                except Exception:
+                    pass
 
     img_path = newest_candidate(inbox_dir, prefix)
     if img_path is None:
