@@ -1,3 +1,6 @@
 .DS_Store
 __MACOSX/
 ._*
+
+# Codex local context artifacts
+.codex/context/
