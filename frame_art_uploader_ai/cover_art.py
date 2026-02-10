@@ -144,10 +144,10 @@ def generate_reference_background(
 
     headers = {"Authorization": f"Bearer {openai_api_key}"}
     with open(input_image_path, "rb") as image_file:
-        # The OpenAI edits endpoint expects a single image payload under `image`.
-        # Sending `image[]` can trigger server-side mask validation paths and produce
-        # "mask size does not match image size" even when no mask was supplied.
-        files = {"image": (Path(input_image_path).name, image_file, "image/png")}
+        # gpt-image-1 edits uses multipart key `image[]` for reference images.
+        # Using the legacy `image` field can route requests through old edit
+        # validation paths that report misleading mask-format errors.
+        files = [("image[]", (Path(input_image_path).name, image_file, "image/png"))]
         data: dict[str, Any] = {
             "model": openai_model,
             "prompt": REFERENCE_BACKGROUND_PROMPT,
