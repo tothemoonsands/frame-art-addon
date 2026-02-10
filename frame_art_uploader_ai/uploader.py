@@ -108,16 +108,32 @@ def append_uploaded_id(state: dict, state_key: str, target_cid: Any) -> None:
 def load_state() -> dict:
     p = Path(STATE_PATH)
     if not p.exists():
-        return {"last_applied": None, "local_uploaded_ids": [], "cover_uploaded_ids": []}
+        return {
+            "last_applied": None,
+            "local_uploaded_ids": [],
+            "cover_uploaded_ids": [],
+            "pending_keep_count_cleanup": False,
+        }
     try:
         data = json.loads(p.read_text(encoding="utf-8"))
     except Exception:
-        return {"last_applied": None, "local_uploaded_ids": [], "cover_uploaded_ids": []}
+        return {
+            "last_applied": None,
+            "local_uploaded_ids": [],
+            "cover_uploaded_ids": [],
+            "pending_keep_count_cleanup": False,
+        }
     if not isinstance(data, dict):
-        return {"last_applied": None, "local_uploaded_ids": [], "cover_uploaded_ids": []}
+        return {
+            "last_applied": None,
+            "local_uploaded_ids": [],
+            "cover_uploaded_ids": [],
+            "pending_keep_count_cleanup": False,
+        }
     data.setdefault("last_applied", None)
     data["local_uploaded_ids"] = sanitize_local_uploaded_ids(data.get("local_uploaded_ids"))
     data["cover_uploaded_ids"] = sanitize_local_uploaded_ids(data.get("cover_uploaded_ids"))
+    data["pending_keep_count_cleanup"] = bool(data.get("pending_keep_count_cleanup", False))
     return data
 
 
@@ -574,6 +590,25 @@ def cleanup_frame_uploads(art: Any, state: dict, state_key: str, keep_count_loca
     return deleted, delete_error
 
 
+def run_pending_keep_count_cleanup(art: Any, state: dict, keep_count: int) -> list[str]:
+    if not state.get("pending_keep_count_cleanup"):
+        return []
+
+    available = art.available()
+    myf = extract_myf_ids(available)
+    if keep_count > 0 and len(myf) > keep_count:
+        to_delete = [cid for (_, cid) in myf[:-keep_count]]
+        if to_delete:
+            art.delete_list(to_delete)
+            state["pending_keep_count_cleanup"] = False
+            save_state(state)
+            return to_delete
+
+    state["pending_keep_count_cleanup"] = False
+    save_state(state)
+    return []
+
+
 # ------------------------------------------------------------
 # Main
 # ------------------------------------------------------------
@@ -848,6 +883,14 @@ def main() -> None:
                     deleted_local, cleanup_error = cleanup_local_uploads(art, state, keep_count_local)
                 elif kind in {"cover_art_reference_background", "cover_art_outpaint"}:
                     deleted_local, cleanup_error = cleanup_frame_uploads(art, state, "cover_uploaded_ids", keep_count_local)
+
+                deleted_keep_count: list[str] = []
+                pending_cleanup_error: Optional[str] = None
+                try:
+                    deleted_keep_count = run_pending_keep_count_cleanup(art, state, keep_count)
+                except Exception as e:
+                    pending_cleanup_error = repr(e)
+
                 save_state(state)
 
                 log_event(
@@ -865,6 +908,8 @@ def main() -> None:
                     pick_samsung_pct=pick_samsung_pct,
                     cleanup_deletions=len(deleted_local),
                     cleanup_error=cleanup_error,
+                    keep_count_cleanup_deletions=len(deleted_keep_count),
+                    keep_count_cleanup_error=pending_cleanup_error,
                 )
 
                 write_status(
@@ -891,6 +936,8 @@ def main() -> None:
                         "chosen": selected_name or target_cid,
                         "deleted_local": deleted_local,
                         "cleanup_error": cleanup_error,
+                        "keep_count_deleted": deleted_keep_count,
+                        "keep_count_cleanup_error": pending_cleanup_error,
                         "verified": verified,
                         "verification_skipped": verification_skipped,
                         "cache_key": locals().get("cache_key"),
@@ -946,11 +993,11 @@ def main() -> None:
     newest = myf[-1][1] if myf else None
 
     deleted: list[str] = []
+    cleanup_scheduled = False
     if keep_count > 0 and len(myf) > keep_count:
-        to_delete = [cid for (_, cid) in myf[:-keep_count]]
-        if to_delete:
-            art.delete_list(to_delete)
-            deleted = to_delete
+        state["pending_keep_count_cleanup"] = True
+        cleanup_scheduled = True
+        save_state(state)
 
     if select_after and newest:
         art.select_image(newest, show=True)
@@ -967,6 +1014,7 @@ def main() -> None:
             "keep_count": keep_count,
             "myf_count": len(myf),
             "deleted": deleted,
+            "keep_count_cleanup_scheduled": cleanup_scheduled,
         }
     )
 
