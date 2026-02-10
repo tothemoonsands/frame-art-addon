@@ -1332,7 +1332,6 @@ def main() -> None:
                     source_url = str(restore_payload.get("artwork_url", "")).strip()
                     artist = str(restore_payload.get("artist", "")).strip()
                     album = str(restore_payload.get("album", "")).strip()
-                    track = str(restore_payload.get("track", "")).strip()
                     association_record = lookup_music_association(restore_payload)
                     if isinstance(association_record, dict):
                         log_event(
@@ -1409,6 +1408,11 @@ def main() -> None:
                     if wide_path.exists():
                         catalog_key = music_catalog_key_for_path(wide_path)
                         cached_content_id = lookup_catalog_content_id(MUSIC_CATALOG_PATH, catalog_key)
+                        association_content_id = (
+                            str(association_record.get("content_id", "")).strip()
+                            if isinstance(association_record, dict)
+                            else ""
+                        )
                         if cached_content_id:
                             target_cid = cached_content_id
                             encoded_type = guess_file_type(wide_path)
@@ -1431,6 +1435,29 @@ def main() -> None:
                                 request_id=None,
                             )
                             pick_source = "music_cache_catalog_hit"
+                        elif association_content_id:
+                            target_cid = association_content_id
+                            encoded_type = guess_file_type(wide_path)
+                            encoded_bytes = wide_path.stat().st_size
+                            update_catalog_content_id(MUSIC_CATALOG_PATH, catalog_key, target_cid)
+                            update_music_association(
+                                restore_payload,
+                                cache_key=cache_key,
+                                catalog_key=catalog_key,
+                                content_id=target_cid,
+                            )
+                            update_music_index_entry(
+                                artist=artist,
+                                album=album,
+                                collection_id=collection_id,
+                                catalog_key=catalog_key,
+                                cache_key=cache_key,
+                                content_id=target_cid,
+                                wide_path=wide_path,
+                                compressed_path=wide_path if wide_path.suffix.lower() in {".jpg", ".jpeg"} else compressed_jpg_path,
+                                request_id=None,
+                            )
+                            pick_source = "music_cache_association_content_id"
                         else:
                             encoded_type = guess_file_type(wide_path)
                             encoded_bytes = wide_path.stat().st_size
@@ -1571,7 +1598,7 @@ def main() -> None:
                                     "collection_id": collection_id,
                                     "artist": artist,
                                     "album": album,
-                                    "track": track,
+                                    "track": str(restore_payload.get("track", "")).strip(),
                                     "music_session_key": restore_payload.get("music_session_key", ""),
                                     "key_source": restore_payload.get("key_source", ""),
                                     "error": repr(e),
