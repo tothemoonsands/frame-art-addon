@@ -61,6 +61,7 @@ options:
   select_after_upload: true
   openai_api_key: ""
   openai_model: "gpt-image-1"
+  legacy_masked_outpaint: false
 
 schema:
   tv_ip: str
@@ -131,3 +132,4 @@ schema:
   select_after_upload: bool
   openai_api_key: str
   openai_model: str
+  legacy_masked_outpaint: bool

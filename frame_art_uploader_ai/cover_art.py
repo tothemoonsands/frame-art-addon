@@ -282,6 +282,10 @@ def convert_generated_to_background(generated_bytes: bytes) -> Image.Image:
     return im.crop((0, top, FRAME_FINAL_WIDTH, top + FRAME_FINAL_HEIGHT))
 
 
+def ha_edit_to_frame(generated_bytes: bytes) -> Image.Image:
+    return convert_generated_to_background(generated_bytes)
+
+
 def composite_album(
     background: Image.Image,
     source_album_path: Path,
@@ -310,6 +314,35 @@ def composite_album(
     album_layer.paste(album, (x, y), album)
     final = Image.alpha_composite(final, album_layer)
     return final.convert("RGB")
+
+
+def generate_reference_frame_from_album(
+    source_album_path: Path,
+    openai_api_key: str,
+    openai_model: str,
+    seed: Optional[int] = None,
+    timeout_s: int = 90,
+    album_shadow: bool = True,
+) -> tuple[bytes, bytes, Optional[str], Optional[str]]:
+    reference_canvas_png = build_reference_canvas_from_album(str(source_album_path))
+    generated_bytes, request_id, model_used = _request_openai_reference_background(
+        input_canvas_png=reference_canvas_png,
+        openai_api_key=openai_api_key,
+        openai_model=openai_model,
+        seed=seed,
+        timeout_s=timeout_s,
+    )
+
+    background = ha_edit_to_frame(generated_bytes)
+    final = composite_album(background, source_album_path, album_shadow=album_shadow)
+
+    background_out = BytesIO()
+    background.save(background_out, format="PNG", optimize=True, compress_level=9)
+
+    final_out = BytesIO()
+    final.save(final_out, format="PNG", optimize=True, compress_level=9)
+
+    return final_out.getvalue(), background_out.getvalue(), request_id, model_used
 
 
 def infer_content_id(path: Path) -> Optional[str]:
@@ -368,7 +401,7 @@ def process_source_file(
         result["request_id"] = request_id
         result["model_used"] = model_used or model
 
-        background = convert_generated_to_background(generated_bytes)
+        background = ha_edit_to_frame(generated_bytes)
         if save_background_layer:
             background.save(background_path, format="PNG", optimize=True, compress_level=9)
             result["background_bytes"] = background_path.stat().st_size
