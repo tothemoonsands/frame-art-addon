@@ -474,6 +474,24 @@ def load_frame_art_catalog(path: Path) -> dict[str, Any]:
     return data
 
 
+def load_frame_art_catalog_with_validity(path: Path) -> tuple[dict[str, Any], bool]:
+    if not path.exists():
+        return {"version": 1, "updated_at": "", "entries": {}}, True
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return {"version": 1, "updated_at": "", "entries": {}}, False
+    if not isinstance(data, dict):
+        return {"version": 1, "updated_at": "", "entries": {}}, False
+    entries = data.get("entries")
+    if not isinstance(entries, dict):
+        entries = {}
+    data["version"] = 1
+    data["entries"] = entries
+    data.setdefault("updated_at", "")
+    return data, True
+
+
 def persist_ambient_catalog(path: Path, catalog: dict[str, Any]) -> None:
     persist_frame_art_catalog(path, catalog)
 
@@ -752,7 +770,13 @@ def update_music_index_entry(
     request_id: Optional[str],
 ) -> None:
     index_path = select_music_index_write_path()
-    catalog = load_frame_art_catalog(index_path)
+    catalog, is_valid = load_frame_art_catalog_with_validity(index_path)
+    if not is_valid:
+        log_event(
+            "music_index_update_skipped_invalid_json",
+            index_path=str(index_path),
+        )
+        return
     entries = catalog.setdefault("entries", {})
     if not isinstance(entries, dict):
         entries = {}

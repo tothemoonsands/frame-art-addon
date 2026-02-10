@@ -605,6 +605,24 @@ class MusicAssociationLookupTests(unittest.TestCase):
         self.assertEqual("milt jackson — sunflower 40th anniversary edition", index["entries"][entry_key]["text_key"])
         self.assertEqual("MY_F2002", index["entries"][entry_key]["content_id"])
 
+    def test_update_music_index_entry_skips_invalid_json_without_overwrite(self):
+        self.index.write_text("{not-json", encoding="utf-8")
+        original = self.index.read_text(encoding="utf-8")
+        wide = self.root / "1440795324__3840x2160.jpg"
+        wide.write_bytes(b"x")
+        uploader.update_music_index_entry(
+            artist="Michael Kiwanuka",
+            album="Home Again",
+            collection_id=1440795324,
+            catalog_key="1440795324__3840x2160.jpg",
+            cache_key="itc_1440795324",
+            content_id="MY_F1226",
+            wide_path=wide,
+            compressed_path=wide,
+            request_id="req_123",
+        )
+        self.assertEqual(original, self.index.read_text(encoding="utf-8"))
+
 
 if __name__ == "__main__":
     unittest.main()
