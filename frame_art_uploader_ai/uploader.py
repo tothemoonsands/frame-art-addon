@@ -57,6 +57,8 @@ MUSIC_INDEX_PATHS = [
 MYF_RE = re.compile(r"^MY[_-]F(\d+)", re.IGNORECASE)
 ALLOWED_EXTENSIONS = {".jpg", ".jpeg", ".png"}
 AMBIENT_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp"}
+SEED_KINDS = {"ambient_seed", "holiday_seed", "music_seed"}
+DEFAULT_SEED_DELETE_LIMIT = 25
 PHASE_SALT = {
     "pre_dawn": 101,
     "midday": 303,
@@ -432,10 +434,24 @@ def parse_restore_request_payload(payload: Any) -> tuple[Optional[dict], Optiona
             except Exception:
                 normalized["collection_id"] = None
 
+    if kind in SEED_KINDS:
+        normalized["force_reupload"] = bool(payload.get("force_reupload", False))
+        normalized["apply_deletions"] = bool(payload.get("apply_deletions", True))
+        normalized["auto_queue_missing"] = bool(payload.get("auto_queue_missing", True))
+        try:
+            normalized["delete_limit"] = max(1, int(payload.get("delete_limit", DEFAULT_SEED_DELETE_LIMIT)))
+        except Exception:
+            normalized["delete_limit"] = DEFAULT_SEED_DELETE_LIMIT
+
     if kind == "ambient_seed":
         normalized["ambient_dir"] = str(payload.get("ambient_dir", "")).strip()
         normalized["catalog_path"] = str(payload.get("catalog_path", "")).strip()
-        normalized["force_reupload"] = bool(payload.get("force_reupload", False))
+    elif kind == "holiday_seed":
+        normalized["holiday_dir"] = str(payload.get("holiday_dir", "")).strip()
+        normalized["catalog_path"] = str(payload.get("catalog_path", "")).strip()
+    elif kind == "music_seed":
+        normalized["music_dir"] = str(payload.get("music_dir", "")).strip()
+        normalized["catalog_path"] = str(payload.get("catalog_path", "")).strip()
 
     return normalized, requested_show, None
 
@@ -507,6 +523,313 @@ def persist_frame_art_catalog(path: Path, catalog: dict[str, Any]) -> None:
     catalog["updated_at"] = datetime.now(timezone.utc).isoformat()
     catalog.setdefault("entries", {})
     atomic_write_json(path, catalog)
+
+
+def seed_catalog_entry(raw_entry: Any) -> dict[str, Any]:
+    entry = dict(raw_entry) if isinstance(raw_entry, dict) else {}
+    state = str(entry.get("state", "active")).strip().lower()
+    if state not in {"active", "pending_delete", "deleted"}:
+        state = "active"
+    entry["state"] = state
+    entry.setdefault("delete_requested_at", "")
+    entry.setdefault("delete_reason", "")
+    entry.setdefault("deleted_at", "")
+    entry.setdefault("updated_at", "")
+    entry.setdefault("content_id", "")
+    return entry
+
+
+def mark_catalog_entry_pending_delete(entries: dict[str, Any], key: str, *, reason: str) -> bool:
+    existing = seed_catalog_entry(entries.get(key))
+    if existing.get("state") == "deleted":
+        return False
+    if existing.get("state") == "pending_delete":
+        return False
+    existing["state"] = "pending_delete"
+    existing["delete_requested_at"] = datetime.now(timezone.utc).isoformat()
+    existing["delete_reason"] = reason
+    entries[key] = existing
+    return True
+
+
+def mark_catalog_entry_deleted(entries: dict[str, Any], key: str) -> None:
+    existing = seed_catalog_entry(entries.get(key))
+    existing["state"] = "deleted"
+    existing["deleted_at"] = datetime.now(timezone.utc).isoformat()
+    existing["content_id"] = ""
+    existing["updated_at"] = datetime.now(timezone.utc).isoformat()
+    entries[key] = existing
+
+
+def set_catalog_entry_active(entries: dict[str, Any], key: str, content_id: str) -> None:
+    entries[key] = {
+        "content_id": content_id,
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+        "state": "active",
+        "delete_requested_at": "",
+        "delete_reason": "",
+        "deleted_at": "",
+    }
+
+
+def list_seed_images(folder: Path) -> list[Path]:
+    if not folder.exists() or not folder.is_dir():
+        return []
+    out: list[Path] = []
+    for p in folder.rglob("*"):
+        if not p.is_file():
+            continue
+        if any(part.startswith(".") for part in p.relative_to(folder).parts):
+            continue
+        if p.name.startswith(".") or p.name.startswith("._") or p.name == ".DS_Store":
+            continue
+        if p.suffix.lower() not in AMBIENT_EXTENSIONS:
+            continue
+        out.append(p)
+    out.sort(key=lambda p: p.relative_to(folder).as_posix().lower())
+    return out
+
+
+def available_content_ids(art: Any) -> set[str]:
+    try:
+        available = art.available()
+    except Exception:
+        return set()
+    myf = extract_myf_ids(available)
+    return {cid for _, cid in myf}
+
+
+def delete_art_content_id(art: Any, content_id: str) -> dict[str, Any]:
+    cid = str(content_id or "").strip()
+    if not cid:
+        return {"ok": True, "verified": True, "error": None}
+
+    method_errors: list[str] = []
+    deleted_call = False
+    for method_name in ("delete", "delete_image", "delete_list", "delete_list_items"):
+        method = getattr(art, method_name, None)
+        if not callable(method):
+            continue
+        try:
+            try:
+                method(cid)
+            except TypeError:
+                try:
+                    method([cid])
+                except TypeError:
+                    method(content_id=cid)
+            deleted_call = True
+            break
+        except Exception as exc:
+            method_errors.append(f"{method_name}:{repr(exc)}")
+
+    remaining_ids = available_content_ids(art)
+    verified = cid not in remaining_ids
+    if verified:
+        return {"ok": True, "verified": True, "error": None}
+    if deleted_call:
+        return {"ok": False, "verified": False, "error": f"delete_unverified:{cid}"}
+    error = "; ".join(method_errors) if method_errors else "no_supported_delete_method"
+    return {"ok": False, "verified": False, "error": error}
+
+
+def maybe_swap_current_art(art: Any, target_cid: str, fallback_ids: list[str]) -> tuple[bool, bool, Optional[str]]:
+    current_id = extract_content_id(get_current_info(art))
+    if current_id != target_cid:
+        return True, False, None
+
+    for fallback in fallback_ids:
+        if not fallback or fallback == target_cid:
+            continue
+        try:
+            art.select_image(fallback, show=True)
+            for _ in range(3):
+                time.sleep(0.6)
+                after = extract_content_id(get_current_info(art))
+                if after and after != target_cid:
+                    return True, True, None
+                art.select_image(fallback, show=True)
+        except Exception as exc:
+            continue
+    return False, False, f"swap_failed_for_current:{target_cid}"
+
+
+def collect_seed_fallback_ids(*catalog_paths: Path) -> list[str]:
+    out: list[str] = []
+    seen: set[str] = set()
+    for path in catalog_paths:
+        catalog = load_frame_art_catalog(path)
+        entries = catalog.get("entries") if isinstance(catalog.get("entries"), dict) else {}
+        if not isinstance(entries, dict):
+            continue
+        for raw in entries.values():
+            entry = seed_catalog_entry(raw)
+            if entry.get("state") != "active":
+                continue
+            cid = str(entry.get("content_id", "")).strip()
+            if cid and cid not in seen:
+                seen.add(cid)
+                out.append(cid)
+    return out
+
+
+def cleanup_music_graph_for_deletion(catalog_key: str, content_id: str) -> tuple[bool, list[str]]:
+    errors: list[str] = []
+    changed = False
+    key_name = Path(str(catalog_key or "")).name
+    stem = music_catalog_stem(catalog_key)
+
+    assoc = load_frame_art_catalog(MUSIC_ASSOCIATIONS_PATH)
+    assoc_entries = assoc.get("entries") if isinstance(assoc.get("entries"), dict) else {}
+    if isinstance(assoc_entries, dict):
+        remove_keys: list[str] = []
+        for alias, raw_record in assoc_entries.items():
+            if not isinstance(raw_record, dict):
+                continue
+            rec_catalog_key = str(raw_record.get("catalog_key", "")).strip()
+            rec_content_id = str(raw_record.get("content_id", "")).strip()
+            if rec_catalog_key == catalog_key or (content_id and rec_content_id == content_id):
+                remove_keys.append(alias)
+        for alias in remove_keys:
+            assoc_entries.pop(alias, None)
+            changed = True
+        if remove_keys:
+            assoc["entries"] = assoc_entries
+            persist_frame_art_catalog(MUSIC_ASSOCIATIONS_PATH, assoc)
+
+    for index_path in MUSIC_INDEX_PATHS:
+        catalog, is_valid = load_frame_art_catalog_with_validity(index_path)
+        if not is_valid:
+            continue
+        entries = catalog.get("entries") if isinstance(catalog.get("entries"), dict) else {}
+        if not isinstance(entries, dict):
+            continue
+        remove_index_keys: list[str] = []
+        for idx_key, raw_item in entries.items():
+            if not isinstance(raw_item, dict):
+                continue
+            candidate_names = index_item_candidate_catalog_names(str(idx_key), raw_item)
+            item_content_id = str(raw_item.get("content_id", "")).strip()
+            if content_id and item_content_id == content_id:
+                remove_index_keys.append(str(idx_key))
+                continue
+            if key_name and key_name in candidate_names:
+                remove_index_keys.append(str(idx_key))
+                continue
+            if stem and str(idx_key).strip() == stem:
+                remove_index_keys.append(str(idx_key))
+        if remove_index_keys:
+            for idx_key in remove_index_keys:
+                entries.pop(idx_key, None)
+            catalog["entries"] = entries
+            persist_frame_art_catalog(index_path, catalog)
+            changed = True
+
+    delete_candidates: list[Path] = []
+    if catalog_key:
+        delete_candidates.extend(
+            [
+                COMPRESSED_DIR / catalog_key,
+                COMPRESSED_DIR / key_name,
+                WIDESCREEN_DIR / catalog_key,
+                WIDESCREEN_DIR / key_name,
+            ]
+        )
+    if stem:
+        delete_candidates.extend(
+            [
+                SOURCE_DIR / f"{stem}.jpg",
+                SOURCE_DIR / f"{stem}.png",
+                BACKGROUND_DIR / f"{stem}__3840x2160__background.png",
+                WIDESCREEN_DIR / f"{stem}__3840x2160.jpg",
+                WIDESCREEN_DIR / f"{stem}__3840x2160.png",
+                COMPRESSED_DIR / f"{stem}__3840x2160.jpg",
+            ]
+        )
+    for path in delete_candidates:
+        try:
+            if path.exists() and path.is_file():
+                path.unlink()
+                changed = True
+        except Exception as exc:
+            errors.append(f"file_delete:{path.name}:{repr(exc)}")
+
+    return changed and not errors, errors
+
+
+def process_seed_pending_deletions(
+    tv_ip: str,
+    art: Any,
+    *,
+    seed_kind: str,
+    catalog_path: Path,
+    catalog: dict[str, Any],
+    delete_limit: int,
+) -> tuple[Any, dict[str, Any]]:
+    entries = catalog.get("entries") if isinstance(catalog.get("entries"), dict) else {}
+    if not isinstance(entries, dict):
+        entries = {}
+        catalog["entries"] = entries
+
+    candidates: list[tuple[str, dict[str, Any]]] = []
+    for key, raw_entry in entries.items():
+        entry = seed_catalog_entry(raw_entry)
+        entries[key] = entry
+        if entry.get("state") == "pending_delete":
+            candidates.append((str(key), entry))
+
+    fallback_ids = collect_seed_fallback_ids(AMBIENT_CATALOG_PATH, HOLIDAY_CATALOG_PATH, MUSIC_CATALOG_PATH)
+    fallback_ids.extend([cid for cid in available_content_ids(art) if cid not in fallback_ids])
+
+    processed = 0
+    failed = 0
+    skipped_current = 0
+    swap_used = 0
+    errors: list[str] = []
+    changed = False
+
+    for key, _entry in candidates[: max(1, int(delete_limit))]:
+        entry = seed_catalog_entry(entries.get(key))
+        target_cid = str(entry.get("content_id", "")).strip()
+
+        swap_ok, used_swap, swap_error = maybe_swap_current_art(art, target_cid, fallback_ids)
+        if used_swap:
+            swap_used += 1
+        if not swap_ok:
+            skipped_current += 1
+            failed += 1
+            if swap_error:
+                errors.append(f"{key}:{swap_error}")
+            continue
+
+        delete_result = delete_art_content_id(art, target_cid)
+        if target_cid and not bool(delete_result.get("ok")):
+            failed += 1
+            errors.append(f"{key}:{delete_result.get('error')}")
+            continue
+
+        if seed_kind == "music_seed":
+            _music_cleanup_ok, music_cleanup_errors = cleanup_music_graph_for_deletion(key, target_cid)
+            if music_cleanup_errors:
+                failed += 1
+                errors.extend([f"{key}:{msg}" for msg in music_cleanup_errors])
+                continue
+
+        mark_catalog_entry_deleted(entries, key)
+        processed += 1
+        changed = True
+
+    if changed:
+        persist_frame_art_catalog(catalog_path, catalog)
+
+    return art, {
+        "deletion_candidates": len(candidates),
+        "deletion_processed": processed,
+        "deletion_failed": failed,
+        "deletion_skipped_currently_displayed": skipped_current,
+        "deletion_swap_fallback_used": swap_used,
+        "deletion_errors": errors[:20],
+    }
 
 
 def parse_iso_timestamp(value: Any) -> Optional[datetime]:
@@ -664,10 +987,7 @@ def update_catalog_content_id(catalog_path: Path, catalog_key: str, content_id: 
     if not isinstance(entries, dict):
         entries = {}
         catalog["entries"] = entries
-    entries[catalog_key] = {
-        "content_id": content_id,
-        "updated_at": datetime.now(timezone.utc).isoformat(),
-    }
+    set_catalog_entry_active(entries, catalog_key, content_id)
     persist_frame_art_catalog(catalog_path, catalog)
 
 
@@ -1329,27 +1649,79 @@ def music_catalog_key_for_path(path: Path) -> str:
         return path.name
 
 
-def handle_ambient_seed_restore(tv_ip: str, art: Any, restore_payload: dict, requested_at: str) -> dict[str, Any]:
-    ambient_dir_raw = str(restore_payload.get("ambient_dir", "")).strip()
+def handle_seed_restore(
+    tv_ip: str,
+    art: Any,
+    restore_payload: dict,
+    requested_at: str,
+    *,
+    seed_kind: str,
+    seed_dir_key: str,
+    default_seed_dir: Path,
+    default_catalog_path: Path,
+) -> dict[str, Any]:
+    seed_dir_raw = str(restore_payload.get(seed_dir_key, "")).strip()
     catalog_path_raw = str(restore_payload.get("catalog_path", "")).strip()
     force_reupload = bool(restore_payload.get("force_reupload", False))
+    apply_deletions = bool(restore_payload.get("apply_deletions", True))
+    auto_queue_missing = bool(restore_payload.get("auto_queue_missing", True))
+    try:
+        delete_limit = max(1, int(restore_payload.get("delete_limit", DEFAULT_SEED_DELETE_LIMIT)))
+    except Exception:
+        delete_limit = DEFAULT_SEED_DELETE_LIMIT
 
-    if not ambient_dir_raw:
-        raise ValueError("ambient_seed requires ambient_dir")
+    if not seed_dir_raw:
+        seed_dir_raw = str(default_seed_dir)
     if not catalog_path_raw:
-        raise ValueError("ambient_seed requires catalog_path")
+        catalog_path_raw = str(default_catalog_path)
 
-    ambient_dir = Path(ambient_dir_raw)
-    if not ambient_dir.exists() or not ambient_dir.is_dir():
-        raise ValueError(f"Ambient directory missing: {ambient_dir}")
+    seed_dir = Path(seed_dir_raw)
+    if not seed_dir.exists() or not seed_dir.is_dir():
+        raise ValueError(f"{seed_kind} directory missing: {seed_dir}")
 
-    files = list_ambient_images(ambient_dir)
+    files = list_seed_images(seed_dir)
     if not files:
-        raise ValueError(f"Ambient directory has no supported images: {ambient_dir}")
+        raise ValueError(f"{seed_kind} directory has no supported images: {seed_dir}")
 
     catalog_path = Path(catalog_path_raw)
-    catalog = load_ambient_catalog(catalog_path)
+    catalog = load_frame_art_catalog(catalog_path)
     entries = catalog.setdefault("entries", {})
+    if not isinstance(entries, dict):
+        entries = {}
+        catalog["entries"] = entries
+
+    existing_keys = {p.relative_to(seed_dir).as_posix() for p in files}
+    existing_basenames = {p.name for p in files}
+    auto_queued = 0
+    if auto_queue_missing:
+        for key, raw_entry in list(entries.items()):
+            entry = seed_catalog_entry(raw_entry)
+            entries[key] = entry
+            cid = str(entry.get("content_id", "")).strip()
+            is_legacy_basename_hit = "/" not in key and key in existing_basenames
+            if entry.get("state") == "active" and cid and key not in existing_keys and not is_legacy_basename_hit:
+                if mark_catalog_entry_pending_delete(entries, key, reason="missing_file_drift"):
+                    auto_queued += 1
+        if auto_queued:
+            persist_frame_art_catalog(catalog_path, catalog)
+
+    deletion_status = {
+        "deletion_candidates": 0,
+        "deletion_processed": 0,
+        "deletion_failed": 0,
+        "deletion_skipped_currently_displayed": 0,
+        "deletion_swap_fallback_used": 0,
+        "deletion_errors": [],
+    }
+    if apply_deletions:
+        art, deletion_status = process_seed_pending_deletions(
+            tv_ip,
+            art,
+            seed_kind=seed_kind,
+            catalog_path=catalog_path,
+            catalog=catalog,
+            delete_limit=delete_limit,
+        )
 
     uploaded_count = 0
     skipped_count = 0
@@ -1358,13 +1730,17 @@ def handle_ambient_seed_restore(tv_ip: str, art: Any, restore_payload: dict, req
     last_cid: Optional[str] = None
 
     for image_path in files:
-        key = image_path.relative_to(ambient_dir).as_posix()
-        entry = entries.get(key) if isinstance(entries.get(key), dict) else {}
-        if not entry and "/" in key:
+        key = image_path.relative_to(seed_dir).as_posix()
+        entry = seed_catalog_entry(entries.get(key))
+        if entry.get("content_id", "") == "" and "/" in key:
             legacy_key = image_path.name
-            if isinstance(entries.get(legacy_key), dict):
-                entry = entries.get(legacy_key)
-        cached_id = str(entry.get("content_id", "")).strip() if entry else ""
+            legacy_entry = seed_catalog_entry(entries.get(legacy_key))
+            if str(legacy_entry.get("content_id", "")).strip():
+                entry = legacy_entry
+        entries[key] = entry
+        if entry.get("state") != "active":
+            continue
+        cached_id = str(entry.get("content_id", "")).strip()
 
         if cached_id and not force_reupload:
             skipped_count += 1
@@ -1377,31 +1753,74 @@ def handle_ambient_seed_restore(tv_ip: str, art: Any, restore_payload: dict, req
                 raise ValueError("content_id missing after upload")
             uploaded_count += 1
             last_cid = content_id
-            entries[key] = {
-                "content_id": content_id,
-                "updated_at": datetime.now(timezone.utc).isoformat(),
-            }
-            persist_ambient_catalog(catalog_path, catalog)
+            set_catalog_entry_active(entries, key, content_id)
+            persist_frame_art_catalog(catalog_path, catalog)
         except Exception as exc:
             failed_count += 1
             failures.append(f"{key}: {repr(exc)}")
 
-    ok = failed_count == 0 and (uploaded_count > 0 or skipped_count > 0)
+    ok = failed_count == 0 and deletion_status.get("deletion_failed", 0) == 0 and (
+        uploaded_count > 0 or skipped_count > 0 or deletion_status.get("deletion_processed", 0) > 0
+    )
     return {
         "ok": ok,
         "mode": "restore",
-        "kind": "ambient_seed",
+        "kind": seed_kind,
         "requested_at": requested_at,
-        "ambient_dir": str(ambient_dir),
+        seed_dir_key: str(seed_dir),
         "catalog_path": str(catalog_path),
         "force_reupload": force_reupload,
+        "apply_deletions": apply_deletions,
+        "auto_queue_missing": auto_queue_missing,
+        "delete_limit": delete_limit,
+        "auto_queued_missing_count": auto_queued,
         "total_files": len(files),
         "uploaded_count": uploaded_count,
         "skipped_count": skipped_count,
         "failed_count": failed_count,
         "selected_content_id": last_cid,
-        "error": None if ok else "; ".join(failures) if failures else "ambient_seed completed with no successful uploads",
+        "error": None if ok else "; ".join(failures) if failures else f"{seed_kind} completed with no successful uploads",
+        **deletion_status,
     }
+
+
+def handle_ambient_seed_restore(tv_ip: str, art: Any, restore_payload: dict, requested_at: str) -> dict[str, Any]:
+    return handle_seed_restore(
+        tv_ip,
+        art,
+        restore_payload,
+        requested_at,
+        seed_kind="ambient_seed",
+        seed_dir_key="ambient_dir",
+        default_seed_dir=Path("/media/frame_ai/ambient"),
+        default_catalog_path=AMBIENT_CATALOG_PATH,
+    )
+
+
+def handle_holiday_seed_restore(tv_ip: str, art: Any, restore_payload: dict, requested_at: str) -> dict[str, Any]:
+    return handle_seed_restore(
+        tv_ip,
+        art,
+        restore_payload,
+        requested_at,
+        seed_kind="holiday_seed",
+        seed_dir_key="holiday_dir",
+        default_seed_dir=Path("/media/frame_ai/holidays"),
+        default_catalog_path=HOLIDAY_CATALOG_PATH,
+    )
+
+
+def handle_music_seed_restore(tv_ip: str, art: Any, restore_payload: dict, requested_at: str) -> dict[str, Any]:
+    return handle_seed_restore(
+        tv_ip,
+        art,
+        restore_payload,
+        requested_at,
+        seed_kind="music_seed",
+        seed_dir_key="music_dir",
+        default_seed_dir=COMPRESSED_DIR,
+        default_catalog_path=MUSIC_CATALOG_PATH,
+    )
 
 
 def _queue_sort_key(path: Path) -> tuple[float, str]:
@@ -1787,9 +2206,14 @@ def main() -> None:
                         state["last_applied"] = str(pick_file)
                     else:
                         state["last_applied"] = f"samsung:{target_cid}"
-                elif kind == "ambient_seed":
-                    ambient_status = handle_ambient_seed_restore(tv_ip, art, restore_payload, requested_at)
-                    write_status({**ambient_status, "tv_ip": tv_ip, "addon_version": ADDON_VERSION})
+                elif kind in SEED_KINDS:
+                    if kind == "ambient_seed":
+                        seed_status = handle_ambient_seed_restore(tv_ip, art, restore_payload, requested_at)
+                    elif kind == "holiday_seed":
+                        seed_status = handle_holiday_seed_restore(tv_ip, art, restore_payload, requested_at)
+                    else:
+                        seed_status = handle_music_seed_restore(tv_ip, art, restore_payload, requested_at)
+                    write_status({**seed_status, "tv_ip": tv_ip, "addon_version": ADDON_VERSION})
                     continue
                 elif kind in {"cover_art_reference_background", "cover_art_outpaint"}:
                     ensure_dirs()
