@@ -37,6 +37,7 @@ FALLBACK_DIR = Path("/media/frame_ai/cover_art/fallback")
 
 MYF_RE = re.compile(r"^MY[_-]F(\d+)", re.IGNORECASE)
 ALLOWED_EXTENSIONS = {".jpg", ".jpeg", ".png"}
+AMBIENT_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp"}
 PHASE_SALT = {
     "pre_dawn": 101,
     "midday": 303,
@@ -65,9 +66,17 @@ def log_event(event: str, **fields: Any) -> None:
 
 def write_status(payload: dict) -> None:
     payload["ts"] = time.monotonic()
-    with open(STATUS_PATH, "w", encoding="utf-8") as f:
-        json.dump(payload, f, indent=2)
+    atomic_write_json(Path(STATUS_PATH), payload)
     log_event("status", **payload)
+
+
+def atomic_write_json(path: Path, payload: Any) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_name = f".{path.name}.{uuid.uuid4().hex}.tmp"
+    tmp_path = path.parent / tmp_name
+    with open(tmp_path, "w", encoding="utf-8") as f:
+        json.dump(payload, f, indent=2)
+    os.replace(tmp_path, path)
 
 
 def load_options() -> dict:
@@ -398,7 +407,124 @@ def parse_restore_request_payload(payload: Any) -> tuple[Optional[dict], Optiona
             except Exception:
                 normalized["collection_id"] = None
 
+    if kind == "ambient_seed":
+        normalized["ambient_dir"] = str(payload.get("ambient_dir", "")).strip()
+        normalized["catalog_path"] = str(payload.get("catalog_path", "")).strip()
+        normalized["force_reupload"] = bool(payload.get("force_reupload", False))
+
     return normalized, requested_show, None
+
+
+def list_ambient_images(folder: Path) -> list[Path]:
+    if not folder.exists() or not folder.is_dir():
+        return []
+    out: list[Path] = []
+    for p in folder.iterdir():
+        if not p.is_file():
+            continue
+        if p.name.startswith(".") or p.name.startswith("._") or p.name == ".DS_Store":
+            continue
+        if p.suffix.lower() not in AMBIENT_EXTENSIONS:
+            continue
+        out.append(p)
+    out.sort(key=lambda p: p.name.lower())
+    return out
+
+
+def load_ambient_catalog(path: Path) -> dict[str, Any]:
+    if not path.exists():
+        return {"version": 1, "updated_at": "", "entries": {}}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return {"version": 1, "updated_at": "", "entries": {}}
+    if not isinstance(data, dict):
+        return {"version": 1, "updated_at": "", "entries": {}}
+    entries = data.get("entries")
+    if not isinstance(entries, dict):
+        entries = {}
+    data["version"] = 1
+    data["entries"] = entries
+    data.setdefault("updated_at", "")
+    return data
+
+
+def persist_ambient_catalog(path: Path, catalog: dict[str, Any]) -> None:
+    catalog["version"] = 1
+    catalog["updated_at"] = datetime.now(timezone.utc).isoformat()
+    catalog.setdefault("entries", {})
+    atomic_write_json(path, catalog)
+
+
+def handle_ambient_seed_restore(tv_ip: str, art: Any, restore_payload: dict, requested_at: str) -> dict[str, Any]:
+    ambient_dir_raw = str(restore_payload.get("ambient_dir", "")).strip()
+    catalog_path_raw = str(restore_payload.get("catalog_path", "")).strip()
+    force_reupload = bool(restore_payload.get("force_reupload", False))
+
+    if not ambient_dir_raw:
+        raise ValueError("ambient_seed requires ambient_dir")
+    if not catalog_path_raw:
+        raise ValueError("ambient_seed requires catalog_path")
+
+    ambient_dir = Path(ambient_dir_raw)
+    if not ambient_dir.exists() or not ambient_dir.is_dir():
+        raise ValueError(f"Ambient directory missing: {ambient_dir}")
+
+    files = list_ambient_images(ambient_dir)
+    if not files:
+        raise ValueError(f"Ambient directory has no supported images: {ambient_dir}")
+
+    catalog_path = Path(catalog_path_raw)
+    catalog = load_ambient_catalog(catalog_path)
+    entries = catalog.setdefault("entries", {})
+
+    uploaded_count = 0
+    skipped_count = 0
+    failed_count = 0
+    failures: list[str] = []
+    last_cid: Optional[str] = None
+
+    for image_path in files:
+        key = image_path.name
+        entry = entries.get(key) if isinstance(entries.get(key), dict) else {}
+        cached_id = str(entry.get("content_id", "")).strip() if entry else ""
+
+        if cached_id and not force_reupload:
+            skipped_count += 1
+            last_cid = cached_id
+            continue
+
+        try:
+            art, content_id = upload_local_file_with_reconnect(tv_ip, art, image_path)
+            if not content_id:
+                raise ValueError("content_id missing after upload")
+            uploaded_count += 1
+            last_cid = content_id
+            entries[key] = {
+                "content_id": content_id,
+                "updated_at": datetime.now(timezone.utc).isoformat(),
+            }
+            persist_ambient_catalog(catalog_path, catalog)
+        except Exception as exc:
+            failed_count += 1
+            failures.append(f"{key}: {repr(exc)}")
+
+    ok = failed_count == 0 and (uploaded_count > 0 or skipped_count > 0)
+    return {
+        "ok": ok,
+        "mode": "restore",
+        "kind": "ambient_seed",
+        "requested_at": requested_at,
+        "ambient_dir": str(ambient_dir),
+        "catalog_path": str(catalog_path),
+        "force_reupload": force_reupload,
+        "total_files": len(files),
+        "uploaded_count": uploaded_count,
+        "skipped_count": skipped_count,
+        "failed_count": failed_count,
+        "selected_content_id": last_cid,
+        "error": None if ok else "; ".join(failures) if failures else "ambient_seed completed with no successful uploads",
+    }
 
 
 def _queue_sort_key(path: Path) -> tuple[float, str]:
@@ -665,11 +791,13 @@ def main() -> None:
             )
             return
 
+        handled_restore_work = False
         while True:
             enqueue_restore_inbox_if_present()
             work_item = dequeue_next_restore_work_item()
             if work_item is None:
                 break
+            handled_restore_work = True
 
             requested_at = ""
             payload_kind = None
@@ -756,6 +884,10 @@ def main() -> None:
                         selected_name = pick_file.name
                     else:
                         state["last_applied"] = f"samsung:{target_cid}"
+                elif kind == "ambient_seed":
+                    ambient_status = handle_ambient_seed_restore(tv_ip, art, restore_payload, requested_at)
+                    write_status({**ambient_status, "tv_ip": tv_ip, "addon_version": ADDON_VERSION})
+                    continue
                 elif kind in {"cover_art_reference_background", "cover_art_outpaint"}:
                     ensure_dirs()
                     source_url = str(restore_payload.get("artwork_url", "")).strip()
@@ -969,6 +1101,9 @@ def main() -> None:
                     work_item.unlink()
                 except Exception:
                     pass
+
+        if handled_restore_work:
+            return
 
     img_path = newest_candidate(inbox_dir, prefix)
     if img_path is None:
