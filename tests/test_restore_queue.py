@@ -106,6 +106,70 @@ class RestoreQueueTests(unittest.TestCase):
             with uploader.worker_lock() as lock2:
                 self.assertFalse(lock2)
 
+    def test_music_request_is_superseded_by_newer_music_request(self):
+        self._write_inbox(
+            {
+                "kind": "cover_art_reference",
+                "artist": "Old Artist",
+                "album": "Old Album",
+            }
+        )
+        first = uploader.enqueue_restore_inbox_if_present()
+        self.assertIsNotNone(first)
+
+        self._write_inbox(
+            {
+                "kind": "cover_art_outpaint",
+                "artist": "New Artist",
+                "album": "New Album",
+            }
+        )
+        second = uploader.enqueue_restore_inbox_if_present()
+        self.assertIsNotNone(second)
+
+        self.assertTrue(uploader.is_superseded_music_request(first, "cover_art_reference_background"))
+
+    def test_music_request_not_superseded_by_newer_pick(self):
+        self._write_inbox(
+            {
+                "kind": "cover_art_reference",
+                "artist": "Old Artist",
+                "album": "Old Album",
+            }
+        )
+        first = uploader.enqueue_restore_inbox_if_present()
+        self.assertIsNotNone(first)
+
+        self._write_inbox({"kind": "pick", "phase": "night", "season": "winter"})
+        second = uploader.enqueue_restore_inbox_if_present()
+        self.assertIsNotNone(second)
+
+        self.assertFalse(uploader.is_superseded_music_request(first, "cover_art_reference_background"))
+
+    def test_music_request_not_superseded_when_newer_music_show_false(self):
+        self._write_inbox(
+            {
+                "kind": "cover_art_reference",
+                "artist": "Old Artist",
+                "album": "Old Album",
+            }
+        )
+        first = uploader.enqueue_restore_inbox_if_present()
+        self.assertIsNotNone(first)
+
+        self._write_inbox(
+            {
+                "kind": "cover_art_outpaint",
+                "artist": "New Artist",
+                "album": "New Album",
+                "show": False,
+            }
+        )
+        second = uploader.enqueue_restore_inbox_if_present()
+        self.assertIsNotNone(second)
+
+        self.assertFalse(uploader.is_superseded_music_request(first, "cover_art_reference_background"))
+
 
 class AmbientSeedTests(unittest.TestCase):
     def setUp(self) -> None:

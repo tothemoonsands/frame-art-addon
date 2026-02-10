@@ -64,6 +64,7 @@ PHASE_SALT = {
     "night": 707,
 }
 UNKNOWN_PHASE = "night"
+MUSIC_RESTORE_KINDS = {"cover_art_reference_background", "cover_art_outpaint"}
 
 RUNTIME_OPTIONS: dict[str, Any] = {}
 ADDON_VERSION = "0.3.6"
@@ -1312,6 +1313,37 @@ def dequeue_next_restore_work_item() -> Optional[Path]:
     return queued[0]
 
 
+def is_music_restore_kind(kind: str) -> bool:
+    return str(kind or "").strip().lower() in MUSIC_RESTORE_KINDS
+
+
+def is_superseded_music_request(work_item: Path, current_kind: str) -> bool:
+    if not is_music_restore_kind(current_kind):
+        return False
+
+    queued = list_queued_requests()
+    if not queued:
+        return False
+
+    current_index = -1
+    for idx, queued_item in enumerate(queued):
+        if queued_item.name == work_item.name:
+            current_index = idx
+            break
+    if current_index < 0:
+        return False
+
+    for queued_item in queued[current_index + 1 :]:
+        next_payload, next_requested_show, next_parse_error = load_restore_work_item(queued_item)
+        if next_parse_error or not isinstance(next_payload, dict):
+            continue
+        next_kind = str(next_payload.get("kind", "")).strip().lower()
+        if is_music_restore_kind(next_kind) and next_requested_show is not False:
+            return True
+
+    return False
+
+
 @contextmanager
 def worker_lock() -> Any:
     WORKER_LOCK_PATH.parent.mkdir(parents=True, exist_ok=True)
@@ -1952,6 +1984,15 @@ def main() -> None:
                 else:
                     raise ValueError(f"Unsupported restore kind: {kind!r}")
 
+                if show_flag and is_superseded_music_request(work_item, kind):
+                    show_flag = False
+                    log_event(
+                        "restore_show_suppressed",
+                        reason="superseded_by_newer_music_request",
+                        kind=kind,
+                        requested_at=requested_at,
+                    )
+
                 verified = False
                 verification_skipped = False
 
@@ -2067,6 +2108,7 @@ def main() -> None:
                         "file_count": file_count,
                         "chosen_index": chosen_index,
                         "requested_show": requested_show,
+                        "effective_show": show_flag,
                         "art_mode": is_art_mode,
                         "pick_source": pick_source,
                         "rng": rng,
