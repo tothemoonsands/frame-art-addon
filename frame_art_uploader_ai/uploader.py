@@ -652,6 +652,8 @@ def main() -> None:
                     state["last_applied"] = f"samsung:{target_cid}"
             elif kind in {"cover_art_reference_background", "cover_art_outpaint"}:
                 ensure_dirs()
+                # Allow the restore cycle to settle before requesting new cover art.
+                time.sleep(2.0)
                 source_url = str(restore_payload.get("artwork_url", "")).strip()
                 artist = str(restore_payload.get("artist", "")).strip()
                 album = str(restore_payload.get("album", "")).strip()
