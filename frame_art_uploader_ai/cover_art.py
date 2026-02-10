@@ -1,3 +1,5 @@
+import argparse
+import base64
 import hashlib
 import json
 import re
@@ -7,21 +9,21 @@ from typing import Any, Optional
 from urllib.parse import quote_plus
 
 import requests
-from PIL import Image
+from PIL import Image, ImageFilter
 
 COVER_ART_BASE = Path("/media/frame_ai/cover_art")
 SOURCE_DIR = COVER_ART_BASE / "source"
 WIDESCREEN_DIR = COVER_ART_BASE / "widescreen"
 
-OUTPAINT_PROMPT = (
-    "Remove ALL text, typography, logos, label marks, and signatures from the entire image. "
-    "Do not add any new text. Reconstruct removed areas as coherent artwork matching the existing style. "
-    "Then outpaint the image into seamless full-bleed 16:9 by extending naturally beyond the left/right edges. "
-    "No borders, no mat, no frames, no captions."
+REFERENCE_BACKGROUND_PROMPT = (
+    "Create an original seamless 16:9 full-bleed background inspired by the reference album "
+    "cover's color palette, lighting, mood, and visual texture. Keep the result atmospheric "
+    "and cohesive for a TV backdrop. Do not include any text, logos, labels, signatures, "
+    "watermarks, faces, or copyrighted characters. Do not recreate the exact album cover composition."
 )
 
-
 _slug_re = re.compile(r"[^a-z0-9]+")
+ALLOWED_EXTENSIONS = {".jpg", ".jpeg", ".png"}
 
 
 def _normalize_text(value: str) -> str:
@@ -109,30 +111,80 @@ def download_artwork(url: str, dest_path: str, timeout_s: int = 15) -> None:
     Path(dest_path).write_bytes(resp.content)
 
 
-def build_outpaint_canvas_and_mask(src_path: str) -> tuple[Path, Path]:
-    """Build a 1536x1024 outpaint canvas and fully editable mask.
-
-    NOTE: If this outpaint algorithm changes, previously cached widescreen images may need
-    to be deleted so they can be regenerated with the updated masking behavior.
-    """
+def build_reference_canvas(src_path: str) -> Path:
     canvas_w, canvas_h = 1536, 1024
     center_x, center_y = 256, 0
-    center_size = 1024
 
     with Image.open(src_path) as src:
-        cover = src.convert("RGB").resize((center_size, center_size), Image.Resampling.LANCZOS)
+        cover = src.convert("RGB").resize((1024, 1024), Image.Resampling.LANCZOS)
         canvas = Image.new("RGB", (canvas_w, canvas_h), (0, 0, 0))
         canvas.paste(cover, (center_x, center_y))
 
-    # Entire canvas is editable: both gutters plus the full original 1024x1024 square.
-    mask = Image.new("L", (canvas_w, canvas_h), 255)
-
-    temp_dir = Path(tempfile.mkdtemp(prefix="frame_art_outpaint_"))
-    canvas_path = temp_dir / "canvas.png"
-    mask_path = temp_dir / "mask.png"
+    temp_dir = Path(tempfile.mkdtemp(prefix="frame_art_reference_"))
+    canvas_path = temp_dir / "reference_canvas.png"
     canvas.save(canvas_path, format="PNG")
-    mask.save(mask_path, format="PNG")
-    return canvas_path, mask_path
+    return canvas_path
+
+
+def build_outpaint_canvas_and_mask(src_path: str) -> tuple[Path, Path]:
+    """Backward-compatible wrapper that now returns a no-mask reference canvas."""
+    canvas_path = build_reference_canvas(src_path)
+    return canvas_path, canvas_path
+
+
+def generate_reference_background(
+    input_image_path: str,
+    openai_api_key: str,
+    openai_model: str,
+    seed: Optional[int] = None,
+    timeout_s: int = 60,
+) -> tuple[bytes, Optional[str], Optional[str]]:
+    if not openai_api_key:
+        raise ValueError("Missing OpenAI API key")
+
+    headers = {"Authorization": f"Bearer {openai_api_key}"}
+    with open(input_image_path, "rb") as image_file:
+        files = {"image[]": (Path(input_image_path).name, image_file, "image/png")}
+        data: dict[str, Any] = {
+            "model": openai_model,
+            "prompt": REFERENCE_BACKGROUND_PROMPT,
+            "size": "1536x1024",
+        }
+        if seed is not None:
+            data["seed"] = str(seed)
+
+        response = requests.post(
+            "https://api.openai.com/v1/images/edits",
+            headers=headers,
+            files=files,
+            data=data,
+            timeout=timeout_s,
+        )
+
+    request_id = response.headers.get("x-request-id") or response.headers.get("X-Request-Id")
+    try:
+        response.raise_for_status()
+    except requests.HTTPError as e:
+        body = (response.text or "")[:800]
+        raise ValueError(
+            f"OpenAI edits failed: {response.status_code} request_id={request_id} body={body}"
+        ) from e
+
+    payload = response.json() if response.text else {}
+    model_used = payload.get("model") if isinstance(payload, dict) else None
+    items = payload.get("data") if isinstance(payload, dict) else None
+    if not isinstance(items, list) or not items:
+        raise ValueError(
+            f"Unexpected OpenAI image response request_id={request_id}: {json.dumps(payload)[:300]}"
+        )
+
+    first = items[0] if isinstance(items[0], dict) else {}
+    b64_json = first.get("b64_json")
+    if not b64_json:
+        raise ValueError(
+            f"OpenAI response missing b64_json request_id={request_id}: {json.dumps(payload)[:300]}"
+        )
+    return base64.b64decode(b64_json), request_id, model_used if isinstance(model_used, str) else None
 
 
 def outpaint_mode_b(
@@ -142,42 +194,219 @@ def outpaint_mode_b(
     openai_model: str,
     timeout_s: int = 60,
 ) -> bytes:
-    if not openai_api_key:
-        raise ValueError("Missing OpenAI API key")
-    headers = {"Authorization": f"Bearer {openai_api_key}"}
-    with open(input_image_path, "rb") as image_file, open(input_mask_path, "rb") as mask_file:
-        files = {
-            "image[]": (Path(input_image_path).name, image_file, "image/png"),
-            "mask": (Path(input_mask_path).name, mask_file, "image/png"),
-        }
-        data = {
-            "model": openai_model,
-            "prompt": OUTPAINT_PROMPT,
-            "size": "1536x1024",
-        }
-        response = requests.post(
-            "https://api.openai.com/v1/images/edits",
-            headers=headers,
-            files=files,
-            data=data,
-            timeout=timeout_s,
-        )
-    try:
-        response.raise_for_status()
-    except requests.HTTPError as e:
-        rid = response.headers.get("x-request-id") or response.headers.get("X-Request-Id")
-        body = (response.text or "")[:800]
-        raise ValueError(
-            f"OpenAI edits failed: {response.status_code} request_id={rid} body={body}"
-        ) from e
-    payload = response.json() if response.text else {}
-    items = payload.get("data") if isinstance(payload, dict) else None
-    if not isinstance(items, list) or not items:
-        raise ValueError(f"Unexpected OpenAI image response: {json.dumps(payload)[:300]}")
-    first = items[0] if isinstance(items[0], dict) else {}
-    b64_json = first.get("b64_json")
-    if b64_json:
-        import base64
+    del input_mask_path
+    image_bytes, _, _ = generate_reference_background(
+        input_image_path,
+        openai_api_key=openai_api_key,
+        openai_model=openai_model,
+        timeout_s=timeout_s,
+    )
+    return image_bytes
 
-        return base64.b64decode(b64_json)
-    raise ValueError(f"OpenAI response missing b64_json: {json.dumps(payload)[:300]}")
+
+def convert_generated_to_background(generated_bytes: bytes) -> Image.Image:
+    from io import BytesIO
+
+    with Image.open(BytesIO(generated_bytes)) as generated:
+        im = generated.convert("RGB")
+    if im.size != (1536, 1024):
+        raise ValueError(f"Generated image size must be 1536x1024; got {im.size[0]}x{im.size[1]}")
+
+    target_w = 3840
+    upscale_h = int(round(im.height * (target_w / im.width)))
+    im = im.resize((target_w, upscale_h), Image.Resampling.LANCZOS)
+    if upscale_h < 2160:
+        raise ValueError(f"Upscaled image height too small for center-crop: {upscale_h}")
+    top = (upscale_h - 2160) // 2
+    return im.crop((0, top, 3840, top + 2160))
+
+
+def composite_album(
+    background: Image.Image,
+    source_album_path: Path,
+    album_shadow: bool = True,
+) -> Image.Image:
+    if background.size != (3840, 2160):
+        raise ValueError(f"Background must be 3840x2160; got {background.size[0]}x{background.size[1]}")
+
+    x = (3840 - 1536) // 2
+    y = (2160 - 1536) // 2
+    with Image.open(source_album_path) as src:
+        album = src.convert("RGBA").resize((1536, 1536), Image.Resampling.LANCZOS)
+
+    final = background.convert("RGBA")
+
+    if album_shadow:
+        shadow_layer = Image.new("RGBA", (3840, 2160), (0, 0, 0, 0))
+        shadow_rect = Image.new("RGBA", (1536, 1536), (0, 0, 0, 88))
+        shadow_layer.paste(shadow_rect, (x + 0, y + 16), shadow_rect)
+        shadow_layer = shadow_layer.filter(ImageFilter.GaussianBlur(radius=26))
+        final = Image.alpha_composite(final, shadow_layer)
+
+    album_layer = Image.new("RGBA", (3840, 2160), (0, 0, 0, 0))
+    album_layer.paste(album, (x, y), album)
+    final = Image.alpha_composite(final, album_layer)
+    return final.convert("RGB")
+
+
+def infer_content_id(path: Path) -> Optional[str]:
+    stem = path.stem
+    if stem.startswith("itc_") and stem[4:].isdigit():
+        return stem[4:]
+    return None
+
+
+def unknown_name_hash(path: Path) -> str:
+    return hashlib.sha1(path.read_bytes()).hexdigest()[:12]
+
+
+def process_source_file(
+    source_path: Path,
+    out_dir: Path,
+    api_key: str,
+    model: str,
+    seed: Optional[int],
+    save_background_layer: bool,
+    album_shadow: bool,
+) -> dict[str, Any]:
+    content_id = infer_content_id(source_path)
+    name_key = content_id if content_id else f"unknown_{unknown_name_hash(source_path)}"
+
+    background_path = out_dir / f"{name_key}__3840x2160__background.png"
+    output_path = out_dir / f"{name_key}__3840x2160.png"
+
+    result: dict[str, Any] = {
+        "source_path": str(source_path),
+        "model_requested": model,
+        "model_used": None,
+        "prompt_variant": "reference_background_nomask",
+        "pipeline": "reference_no_mask",
+        "mask_mode": "none",
+        "edit_size": "1536x1024",
+        "final_size": "3840x2160",
+        "background_output_path": str(background_path),
+        "output_path": str(output_path),
+        "background_bytes": None,
+        "output_bytes": None,
+        "request_id": None,
+        "status": "error",
+        "error": None,
+    }
+
+    try:
+        reference_canvas = build_reference_canvas(str(source_path))
+        generated_bytes, request_id, model_used = generate_reference_background(
+            str(reference_canvas),
+            openai_api_key=api_key,
+            openai_model=model,
+            seed=seed,
+            timeout_s=90,
+        )
+        result["request_id"] = request_id
+        result["model_used"] = model_used or model
+
+        background = convert_generated_to_background(generated_bytes)
+        if save_background_layer:
+            background.save(background_path, format="PNG", optimize=True, compress_level=9)
+            result["background_bytes"] = background_path.stat().st_size
+
+        final = composite_album(background, source_path, album_shadow=album_shadow)
+        final.save(output_path, format="PNG", optimize=True, compress_level=9)
+        result["output_bytes"] = output_path.stat().st_size
+
+        with Image.open(output_path) as out_im:
+            if out_im.size != (3840, 2160):
+                raise ValueError(f"Final output dimensions invalid: {out_im.size}")
+
+        if save_background_layer and not background_path.exists():
+            raise ValueError("Background output file was not created")
+        if not output_path.exists():
+            raise ValueError("Final composited output file was not created")
+
+        result["status"] = "ok"
+    except Exception as e:
+        result["error"] = str(e)
+    return result
+
+
+def iter_source_files(source_art_dir: Path) -> list[Path]:
+    if not source_art_dir.exists() or not source_art_dir.is_dir():
+        return []
+    return sorted(
+        [p for p in source_art_dir.iterdir() if p.is_file() and p.suffix.lower() in ALLOWED_EXTENSIONS],
+        key=lambda p: p.name.lower(),
+    )
+
+
+def append_manifest(manifest_path: Path, item: dict[str, Any]) -> None:
+    with manifest_path.open("a", encoding="utf-8") as f:
+        f.write(json.dumps(item, sort_keys=True) + "\n")
+
+
+def run_generate_widescreen(args: argparse.Namespace) -> int:
+    source_art_dir = Path(args.source_art_dir)
+    out_dir = Path(args.out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    api_key = args.api_key or ""
+    if not api_key:
+        import os
+
+        api_key = os.getenv("OPENAI_API_KEY", "")
+    if not api_key:
+        raise ValueError("Missing OpenAI API key (use --api-key or OPENAI_API_KEY)")
+
+    files = iter_source_files(source_art_dir)
+    manifest_path = out_dir / "manifest.jsonl"
+
+    for source_path in files:
+        content_id = infer_content_id(source_path)
+        name_key = content_id if content_id else f"unknown_{unknown_name_hash(source_path)}"
+        final_path = out_dir / f"{name_key}__3840x2160.png"
+        if args.resume and final_path.exists():
+            continue
+
+        item = process_source_file(
+            source_path=source_path,
+            out_dir=out_dir,
+            api_key=api_key,
+            model=args.model,
+            seed=args.seed,
+            save_background_layer=args.save_background_layer,
+            album_shadow=args.album_shadow,
+        )
+        append_manifest(manifest_path, item)
+        print(json.dumps(item, sort_keys=True))
+
+    return 0
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="Album art background generation pipeline")
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    generate = sub.add_parser("generate-widescreen", help="Generate 3840x2160 widescreen outputs")
+    generate.add_argument("--source-art-dir", default=str(SOURCE_DIR), required=False)
+    generate.add_argument("--out-dir", default=str(WIDESCREEN_DIR), required=False)
+    generate.add_argument("--api-key", default="", required=False)
+    generate.add_argument("--model", required=True)
+    generate.add_argument("--seed", type=int, default=None)
+    generate.add_argument("--resume", action="store_true")
+    generate.add_argument("--save-background-layer", dest="save_background_layer", action="store_true")
+    generate.add_argument("--no-save-background-layer", dest="save_background_layer", action="store_false")
+    generate.set_defaults(save_background_layer=True)
+    generate.add_argument("--album-shadow", dest="album_shadow", action="store_true")
+    generate.add_argument("--no-album-shadow", dest="album_shadow", action="store_false")
+    generate.set_defaults(album_shadow=True)
+
+    return parser
+
+
+def main() -> int:
+    args = build_parser().parse_args()
+    if args.command == "generate-widescreen":
+        return run_generate_widescreen(args)
+    raise ValueError(f"Unsupported command: {args.command}")
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
