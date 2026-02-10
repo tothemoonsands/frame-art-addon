@@ -40,7 +40,7 @@ PHASE_SALT = {
 UNKNOWN_PHASE = "night"
 
 RUNTIME_OPTIONS: dict[str, Any] = {}
-ADDON_VERSION = "0.2.8"
+ADDON_VERSION = "0.3.6"
 
 HOLIDAY_ALIASES = {
     "football": "huskers",
@@ -380,7 +380,7 @@ def read_restore_request() -> tuple[Optional[dict], bool, Optional[bool]]:
 
     background_mode = str(payload.get("background_mode", "")).strip().lower()
     normalized["background_mode"] = background_mode
-    if kind == "cover_art_reference_background" or background_mode == "reference-no-mask":
+    if kind in {"cover_art_reference", "cover_art_reference_background"} or background_mode == "reference-no-mask":
         kind = "cover_art_reference_background"
         normalized["kind"] = kind
 
