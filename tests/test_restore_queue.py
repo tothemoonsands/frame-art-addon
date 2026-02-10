@@ -591,7 +591,64 @@ class MusicAssociationLookupTests(unittest.TestCase):
             }
         )
 
-        self.assertIsNone(matched)
+        self.assertIsInstance(matched, dict)
+        self.assertTrue(matched.get("generation_blocked"))
+
+    def test_lookup_prefers_collection_id_numeric_catalog_match(self):
+        uploader.atomic_write_json(
+            self.catalog,
+            {
+                "version": 1,
+                "updated_at": "",
+                "entries": {
+                    "1497226866__3840x2160.jpg": {
+                        "content_id": "MY_F1362",
+                        "updated_at": "",
+                    }
+                },
+            },
+        )
+        matched = uploader.lookup_music_association(
+            {
+                "collection_id": 1497226866,
+                "artist": "tom misch yussef dayes",
+                "album": "what kinda music",
+            }
+        )
+        self.assertIsInstance(matched, dict)
+        self.assertEqual("collection_id_catalog_exact", matched.get("match_source"))
+        self.assertEqual("1497226866__3840x2160.jpg", matched.get("catalog_key"))
+        self.assertEqual("MY_F1362", matched.get("content_id"))
+
+    def test_fuzzy_ambiguous_returns_generation_block(self):
+        uploader.atomic_write_json(
+            self.catalog,
+            {
+                "version": 1,
+                "updated_at": "",
+                "entries": {
+                    "aa_tom-misch-yussef-dayes-what-kinda-music_11111111__3840x2160.jpg": {
+                        "content_id": "MY_F1",
+                        "updated_at": "",
+                    },
+                    "aa_tom-misch-yussef-dayes-what-kinda-music_22222222__3840x2160.jpg": {
+                        "content_id": "MY_F2",
+                        "updated_at": "",
+                    },
+                },
+            },
+        )
+
+        matched = uploader.lookup_music_association_fuzzy(
+            {
+                "artist": "tom misch and yussef dayes",
+                "album": "what kinda music",
+            }
+        )
+        self.assertIsInstance(matched, dict)
+        self.assertTrue(matched.get("generation_blocked"))
+        self.assertEqual("fuzzy_ambiguous_blocked", matched.get("match_source"))
+        self.assertIsInstance(matched.get("match_candidates"), list)
 
     def test_update_music_index_entry_uses_collection_id_key(self):
         wide = self.root / "1440795324__3840x2160.jpg"
