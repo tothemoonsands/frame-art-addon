@@ -34,6 +34,8 @@ RESTORE_REQUEST_PATH = "/share/frame_art_restore_request.json"
 RESTORE_QUEUE_DIR = Path("/share/frame_art_restore_queue")
 WORKER_LOCK_PATH = Path("/share/frame_art_uploader_worker.lock")
 FALLBACK_DIR = Path("/media/frame_ai/cover_art/fallback")
+HOLIDAY_CATALOG_PATH = Path("/share/frame_art_holidays_catalog.json")
+AMBIENT_CATALOG_PATH = Path("/share/frame_art_ambient_catalog.json")
 
 MYF_RE = re.compile(r"^MY[_-]F(\d+)", re.IGNORECASE)
 ALLOWED_EXTENSIONS = {".jpg", ".jpeg", ".png"}
@@ -432,6 +434,10 @@ def list_ambient_images(folder: Path) -> list[Path]:
 
 
 def load_ambient_catalog(path: Path) -> dict[str, Any]:
+    return load_frame_art_catalog(path)
+
+
+def load_frame_art_catalog(path: Path) -> dict[str, Any]:
     if not path.exists():
         return {"version": 1, "updated_at": "", "entries": {}}
     try:
@@ -450,10 +456,53 @@ def load_ambient_catalog(path: Path) -> dict[str, Any]:
 
 
 def persist_ambient_catalog(path: Path, catalog: dict[str, Any]) -> None:
+    persist_frame_art_catalog(path, catalog)
+
+
+def persist_frame_art_catalog(path: Path, catalog: dict[str, Any]) -> None:
     catalog["version"] = 1
     catalog["updated_at"] = datetime.now(timezone.utc).isoformat()
     catalog.setdefault("entries", {})
     atomic_write_json(path, catalog)
+
+
+def get_catalog_for_local_pick(pick_file: Path) -> tuple[Optional[Path], Optional[str]]:
+    try:
+        holiday_root = Path("/media/frame_ai/holidays")
+        if pick_file.is_relative_to(holiday_root):
+            return HOLIDAY_CATALOG_PATH, pick_file.relative_to(holiday_root).as_posix()
+    except Exception:
+        pass
+
+    try:
+        ambient_root = Path("/media/frame_ai/ambient")
+        if pick_file.is_relative_to(ambient_root):
+            return AMBIENT_CATALOG_PATH, pick_file.relative_to(ambient_root).as_posix()
+    except Exception:
+        pass
+
+    return None, None
+
+
+def lookup_catalog_content_id(catalog_path: Path, catalog_key: str) -> Optional[str]:
+    catalog = load_frame_art_catalog(catalog_path)
+    entries = catalog.get("entries") if isinstance(catalog.get("entries"), dict) else {}
+    entry = entries.get(catalog_key) if isinstance(entries.get(catalog_key), dict) else {}
+    content_id = str(entry.get("content_id", "")).strip() if entry else ""
+    return content_id or None
+
+
+def update_catalog_content_id(catalog_path: Path, catalog_key: str, content_id: str) -> None:
+    catalog = load_frame_art_catalog(catalog_path)
+    entries = catalog.setdefault("entries", {})
+    if not isinstance(entries, dict):
+        entries = {}
+        catalog["entries"] = entries
+    entries[catalog_key] = {
+        "content_id": content_id,
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+    }
+    persist_frame_art_catalog(catalog_path, catalog)
 
 
 def handle_ambient_seed_restore(tv_ip: str, art: Any, restore_payload: dict, requested_at: str) -> dict[str, Any]:
@@ -842,14 +891,42 @@ def main() -> None:
                             raise ValueError(
                                 f"No candidate files found for pick request (kind={kind}, value={request_value!r}, resolved_folder={resolved_folder})"
                             )
-                        art, target_cid = upload_local_file_with_reconnect(tv_ip, art, pick_file)
-                        if not target_cid:
-                            raise ValueError(
-                                f"Upload completed but content_id was not discovered (kind={kind}, value={request_value!r}, resolved_folder={resolved_folder})"
-                            )
-                        append_local_uploaded_id(state, target_cid)
-                        state["last_applied"] = str(pick_file)
+
                         selected_name = pick_file.name
+                        catalog_path, catalog_key = get_catalog_for_local_pick(pick_file)
+                        catalog_hit = False
+
+                        if catalog_path and catalog_key:
+                            cached_content_id = lookup_catalog_content_id(catalog_path, catalog_key)
+                            if cached_content_id:
+                                target_cid = cached_content_id
+                                catalog_hit = True
+                                log_event(
+                                    "catalog_pick_hit",
+                                    file=str(pick_file),
+                                    catalog_path=str(catalog_path),
+                                    catalog_key=catalog_key,
+                                    content_id=target_cid,
+                                )
+
+                        if not catalog_hit:
+                            art, target_cid = upload_local_file_with_reconnect(tv_ip, art, pick_file)
+                            if not target_cid:
+                                raise ValueError(
+                                    f"Upload completed but content_id was not discovered (kind={kind}, value={request_value!r}, resolved_folder={resolved_folder})"
+                                )
+                            append_local_uploaded_id(state, target_cid)
+                            if catalog_path and catalog_key:
+                                update_catalog_content_id(catalog_path, catalog_key, target_cid)
+                                log_event(
+                                    "catalog_pick_update",
+                                    file=str(pick_file),
+                                    catalog_path=str(catalog_path),
+                                    catalog_key=catalog_key,
+                                    content_id=target_cid,
+                                )
+
+                        state["last_applied"] = str(pick_file)
                     else:
                         state["last_applied"] = f"samsung:{target_cid}"
                 elif kind == "ambient_seed":
@@ -963,15 +1040,61 @@ def main() -> None:
                     if current_id == target_cid:
                         verified = True
                     else:
-                        art.select_image(target_cid, show=True)
-                        for _ in range(3):
-                            time.sleep(1.0)
-                            current_info = get_current_info(art)
-                            current_id = extract_content_id(current_info)
-                            if current_id == target_cid:
-                                verified = True
-                                break
+                        pick_local_retry_file: Optional[Path] = None
+                        pick_local_retry_catalog_path: Optional[Path] = None
+                        pick_local_retry_catalog_key: Optional[str] = None
+
+                        if kind == "pick" and pick_source == "local":
+                            pick_file_candidate, _, _, _ = choose_pick_file(restore_payload, state)
+                            if pick_file_candidate and str(pick_file_candidate.name) == str(selected_name):
+                                pick_local_retry_file = pick_file_candidate
+                                pick_local_retry_catalog_path, pick_local_retry_catalog_key = get_catalog_for_local_pick(
+                                    pick_file_candidate
+                                )
+
+                        select_attempt_error: Optional[Exception] = None
+                        try:
                             art.select_image(target_cid, show=True)
+                            for _ in range(3):
+                                time.sleep(1.0)
+                                current_info = get_current_info(art)
+                                current_id = extract_content_id(current_info)
+                                if current_id == target_cid:
+                                    verified = True
+                                    break
+                                art.select_image(target_cid, show=True)
+                        except Exception as select_exc:
+                            select_attempt_error = select_exc
+
+                        if not verified and pick_local_retry_file is not None:
+                            log_event(
+                                "catalog_pick_fallback_upload",
+                                file=str(pick_local_retry_file),
+                                selected_content_id=target_cid,
+                                reason=repr(select_attempt_error) if select_attempt_error else "select_unverified",
+                            )
+                            art, replacement_cid = upload_local_file_with_reconnect(tv_ip, art, pick_local_retry_file)
+                            if not replacement_cid:
+                                raise ValueError(
+                                    f"Upload fallback completed but content_id was not discovered (kind={kind}, value={request_value!r}, resolved_folder={resolved_folder})"
+                                )
+                            append_local_uploaded_id(state, replacement_cid)
+                            target_cid = replacement_cid
+                            if pick_local_retry_catalog_path and pick_local_retry_catalog_key:
+                                update_catalog_content_id(
+                                    pick_local_retry_catalog_path,
+                                    pick_local_retry_catalog_key,
+                                    replacement_cid,
+                                )
+                            art.select_image(target_cid, show=True)
+                            for _ in range(3):
+                                time.sleep(1.0)
+                                current_info = get_current_info(art)
+                                current_id = extract_content_id(current_info)
+                                if current_id == target_cid:
+                                    verified = True
+                                    break
+                                art.select_image(target_cid, show=True)
                 else:
                     verification_skipped = True
 
