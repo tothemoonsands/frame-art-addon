@@ -543,6 +543,29 @@ class AmbientSeedTests(unittest.TestCase):
         self.assertEqual(0, second["deletion_failed"])
 
 
+class DeleteApiPathTests(unittest.TestCase):
+    def test_delete_prefers_delete_list_with_list_payload(self):
+        art = mock.Mock()
+        art.delete_list = mock.Mock()
+        art.available.return_value = []
+
+        result = uploader.delete_art_content_id(art, "MY_F999")
+
+        self.assertTrue(result["ok"])
+        art.delete_list.assert_called_once_with(["MY_F999"])
+
+    def test_delete_falls_back_to_delete_method(self):
+        art = mock.Mock()
+        art.delete_list = None
+        art.delete = mock.Mock()
+        art.available.return_value = []
+
+        result = uploader.delete_art_content_id(art, "MY_F123")
+
+        self.assertTrue(result["ok"])
+        art.delete.assert_called_once_with("MY_F123")
+
+
 class PickCatalogTests(unittest.TestCase):
     def setUp(self) -> None:
         self.tmp = tempfile.TemporaryDirectory()
