@@ -13,6 +13,10 @@ from typing import Any, Optional
 
 from PIL import Image
 from samsungtvws import SamsungTVWS
+try:
+    from rapidfuzz import fuzz as rapidfuzz_fuzz
+except Exception:
+    rapidfuzz_fuzz = None
 
 from cover_art import (
     BACKGROUND_DIR,
@@ -568,6 +572,42 @@ def normalize_music_text(value: str) -> str:
     return re.sub(r"\s+", " ", cleaned).strip()
 
 
+def normalize_music_text_loose(value: str) -> str:
+    # Canonicalize minor wording and format noise so near-identical album metadata
+    # can still resolve to the same cached item.
+    stopwords = {
+        "a",
+        "an",
+        "and",
+        "the",
+        "of",
+        "feat",
+        "featuring",
+        "ft",
+        "with",
+        "deluxe",
+        "edition",
+        "remaster",
+        "remastered",
+        "version",
+        "anniversary",
+        "album",
+        "single",
+        "ep",
+    }
+    return " ".join(token for token in normalize_music_text(value).split() if token not in stopwords)
+
+
+def music_text_equivalent(query: str, candidate: str) -> bool:
+    query_norm = normalize_music_text(query)
+    candidate_norm = normalize_music_text(candidate)
+    if query_norm and query_norm == candidate_norm:
+        return True
+    query_loose = normalize_music_text_loose(query)
+    candidate_loose = normalize_music_text_loose(candidate)
+    return bool(query_loose and query_loose == candidate_loose)
+
+
 def music_token_set(value: str) -> set[str]:
     stopwords = {
         "a",
@@ -599,13 +639,19 @@ def music_similarity(query: str, candidate: str) -> float:
     if query_norm in candidate_norm or candidate_norm in query_norm:
         return 0.93
 
-    ratio = SequenceMatcher(None, query_norm, candidate_norm).ratio()
     q_tokens = music_token_set(query_norm)
     c_tokens = music_token_set(candidate_norm)
     if q_tokens and c_tokens:
         overlap = len(q_tokens & c_tokens) / float(len(q_tokens | c_tokens))
     else:
         overlap = 0.0
+
+    if rapidfuzz_fuzz is not None:
+        ratio = rapidfuzz_fuzz.ratio(query_norm, candidate_norm) / 100.0
+        token_ratio = rapidfuzz_fuzz.token_set_ratio(query_norm, candidate_norm) / 100.0
+        return (0.4 * ratio) + (0.35 * token_ratio) + (0.25 * overlap)
+
+    ratio = SequenceMatcher(None, query_norm, candidate_norm).ratio()
     return (0.65 * ratio) + (0.35 * overlap)
 
 
@@ -685,8 +731,7 @@ def index_item_candidate_catalog_names(index_key: str, index_item: dict[str, Any
 
 def find_exact_music_index_match(artist: str, album: str) -> Optional[dict[str, Any]]:
     query_text_key = music_text_key(artist, album)
-    query_norm = normalize_music_text(query_text_key)
-    if not query_norm:
+    if not normalize_music_text(query_text_key):
         return None
 
     index_entries = load_music_index_entries()
@@ -699,7 +744,7 @@ def find_exact_music_index_match(artist: str, album: str) -> Optional[dict[str, 
         text_key = str(index_item.get("text_key", "")).strip()
         if not text_key:
             continue
-        if normalize_music_text(text_key) != query_norm:
+        if not music_text_equivalent(query_text_key, text_key):
             continue
 
         catalog_key = ""

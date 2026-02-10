@@ -529,6 +529,36 @@ class MusicAssociationLookupTests(unittest.TestCase):
         self.assertEqual("index_text_key_exact", matched.get("match_source"))
         self.assertEqual("MY_F555", matched.get("content_id"))
 
+    def test_exact_index_match_allows_and_token_difference(self):
+        expected_file = uploader.COMPRESSED_DIR / "1497226866__3840x2160.jpg"
+        expected_file.write_bytes(b"jpg")
+        uploader.atomic_write_json(
+            self.index,
+            {
+                "version": 1,
+                "updated_at": "",
+                "entries": {
+                    "1497226866": {
+                        "text_key": "tom misch and yussef dayes — what kinda music",
+                        "compressed_output_path": str(expected_file),
+                        "content_id": "MY_F1362",
+                    }
+                },
+            },
+        )
+
+        matched = uploader.lookup_music_association(
+            {
+                "artist": "tom misch yussef dayes",
+                "album": "what kinda music",
+            }
+        )
+
+        self.assertIsInstance(matched, dict)
+        self.assertEqual("1497226866__3840x2160.jpg", matched.get("catalog_key"))
+        self.assertEqual("index_text_key_exact", matched.get("match_source"))
+        self.assertEqual("MY_F1362", matched.get("content_id"))
+
     def test_fuzzy_lookup_requires_clear_winner_margin(self):
         uploader.atomic_write_json(
             self.assoc,
