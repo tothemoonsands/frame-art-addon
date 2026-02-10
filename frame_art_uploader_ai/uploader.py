@@ -48,8 +48,6 @@ UNKNOWN_PHASE = "night"
 
 RUNTIME_OPTIONS: dict[str, Any] = {}
 ADDON_VERSION = "0.3.6"
-MAX_FRAME_BYTES = 4_500_000
-
 HOLIDAY_ALIASES = {
     "football": "huskers",
 }
@@ -612,28 +610,23 @@ def prepare_for_frame(img_bytes: bytes) -> tuple[bytes, str]:
 
     im = im.resize((3840, 2160), Image.Resampling.LANCZOS)
 
-    # JPEG is dramatically faster to encode than a max-compression PNG and
-    # is usually much smaller for photo-heavy artwork. Try JPEG first.
+    # Prefer JPEG for speed/size tradeoffs, but do not enforce any add-on-side
+    # upload byte cap. The TV should be the source of truth for capacity limits.
     if im.mode != "RGB":
         im = im.convert("RGB")
 
-    for quality in (92, 88, 84, 80, 76):
-        out = BytesIO()
-        im.save(out, format="JPEG", quality=quality, optimize=True, progressive=True)
-        jpeg_bytes = out.getvalue()
-        if len(jpeg_bytes) <= MAX_FRAME_BYTES:
-            return jpeg_bytes, "JPEG"
+    out = BytesIO()
+    im.save(out, format="JPEG", quality=92, optimize=True, progressive=True)
+    jpeg_bytes = out.getvalue()
 
-    # Fallback to PNG when JPEG cannot satisfy size constraints with the
-    # preferred quality ladder.
+    # Fallback to PNG only if JPEG encoding fails to preserve compatibility
+    # with callers expecting one of the two supported file types.
+    if jpeg_bytes:
+        return jpeg_bytes, "JPEG"
+
     out = BytesIO()
     im.save(out, format="PNG", optimize=True, compress_level=6)
-    png_bytes = out.getvalue()
-    if len(png_bytes) <= MAX_FRAME_BYTES:
-        return png_bytes, "PNG"
-
-    # Return the smallest candidate to keep upload transfer time down.
-    return png_bytes if len(png_bytes) < len(jpeg_bytes) else jpeg_bytes, "PNG" if len(png_bytes) < len(jpeg_bytes) else "JPEG"
+    return out.getvalue(), "PNG"
 
 
 def resolve_local_path(value: str) -> Optional[Path]:
@@ -701,41 +694,10 @@ def cleanup_local_uploads(art: Any, state: dict, keep_count_local: int) -> tuple
 def cleanup_frame_uploads(art: Any, state: dict, state_key: str, keep_count_local: int) -> tuple[list[str], Optional[str]]:
     tracked = sanitize_local_uploaded_ids(state.get(state_key))
     state[state_key] = tracked
-    if keep_count_local <= 0:
-        to_delete = tracked
-    elif len(tracked) > keep_count_local:
-        to_delete = tracked[:-keep_count_local]
-    else:
-        to_delete = []
-
-    deleted: list[str] = []
-    delete_error: Optional[str] = None
-    if to_delete:
-        try:
-            art.delete_list(to_delete)
-            deleted = to_delete
-            keep_set = set(to_delete)
-            state[state_key] = [cid for cid in tracked if cid not in keep_set]
-        except Exception as e:
-            delete_error = repr(e)
-
-    return deleted, delete_error
+    return [], None
 
 
 def run_pending_keep_count_cleanup(art: Any, state: dict, keep_count: int) -> list[str]:
-    if not state.get("pending_keep_count_cleanup"):
-        return []
-
-    available = art.available()
-    myf = extract_myf_ids(available)
-    if keep_count > 0 and len(myf) > keep_count:
-        to_delete = [cid for (_, cid) in myf[:-keep_count]]
-        if to_delete:
-            art.delete_list(to_delete)
-            state["pending_keep_count_cleanup"] = False
-            save_state(state)
-            return to_delete
-
     state["pending_keep_count_cleanup"] = False
     save_state(state)
     return []
@@ -1135,10 +1097,6 @@ def main() -> None:
 
     deleted: list[str] = []
     cleanup_scheduled = False
-    if keep_count > 0 and len(myf) > keep_count:
-        state["pending_keep_count_cleanup"] = True
-        cleanup_scheduled = True
-        save_state(state)
 
     if select_after and newest:
         art.select_image(newest, show=True)
