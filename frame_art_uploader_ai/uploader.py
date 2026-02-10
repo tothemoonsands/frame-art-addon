@@ -12,13 +12,12 @@ from samsungtvws import SamsungTVWS
 from cover_art import (
     SOURCE_DIR,
     WIDESCREEN_DIR,
-    build_outpaint_canvas_and_mask,
     download_artwork,
     ensure_dirs,
     itunes_lookup,
     itunes_search,
     normalize_key,
-    outpaint_mode_b,
+    generate_reference_frame_from_album,
     resolve_artwork_url,
 )
 
@@ -378,7 +377,13 @@ def read_restore_request() -> tuple[Optional[dict], bool, Optional[bool]]:
             kind = ""
     normalized["kind"] = kind
 
-    if kind == "cover_art_outpaint":
+    background_mode = str(payload.get("background_mode", "")).strip().lower()
+    normalized["background_mode"] = background_mode
+    if kind == "cover_art_reference_background" or background_mode == "reference-no-mask":
+        kind = "cover_art_reference_background"
+        normalized["kind"] = kind
+
+    if kind in {"cover_art_outpaint", "cover_art_reference_background"}:
         if requested_show is None:
             requested_show = True
         normalized["requested_at"] = str(payload.get("requested_at", "")).strip()
@@ -644,7 +649,7 @@ def main() -> None:
                     selected_name = pick_file.name
                 else:
                     state["last_applied"] = f"samsung:{target_cid}"
-            elif kind == "cover_art_outpaint":
+            elif kind in {"cover_art_reference_background", "cover_art_outpaint"}:
                 ensure_dirs()
                 source_url = str(restore_payload.get("artwork_url", "")).strip()
                 artist = str(restore_payload.get("artist", "")).strip()
@@ -704,27 +709,34 @@ def main() -> None:
                         if not src_path.exists():
                             download_artwork(source_url, str(src_path), timeout_s=15)
 
-                        canvas_path, mask_path = build_outpaint_canvas_and_mask(str(src_path))
-                        outpaint_bytes = outpaint_mode_b(
-                            str(canvas_path),
-                            str(mask_path),
+                        use_legacy_masked = bool(RUNTIME_OPTIONS.get("legacy_masked_outpaint", False))
+                        if use_legacy_masked:
+                            log_event("legacy_masked_outpaint_requested", enabled=True, note="using reference_no_mask pipeline")
+
+                        final_png, background_png, request_id, model_used = generate_reference_frame_from_album(
+                            source_album_path=src_path,
                             openai_api_key=openai_api_key,
                             openai_model=openai_model,
                             timeout_s=90,
+                            album_shadow=True,
                         )
-                        processed_bytes, file_type = prepare_for_frame(outpaint_bytes)
-                        encoded_type = file_type
-                        encoded_bytes = len(processed_bytes)
-                        wide_path = wide_png_path if file_type == "PNG" else wide_jpg_path
+                        encoded_type = "PNG"
+                        encoded_bytes = len(final_png)
+                        wide_path = wide_png_path
                         selected_name = wide_path.name
-                        wide_path.write_bytes(processed_bytes)
+                        wide_path.write_bytes(final_png)
+
+                        save_bg = bool(RUNTIME_OPTIONS.get("save_background_layer", True))
+                        if save_bg:
+                            background_path = WIDESCREEN_DIR / f"{cache_key}__background.png"
+                            background_path.write_bytes(background_png)
 
                         art, target_cid = upload_local_file_with_reconnect(tv_ip, art, wide_path)
                         if not target_cid:
                             raise ValueError("Outpaint upload succeeded but content_id was not found")
                         append_uploaded_id(state, "cover_uploaded_ids", target_cid)
 
-                        pick_source = "cover_art_outpaint"
+                        pick_source = "cover_art_reference_background"
                     except Exception as e:
                         cover_error = e
                         fallback_path = pick_cover_fallback(cache_key)
@@ -765,7 +777,7 @@ def main() -> None:
                 deleted_local, cleanup_error = cleanup_local_uploads(art, state, keep_count_local)
             elif kind == "local_file":
                 deleted_local, cleanup_error = cleanup_local_uploads(art, state, keep_count_local)
-            elif kind == "cover_art_outpaint":
+            elif kind in {"cover_art_reference_background", "cover_art_outpaint"}:
                 deleted_local, cleanup_error = cleanup_frame_uploads(art, state, "cover_uploaded_ids", keep_count_local)
             save_state(state)
 
@@ -816,8 +828,13 @@ def main() -> None:
                     "source_path": str(locals().get("src_path")) if "src_path" in locals() else None,
                     "widescreen_path": str(locals().get("wide_path")) if "wide_path" in locals() else None,
                     "fallback_path": str(locals().get("fallback_path")) if "fallback_path" in locals() and locals().get("fallback_path") else None,
-                    "encoded_type": encoded_type if kind == "cover_art_outpaint" else None,
-                    "encoded_bytes": encoded_bytes if kind == "cover_art_outpaint" else None,
+                    "encoded_type": encoded_type if kind in {"cover_art_outpaint", "cover_art_reference_background"} else None,
+                    "encoded_bytes": encoded_bytes if kind in {"cover_art_outpaint", "cover_art_reference_background"} else None,
+                    "prompt_variant": "reference_background_nomask" if kind in {"cover_art_outpaint", "cover_art_reference_background"} else None,
+                    "pipeline": "reference_no_mask" if kind in {"cover_art_outpaint", "cover_art_reference_background"} else None,
+                    "mask_mode": "none" if kind in {"cover_art_outpaint", "cover_art_reference_background"} else None,
+                    "openai_request_id": locals().get("request_id"),
+                    "openai_model_used": locals().get("model_used"),
                 }
             )
 
