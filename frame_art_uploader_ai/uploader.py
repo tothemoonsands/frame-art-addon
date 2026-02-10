@@ -41,6 +41,7 @@ UNKNOWN_PHASE = "night"
 
 RUNTIME_OPTIONS: dict[str, Any] = {}
 ADDON_VERSION = "0.3.6"
+MAX_FRAME_BYTES = 4_500_000
 
 HOLIDAY_ALIASES = {
     "football": "huskers",
@@ -434,17 +435,28 @@ def prepare_for_frame(img_bytes: bytes) -> tuple[bytes, str]:
 
     im = im.resize((3840, 2160), Image.Resampling.LANCZOS)
 
-    out = BytesIO()
-    im.save(out, format="PNG", optimize=True, compress_level=9)
-    png_bytes = out.getvalue()
-    if len(png_bytes) <= 4_500_000:
-        return png_bytes, "PNG"
-
+    # JPEG is dramatically faster to encode than a max-compression PNG and
+    # is usually much smaller for photo-heavy artwork. Try JPEG first.
     if im.mode != "RGB":
         im = im.convert("RGB")
+
+    for quality in (92, 88, 84, 80, 76):
+        out = BytesIO()
+        im.save(out, format="JPEG", quality=quality, optimize=True, progressive=True)
+        jpeg_bytes = out.getvalue()
+        if len(jpeg_bytes) <= MAX_FRAME_BYTES:
+            return jpeg_bytes, "JPEG"
+
+    # Fallback to PNG when JPEG cannot satisfy size constraints with the
+    # preferred quality ladder.
     out = BytesIO()
-    im.save(out, format="JPEG", quality=92, optimize=True, progressive=True)
-    return out.getvalue(), "JPEG"
+    im.save(out, format="PNG", optimize=True, compress_level=6)
+    png_bytes = out.getvalue()
+    if len(png_bytes) <= MAX_FRAME_BYTES:
+        return png_bytes, "PNG"
+
+    # Return the smallest candidate to keep upload transfer time down.
+    return png_bytes if len(png_bytes) < len(jpeg_bytes) else jpeg_bytes, "PNG" if len(png_bytes) < len(jpeg_bytes) else "JPEG"
 
 
 def resolve_local_path(value: str) -> Optional[Path]:
