@@ -405,9 +405,13 @@ def parse_restore_request_payload(payload: Any) -> tuple[Optional[dict], Optiona
         normalized["album"] = str(payload.get("album", "")).strip()
         normalized["track"] = str(payload.get("track", "")).strip()
         normalized["music_session_key"] = str(payload.get("music_session_key", "")).strip()
-        normalized["key_source"] = str(payload.get("key_source", "")).strip().lower()
-        normalized["shazam_key"] = str(payload.get("shazam_key", "")).strip()
+        key_source = str(payload.get("key_source", "")).strip().lower()
+        normalized["key_source"] = key_source
+        shazam_key = str(payload.get("shazam_key", "")).strip()
+        # Prevent stale Shazam keys from being reused when the current key source is not Shazam.
+        normalized["shazam_key"] = shazam_key if key_source == "shazam" else ""
         normalized["listening_mode"] = str(payload.get("listening_mode", "")).strip()
+        normalized["source_preference"] = str(payload.get("source_preference", "")).strip().lower()
         collection_id_raw = payload.get("collection_id")
         if collection_id_raw in (None, ""):
             normalized["collection_id"] = None
@@ -527,6 +531,52 @@ def append_music_error(entry: dict[str, Any]) -> None:
     persist_frame_art_catalog(MUSIC_ERRORS_PATH, catalog)
 
 
+def normalized_album_association(artist: str, album: str) -> str:
+    merged = f"{artist} {album}".strip().lower()
+    merged = re.sub(r"[^a-z0-9]+", " ", merged)
+    return re.sub(r"\s+", " ", merged).strip()
+
+
+def lookup_music_association(restore_payload: dict[str, Any]) -> Optional[dict[str, Any]]:
+    catalog = load_frame_art_catalog(MUSIC_ASSOCIATIONS_PATH)
+    entries = catalog.get("entries") if isinstance(catalog.get("entries"), dict) else {}
+    if not isinstance(entries, dict) or not entries:
+        return None
+
+    music_session_key = str(restore_payload.get("music_session_key", "")).strip()
+    shazam_key = str(restore_payload.get("shazam_key", "")).strip()
+    artist = str(restore_payload.get("artist", "")).strip()
+    album = str(restore_payload.get("album", "")).strip()
+    album_key_raw = (artist + " — " + album).strip()
+    album_key_norm = normalized_album_association(artist, album)
+
+    candidate_keys: list[str] = []
+    if music_session_key:
+        candidate_keys.append(f"session::{music_session_key}")
+    if shazam_key:
+        candidate_keys.append(f"shazam::{shazam_key}")
+    if album_key_raw:
+        candidate_keys.append(f"album::{album_key_raw}")
+    if album_key_norm:
+        candidate_keys.append(f"album_norm::{album_key_norm}")
+
+    for key in candidate_keys:
+        record = entries.get(key)
+        if isinstance(record, dict):
+            return record
+
+    if album_key_norm:
+        for key, record in entries.items():
+            if not (isinstance(key, str) and key.startswith("album::") and isinstance(record, dict)):
+                continue
+            raw_album_key = key.split("::", 1)[1]
+            raw_norm = normalized_album_association(*raw_album_key.split(" — ", 1)) if " — " in raw_album_key else ""
+            if raw_norm == album_key_norm:
+                return record
+
+    return None
+
+
 def update_music_association(
     restore_payload: dict[str, Any],
     *,
@@ -566,6 +616,9 @@ def update_music_association(
         entries[f"shazam::{shazam_key}"] = record
     if artist or album:
         entries[f"album::{(artist + ' — ' + album).strip()}"] = record
+        album_norm = normalized_album_association(artist, album)
+        if album_norm:
+            entries[f"album_norm::{album_norm}"] = record
     entries[f"cache::{cache_key}"] = record
 
     persist_frame_art_catalog(MUSIC_ASSOCIATIONS_PATH, catalog)
@@ -1012,6 +1065,7 @@ def main() -> None:
                     artist = str(restore_payload.get("artist", "")).strip()
                     album = str(restore_payload.get("album", "")).strip()
                     track = str(restore_payload.get("track", "")).strip()
+                    association_record = lookup_music_association(restore_payload)
                     collection_id_raw = restore_payload.get("collection_id")
                     collection_id: Optional[int] = None
                     if collection_id_raw not in (None, ""):
@@ -1019,9 +1073,23 @@ def main() -> None:
                             collection_id = int(collection_id_raw)
                         except Exception:
                             collection_id = None
+                    if collection_id is None and isinstance(association_record, dict):
+                        assoc_collection_id = association_record.get("collection_id")
+                        if isinstance(assoc_collection_id, int):
+                            collection_id = assoc_collection_id
 
                     cache_key = normalize_key(collection_id, artist, album)
                     stem_key = str(collection_id) if isinstance(collection_id, int) else cache_key
+                    association_cache_key = (
+                        str(association_record.get("cache_key", "")).strip()
+                        if isinstance(association_record, dict)
+                        else ""
+                    )
+                    association_catalog_key = (
+                        str(association_record.get("catalog_key", "")).strip()
+                        if isinstance(association_record, dict)
+                        else ""
+                    )
                     src_path = SOURCE_DIR / f"{stem_key}.jpg"
                     background_path = BACKGROUND_DIR / f"{stem_key}__3840x2160__background.png"
                     wide_png_path = WIDESCREEN_DIR / f"{stem_key}__3840x2160.png"
@@ -1033,10 +1101,28 @@ def main() -> None:
                     legacy_jpg_path = WIDESCREEN_DIR / f"{cache_key}.jpg"
                     wide_path = compressed_jpg_path
                     if not wide_path.exists():
+                        if association_catalog_key:
+                            association_compressed = COMPRESSED_DIR / association_catalog_key
+                            association_wide = WIDESCREEN_DIR / association_catalog_key
+                            for candidate in (association_compressed, association_wide):
+                                if candidate.exists():
+                                    wide_path = candidate
+                                    break
+                        association_legacy_png = (
+                            WIDESCREEN_DIR / f"{association_cache_key}.png" if association_cache_key else None
+                        )
+                        association_legacy_jpg = (
+                            WIDESCREEN_DIR / f"{association_cache_key}.jpg" if association_cache_key else None
+                        )
                         for candidate in (wide_png_path, wide_jpg_path, legacy_png_path, legacy_jpg_path):
                             if candidate.exists():
                                 wide_path = candidate
                                 break
+                        if not wide_path.exists():
+                            for candidate in (association_legacy_png, association_legacy_jpg):
+                                if candidate is not None and candidate.exists():
+                                    wide_path = candidate
+                                    break
 
                     resolved_folder = str(WIDESCREEN_DIR)
                     selected_name = wide_path.name
@@ -1103,22 +1189,28 @@ def main() -> None:
                                     source_album_path=src_path,
                                     openai_api_key=openai_api_key,
                                     openai_model=openai_model,
-                                    timeout_s=90,
+                                    timeout_s=45,
                                     album_shadow=True,
                                 )
                                 generation_mode = "openai_reference"
                             except Exception as gen_exc:
+                                final_png, background_png = generate_local_fallback_frame_from_album(
+                                    source_album_path=src_path,
+                                    album_shadow=True,
+                                )
+                                request_id = None
+                                model_used = "local-fallback"
                                 gen_msg = repr(gen_exc).lower()
                                 if "moderation_blocked" in gen_msg or "safety system" in gen_msg:
-                                    final_png, background_png = generate_local_fallback_frame_from_album(
-                                        source_album_path=src_path,
-                                        album_shadow=True,
-                                    )
-                                    request_id = None
-                                    model_used = "local-fallback"
                                     generation_mode = "local_fallback_blocked"
                                 else:
-                                    raise
+                                    generation_mode = "local_fallback_openai_error"
+                                log_event(
+                                    "music_openai_fallback",
+                                    cache_key=cache_key,
+                                    error=repr(gen_exc),
+                                    mode=generation_mode,
+                                )
 
                             wide_png_path.parent.mkdir(parents=True, exist_ok=True)
                             background_path.parent.mkdir(parents=True, exist_ok=True)
