@@ -65,6 +65,7 @@ PHASE_SALT = {
 }
 UNKNOWN_PHASE = "night"
 MUSIC_RESTORE_KINDS = {"cover_art_reference_background", "cover_art_outpaint"}
+MUSIC_ASSOCIATION_SESSION_TTL_DAYS = 14
 
 RUNTIME_OPTIONS: dict[str, Any] = {}
 ADDON_VERSION = "0.3.6"
@@ -506,6 +507,129 @@ def persist_frame_art_catalog(path: Path, catalog: dict[str, Any]) -> None:
     catalog["updated_at"] = datetime.now(timezone.utc).isoformat()
     catalog.setdefault("entries", {})
     atomic_write_json(path, catalog)
+
+
+def parse_iso_timestamp(value: Any) -> Optional[datetime]:
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(str(value))
+    except Exception:
+        return None
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def music_association_record_rank(record: dict[str, Any]) -> tuple[int, int, float]:
+    verified_rank = 1 if bool(record.get("verified", False)) else 0
+    quality = str(record.get("source_quality", "")).strip().lower()
+    if quality == "trusted_cache":
+        quality_rank = 2
+    elif quality == "generated":
+        quality_rank = 1
+    else:
+        quality_rank = 0
+    updated_dt = parse_iso_timestamp(record.get("updated_at"))
+    updated_rank = updated_dt.timestamp() if updated_dt else 0.0
+    return verified_rank, quality_rank, updated_rank
+
+
+def choose_music_association_record(existing: dict[str, Any], candidate: dict[str, Any]) -> dict[str, Any]:
+    return candidate if music_association_record_rank(candidate) >= music_association_record_rank(existing) else existing
+
+
+def compact_music_association_entries(
+    entries: dict[str, Any],
+    *,
+    now: Optional[datetime] = None,
+    session_ttl_days: int = MUSIC_ASSOCIATION_SESSION_TTL_DAYS,
+) -> tuple[dict[str, dict[str, Any]], dict[str, int]]:
+    if not isinstance(entries, dict):
+        return {}, {"input_entries": 0, "output_entries": 0, "trimmed_entries": 0}
+
+    now_utc = now.astimezone(timezone.utc) if isinstance(now, datetime) and now.tzinfo else datetime.now(timezone.utc)
+    session_cutoff = now_utc - timedelta(days=max(0, int(session_ttl_days)))
+    grouped: dict[tuple[str, str, str, str, str, Any], dict[str, Any]] = {}
+
+    for key, raw_record in entries.items():
+        if not isinstance(raw_record, dict):
+            continue
+
+        record = dict(raw_record)
+        record.setdefault("cache_key", "")
+        record.setdefault("catalog_key", "")
+        record.setdefault("content_id", "")
+        record.setdefault("key_source", "unknown")
+        record.setdefault("artist", "")
+        record.setdefault("album", "")
+        record.setdefault("collection_id", None)
+        record.setdefault("verified", False)
+        record.setdefault("source_quality", "generated")
+        record.setdefault("updated_at", "")
+
+        signature = (
+            str(record.get("cache_key", "")).strip(),
+            str(record.get("catalog_key", "")).strip(),
+            str(record.get("content_id", "")).strip(),
+            str(record.get("artist", "")).strip(),
+            str(record.get("album", "")).strip(),
+            record.get("collection_id"),
+        )
+        group = grouped.setdefault(signature, {"record": record, "session_keys": [], "shazam_keys": []})
+        group["record"] = choose_music_association_record(group["record"], record)
+
+        raw_key = str(key or "")
+        if raw_key.startswith("session::"):
+            group["session_keys"].append(raw_key)
+        elif raw_key.startswith("shazam::"):
+            group["shazam_keys"].append(raw_key)
+
+    compacted: dict[str, dict[str, Any]] = {}
+    for group in grouped.values():
+        record = group["record"]
+
+        def set_key(target_key: str) -> None:
+            if not target_key:
+                return
+            existing = compacted.get(target_key)
+            if isinstance(existing, dict):
+                compacted[target_key] = choose_music_association_record(existing, record)
+            else:
+                compacted[target_key] = record
+
+        artist = str(record.get("artist", "")).strip()
+        album = str(record.get("album", "")).strip()
+        album_norm = normalized_album_association(artist, album)
+        cache_key = str(record.get("cache_key", "")).strip()
+        updated_dt = parse_iso_timestamp(record.get("updated_at"))
+
+        if album_norm:
+            set_key(f"album_norm::{album_norm}")
+        if cache_key:
+            set_key(f"cache::{cache_key}")
+
+        if updated_dt and updated_dt >= session_cutoff:
+            if group["session_keys"]:
+                set_key(group["session_keys"][-1])
+            if group["shazam_keys"]:
+                set_key(group["shazam_keys"][-1])
+
+    stats = {
+        "input_entries": len(entries),
+        "output_entries": len(compacted),
+        "trimmed_entries": max(0, len(entries) - len(compacted)),
+    }
+    return compacted, stats
+
+
+def compact_music_associations_file(session_ttl_days: int = MUSIC_ASSOCIATION_SESSION_TTL_DAYS) -> dict[str, int]:
+    catalog = load_frame_art_catalog(MUSIC_ASSOCIATIONS_PATH)
+    entries = catalog.get("entries") if isinstance(catalog.get("entries"), dict) else {}
+    compacted, stats = compact_music_association_entries(entries, session_ttl_days=session_ttl_days)
+    catalog["entries"] = compacted
+    persist_frame_art_catalog(MUSIC_ASSOCIATIONS_PATH, catalog)
+    return stats
 
 
 def get_catalog_for_local_pick(pick_file: Path) -> tuple[Optional[Path], Optional[str]]:
@@ -1185,17 +1309,17 @@ def update_music_association(
         entries[f"session::{music_session_key}"] = record
     if shazam_key:
         entries[f"shazam::{shazam_key}"] = record
-    if artist or album:
-        entries[f"album::{(artist + ' — ' + album).strip()}"] = record
-        album_norm = normalized_album_association(artist, album)
-        if album_norm:
-            entries[f"album_norm::{album_norm}"] = record
-        album_loose = normalize_music_text_loose(f"{artist} {album}".strip())
-        if album_loose:
-            entries[f"album_loose::{album_loose}"] = record
-    entries[f"cache::{cache_key}"] = record
+    album_norm = normalized_album_association(artist, album)
+    if album_norm:
+        entries[f"album_norm::{album_norm}"] = record
+    if cache_key:
+        entries[f"cache::{cache_key}"] = record
+
+    compacted_entries, compact_stats = compact_music_association_entries(entries)
+    catalog["entries"] = compacted_entries
 
     persist_frame_art_catalog(MUSIC_ASSOCIATIONS_PATH, catalog)
+    log_event("music_associations_compacted", **compact_stats)
 
 
 def music_catalog_key_for_path(path: Path) -> str:
