@@ -738,6 +738,28 @@ class CoverArtPayloadNormalizationTests(unittest.TestCase):
         self.assertEqual("shazam", normalized["key_source"])
         self.assertEqual("album:yes|home-again", normalized["shazam_key"])
 
+    def test_boolean_like_key_source_with_shazam_key_is_inferred_as_shazam(self):
+        payload = {
+            "kind": "cover_art_reference",
+            "key_source": "true",
+            "shazam_key": "album:childish gambino|\"awaken, my love!\"",
+            "artist": "love!",
+            "album": "album",
+            "track": "Childish Gambino",
+            "music_session_key": "album:childish gambino|awaken,",
+        }
+        normalized, _, err = uploader.parse_restore_request_payload(payload)
+        self.assertIsNone(err)
+        self.assertEqual("shazam", normalized["key_source"])
+        self.assertEqual("album:childish gambino|\"awaken, my love!\"", normalized["shazam_key"])
+        self.assertEqual("childish gambino", normalized["artist"].lower())
+        self.assertEqual("awaken, my love!", normalized["album"].lower())
+
+    def test_shazam_key_parsing_recovers_quoted_album(self):
+        artist, album = uploader.parse_shazam_album_match_key('album:childish gambino|"awaken, my love!"')
+        self.assertEqual("childish gambino", artist.lower())
+        self.assertEqual("awaken, my love!", album.lower())
+
 
 class MusicAssociationLookupTests(unittest.TestCase):
     def setUp(self) -> None:

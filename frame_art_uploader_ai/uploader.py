@@ -375,6 +375,35 @@ def choose_pick_samsung_id(payload: dict, rng: int, phase: str) -> Optional[str]
     return pool[idx]
 
 
+def parse_shazam_album_match_key(raw_value: Any) -> tuple[str, str]:
+    raw = str(raw_value or "").strip()
+    if not raw:
+        return "", ""
+    body = raw
+    if raw.lower().startswith("album:"):
+        body = raw.split(":", 1)[1]
+    if "|" not in body:
+        return "", ""
+    artist_raw, album_raw = body.split("|", 1)
+    artist = str(artist_raw).strip().strip("\"'").strip()
+    album = str(album_raw).strip().strip("\"'").strip()
+    if not (artist and album):
+        return "", ""
+    return artist, album
+
+
+def music_metadata_looks_low_quality(artist: str, album: str) -> bool:
+    artist_norm = normalize_music_text(artist)
+    album_norm = normalize_music_text(album)
+    if not artist_norm or not album_norm:
+        return True
+    if artist_norm in {"artist", "unknown"}:
+        return True
+    if album_norm in {"album", "unknown", "music"}:
+        return True
+    return False
+
+
 def parse_restore_request_payload(payload: Any) -> tuple[Optional[dict], Optional[bool], Optional[str]]:
     if not isinstance(payload, dict):
         return None, None, "Invalid restore payload: expected JSON object"
@@ -414,15 +443,45 @@ def parse_restore_request_payload(payload: Any) -> tuple[Optional[dict], Optiona
             requested_show = True
         normalized["requested_at"] = str(payload.get("requested_at", "")).strip()
         normalized["artwork_url"] = str(payload.get("artwork_url", "")).strip()
-        normalized["artist"] = str(payload.get("artist", "")).strip()
-        normalized["album"] = str(payload.get("album", "")).strip()
-        normalized["track"] = str(payload.get("track", "")).strip()
-        normalized["music_session_key"] = str(payload.get("music_session_key", "")).strip()
-        key_source = str(payload.get("key_source", "")).strip().lower()
-        normalized["key_source"] = key_source
+        artist = str(payload.get("artist", "")).strip()
+        album = str(payload.get("album", "")).strip()
+        track = str(payload.get("track", "")).strip()
+        music_session_key = str(payload.get("music_session_key", "")).strip()
         shazam_key = str(payload.get("shazam_key", "")).strip()
+        key_source_raw = str(payload.get("key_source", "")).strip().lower()
+
+        shazam_like = any(
+            str(v).strip().lower().startswith("album:")
+            for v in (shazam_key, music_session_key)
+            if str(v).strip()
+        )
+        inferred_shazam = key_source_raw == "shazam" or (
+            key_source_raw in {"true", "1", "yes", "on"} and shazam_like
+        )
+        key_source = "shazam" if inferred_shazam else key_source_raw
+        normalized["music_session_key"] = music_session_key
+        normalized["key_source"] = key_source
         # Prevent stale Shazam keys from being reused when the current key source is not Shazam.
-        normalized["shazam_key"] = shazam_key if key_source == "shazam" else ""
+        normalized["shazam_key"] = shazam_key if inferred_shazam else ""
+
+        parsed_artist = ""
+        parsed_album = ""
+        for raw_key in (shazam_key, music_session_key):
+            parsed_artist, parsed_album = parse_shazam_album_match_key(raw_key)
+            if parsed_artist and parsed_album:
+                break
+
+        if parsed_artist and parsed_album:
+            if music_metadata_looks_low_quality(artist, album):
+                artist = parsed_artist
+                album = parsed_album
+            elif key_source == "shazam" and track and normalize_music_text(track) == normalize_music_text(parsed_artist):
+                artist = parsed_artist
+                album = parsed_album
+
+        normalized["artist"] = artist
+        normalized["album"] = album
+        normalized["track"] = track
         normalized["listening_mode"] = str(payload.get("listening_mode", "")).strip()
         normalized["source_preference"] = str(payload.get("source_preference", "")).strip().lower()
         collection_id_raw = payload.get("collection_id")
