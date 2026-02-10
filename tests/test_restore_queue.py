@@ -774,6 +774,58 @@ class MusicAssociationLookupTests(unittest.TestCase):
         )
         self.assertEqual(original, self.index.read_text(encoding="utf-8"))
 
+    def test_compact_music_association_entries_trims_duplicate_aliases(self):
+        record = {
+            "cache_key": "itc_1497226866",
+            "catalog_key": "1497226866__3840x2160.jpg",
+            "content_id": "MY_F1362",
+            "key_source": "sonos",
+            "artist": "Tom Misch & Yussef Dayes",
+            "album": "What Kinda Music",
+            "collection_id": 1497226866,
+            "verified": True,
+            "source_quality": "trusted_cache",
+            "updated_at": "2026-02-10T12:27:37.002937+00:00",
+        }
+        entries = {
+            "session::What Kinda Music": dict(record),
+            "album::Tom Misch & Yussef Dayes — What Kinda Music": dict(record),
+            "album_norm::tom misch yussef dayes what kinda music": dict(record),
+            "album_loose::tom misch yussef dayes what kinda music": dict(record),
+            "cache::itc_1497226866": dict(record),
+        }
+
+        compacted, stats = uploader.compact_music_association_entries(entries, session_ttl_days=30)
+        self.assertLess(stats["output_entries"], stats["input_entries"])
+        self.assertIn("album_norm::tom misch yussef dayes what kinda music", compacted)
+        self.assertIn("cache::itc_1497226866", compacted)
+        self.assertIn("session::What Kinda Music", compacted)
+        self.assertNotIn("album::Tom Misch & Yussef Dayes — What Kinda Music", compacted)
+        self.assertNotIn("album_loose::tom misch yussef dayes what kinda music", compacted)
+
+    def test_update_music_association_writes_compact_aliases(self):
+        uploader.update_music_association(
+            {
+                "music_session_key": "What Kinda Music",
+                "artist": "Tom Misch & Yussef Dayes",
+                "album": "What Kinda Music",
+                "key_source": "sonos",
+            },
+            cache_key="itc_1497226866",
+            catalog_key="1497226866__3840x2160.jpg",
+            content_id="MY_F1362",
+            verified=True,
+            source_quality="trusted_cache",
+        )
+
+        assoc = json.loads(self.assoc.read_text(encoding="utf-8"))
+        entries = assoc["entries"]
+        self.assertIn("album_norm::tom misch yussef dayes what kinda music", entries)
+        self.assertIn("cache::itc_1497226866", entries)
+        self.assertIn("session::What Kinda Music", entries)
+        self.assertNotIn("album::Tom Misch & Yussef Dayes — What Kinda Music", entries)
+        self.assertNotIn("album_loose::tom misch yussef dayes what kinda music", entries)
+
 
 if __name__ == "__main__":
     unittest.main()
