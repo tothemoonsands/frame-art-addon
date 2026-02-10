@@ -14,10 +14,15 @@ from PIL import Image
 from samsungtvws import SamsungTVWS
 
 from cover_art import (
+    BACKGROUND_DIR,
+    COMPRESSED_DIR,
+    JPEG_MAX_BYTES,
     SOURCE_DIR,
     WIDESCREEN_DIR,
+    compress_png_path_to_jpeg_max_bytes,
     download_artwork,
     ensure_dirs,
+    generate_local_fallback_frame_from_album,
     itunes_lookup,
     itunes_search,
     normalize_key,
@@ -33,9 +38,12 @@ STATE_PATH = "/data/frame_art_uploader_state.json"
 RESTORE_REQUEST_PATH = "/share/frame_art_restore_request.json"
 RESTORE_QUEUE_DIR = Path("/share/frame_art_restore_queue")
 WORKER_LOCK_PATH = Path("/share/frame_art_uploader_worker.lock")
-FALLBACK_DIR = Path("/media/frame_ai/cover_art/fallback")
+FALLBACK_DIR = Path("/media/frame_ai/music/fallback")
 HOLIDAY_CATALOG_PATH = Path("/share/frame_art_holidays_catalog.json")
 AMBIENT_CATALOG_PATH = Path("/share/frame_art_ambient_catalog.json")
+MUSIC_CATALOG_PATH = Path("/share/frame_art_music_catalog.json")
+MUSIC_ASSOCIATIONS_PATH = Path("/share/frame_art_music_associations.json")
+MUSIC_ERRORS_PATH = Path("/share/frame_art_music_errors.json")
 
 MYF_RE = re.compile(r"^MY[_-]F(\d+)", re.IGNORECASE)
 ALLOWED_EXTENSIONS = {".jpg", ".jpeg", ".png"}
@@ -397,6 +405,8 @@ def parse_restore_request_payload(payload: Any) -> tuple[Optional[dict], Optiona
         normalized["album"] = str(payload.get("album", "")).strip()
         normalized["track"] = str(payload.get("track", "")).strip()
         normalized["music_session_key"] = str(payload.get("music_session_key", "")).strip()
+        normalized["key_source"] = str(payload.get("key_source", "")).strip().lower()
+        normalized["shazam_key"] = str(payload.get("shazam_key", "")).strip()
         normalized["listening_mode"] = str(payload.get("listening_mode", "")).strip()
         collection_id_raw = payload.get("collection_id")
         if collection_id_raw in (None, ""):
@@ -503,6 +513,69 @@ def update_catalog_content_id(catalog_path: Path, catalog_key: str, content_id: 
         "updated_at": datetime.now(timezone.utc).isoformat(),
     }
     persist_frame_art_catalog(catalog_path, catalog)
+
+
+def append_music_error(entry: dict[str, Any]) -> None:
+    catalog = load_frame_art_catalog(MUSIC_ERRORS_PATH)
+    errors = catalog.get("errors")
+    if not isinstance(errors, list):
+        errors = []
+        catalog["errors"] = errors
+    payload = dict(entry)
+    payload["timestamp"] = datetime.now(timezone.utc).isoformat()
+    errors.append(payload)
+    persist_frame_art_catalog(MUSIC_ERRORS_PATH, catalog)
+
+
+def update_music_association(
+    restore_payload: dict[str, Any],
+    *,
+    cache_key: str,
+    catalog_key: str,
+    content_id: str,
+) -> None:
+    catalog = load_frame_art_catalog(MUSIC_ASSOCIATIONS_PATH)
+    entries = catalog.setdefault("entries", {})
+    if not isinstance(entries, dict):
+        entries = {}
+        catalog["entries"] = entries
+
+    music_session_key = str(restore_payload.get("music_session_key", "")).strip()
+    shazam_key = str(restore_payload.get("shazam_key", "")).strip()
+    key_source = str(restore_payload.get("key_source", "")).strip().lower() or "unknown"
+    artist = str(restore_payload.get("artist", "")).strip()
+    album = str(restore_payload.get("album", "")).strip()
+    track = str(restore_payload.get("track", "")).strip()
+    collection_id = restore_payload.get("collection_id")
+
+    record = {
+        "cache_key": cache_key,
+        "catalog_key": catalog_key,
+        "content_id": content_id,
+        "key_source": key_source,
+        "artist": artist,
+        "album": album,
+        "track": track,
+        "collection_id": collection_id if isinstance(collection_id, int) else None,
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+    }
+
+    if music_session_key:
+        entries[f"session::{music_session_key}"] = record
+    if shazam_key:
+        entries[f"shazam::{shazam_key}"] = record
+    if artist or album:
+        entries[f"album::{(artist + ' — ' + album).strip()}"] = record
+    entries[f"cache::{cache_key}"] = record
+
+    persist_frame_art_catalog(MUSIC_ASSOCIATIONS_PATH, catalog)
+
+
+def music_catalog_key_for_path(path: Path) -> str:
+    try:
+        return path.relative_to(COMPRESSED_DIR).as_posix()
+    except Exception:
+        return path.name
 
 
 def handle_ambient_seed_restore(tv_ip: str, art: Any, restore_payload: dict, requested_at: str) -> dict[str, Any]:
@@ -947,10 +1020,22 @@ def main() -> None:
                             collection_id = None
 
                     cache_key = normalize_key(collection_id, artist, album)
-                    src_path = SOURCE_DIR / f"{cache_key}.jpg"
-                    wide_png_path = WIDESCREEN_DIR / f"{cache_key}.png"
-                    wide_jpg_path = WIDESCREEN_DIR / f"{cache_key}.jpg"
-                    wide_path = wide_png_path if wide_png_path.exists() else wide_jpg_path
+                    stem_key = str(collection_id) if isinstance(collection_id, int) else cache_key
+                    src_path = SOURCE_DIR / f"{stem_key}.jpg"
+                    background_path = BACKGROUND_DIR / f"{stem_key}__3840x2160__background.png"
+                    wide_png_path = WIDESCREEN_DIR / f"{stem_key}__3840x2160.png"
+                    wide_jpg_path = WIDESCREEN_DIR / f"{stem_key}__3840x2160.jpg"
+                    compressed_jpg_path = COMPRESSED_DIR / f"{stem_key}__3840x2160.jpg"
+
+                    # Backward-compat candidates from older cover_art layout.
+                    legacy_png_path = WIDESCREEN_DIR / f"{cache_key}.png"
+                    legacy_jpg_path = WIDESCREEN_DIR / f"{cache_key}.jpg"
+                    wide_path = compressed_jpg_path
+                    if not wide_path.exists():
+                        for candidate in (wide_png_path, wide_jpg_path, legacy_png_path, legacy_jpg_path):
+                            if candidate.exists():
+                                wide_path = candidate
+                                break
 
                     resolved_folder = str(WIDESCREEN_DIR)
                     selected_name = wide_path.name
@@ -958,13 +1043,28 @@ def main() -> None:
                     chosen_index = 0
 
                     if wide_path.exists():
-                        encoded_type = guess_file_type(wide_path)
-                        encoded_bytes = wide_path.stat().st_size
-                        art, target_cid = upload_local_file_with_reconnect(tv_ip, art, wide_path)
-                        if not target_cid:
-                            raise ValueError("Cached widescreen upload succeeded but content_id was not found")
-                        append_uploaded_id(state, "cover_uploaded_ids", target_cid)
-                        pick_source = "cover_art_cache"
+                        catalog_key = music_catalog_key_for_path(wide_path)
+                        cached_content_id = lookup_catalog_content_id(MUSIC_CATALOG_PATH, catalog_key)
+                        if cached_content_id:
+                            target_cid = cached_content_id
+                            encoded_type = guess_file_type(wide_path)
+                            encoded_bytes = wide_path.stat().st_size
+                            pick_source = "music_cache_catalog_hit"
+                        else:
+                            encoded_type = guess_file_type(wide_path)
+                            encoded_bytes = wide_path.stat().st_size
+                            art, target_cid = upload_local_file_with_reconnect(tv_ip, art, wide_path)
+                            if not target_cid:
+                                raise ValueError("Cached music upload succeeded but content_id was not found")
+                            append_uploaded_id(state, "cover_uploaded_ids", target_cid)
+                            update_catalog_content_id(MUSIC_CATALOG_PATH, catalog_key, target_cid)
+                            update_music_association(
+                                restore_payload,
+                                cache_key=cache_key,
+                                catalog_key=catalog_key,
+                                content_id=target_cid,
+                            )
+                            pick_source = "music_cache_uploaded"
                     else:
                         FALLBACK_DIR.mkdir(parents=True, exist_ok=True)
                         cover_error: Optional[Exception] = None
@@ -997,27 +1097,77 @@ def main() -> None:
                             if use_legacy_masked:
                                 log_event("legacy_masked_outpaint_requested", enabled=True, note="using reference_no_mask pipeline")
 
-                            final_png, background_png, request_id, model_used = generate_reference_frame_from_album(
-                                source_album_path=src_path,
-                                openai_api_key=openai_api_key,
-                                openai_model=openai_model,
-                                timeout_s=90,
-                                album_shadow=True,
+                            try:
+                                final_png, background_png, request_id, model_used = generate_reference_frame_from_album(
+                                    source_album_path=src_path,
+                                    openai_api_key=openai_api_key,
+                                    openai_model=openai_model,
+                                    timeout_s=90,
+                                    album_shadow=True,
+                                )
+                                generation_mode = "openai_reference"
+                            except Exception as gen_exc:
+                                gen_msg = repr(gen_exc).lower()
+                                if "moderation_blocked" in gen_msg or "safety system" in gen_msg:
+                                    final_png, background_png = generate_local_fallback_frame_from_album(
+                                        source_album_path=src_path,
+                                        album_shadow=True,
+                                    )
+                                    request_id = None
+                                    model_used = "local-fallback"
+                                    generation_mode = "local_fallback_blocked"
+                                else:
+                                    raise
+
+                            wide_png_path.parent.mkdir(parents=True, exist_ok=True)
+                            background_path.parent.mkdir(parents=True, exist_ok=True)
+                            compressed_jpg_path.parent.mkdir(parents=True, exist_ok=True)
+                            wide_png_path.write_bytes(final_png)
+                            background_path.write_bytes(background_png)
+                            compressed_ok, compressed_size = compress_png_path_to_jpeg_max_bytes(
+                                wide_png_path,
+                                compressed_jpg_path,
+                                max_bytes=JPEG_MAX_BYTES,
                             )
-                            encoded_type = "PNG"
-                            encoded_bytes = len(final_png)
-                            wide_path = wide_png_path
-                            wide_path.write_bytes(final_png)
-                            art.upload(final_png, file_type="PNG", matte="none")
-                            available = art.available()
-                            myf = extract_myf_ids(available)
-                            target_cid = myf[-1][1] if myf else None
+                            wide_path = compressed_jpg_path if compressed_jpg_path.exists() else wide_png_path
+                            encoded_type = guess_file_type(wide_path)
+                            encoded_bytes = wide_path.stat().st_size
+                            art, target_cid = upload_local_file_with_reconnect(tv_ip, art, wide_path)
                             if not target_cid:
-                                raise ValueError("Generated cover upload succeeded but content_id was not found")
+                                raise ValueError("Generated music upload succeeded but content_id was not found")
                             append_uploaded_id(state, "cover_uploaded_ids", target_cid)
-                            pick_source = "cover_art_generated"
+                            catalog_key = music_catalog_key_for_path(wide_path)
+                            update_catalog_content_id(MUSIC_CATALOG_PATH, catalog_key, target_cid)
+                            update_music_association(
+                                restore_payload,
+                                cache_key=cache_key,
+                                catalog_key=catalog_key,
+                                content_id=target_cid,
+                            )
+                            pick_source = generation_mode
+                            log_event(
+                                "music_generated",
+                                cache_key=cache_key,
+                                mode=generation_mode,
+                                compressed_within_limit=compressed_ok,
+                                compressed_bytes=compressed_size,
+                                path=str(wide_path),
+                                background_path=str(background_path),
+                            )
                         except Exception as e:
                             cover_error = e
+                            append_music_error(
+                                {
+                                    "cache_key": cache_key,
+                                    "collection_id": collection_id,
+                                    "artist": artist,
+                                    "album": album,
+                                    "track": track,
+                                    "music_session_key": restore_payload.get("music_session_key", ""),
+                                    "key_source": restore_payload.get("key_source", ""),
+                                    "error": repr(e),
+                                }
+                            )
                             fallback_path = pick_cover_fallback(cache_key)
                             if fallback_path is None:
                                 raise
@@ -1027,8 +1177,8 @@ def main() -> None:
                             if not target_cid:
                                 raise ValueError("Fallback cover upload succeeded but content_id was not found")
                             append_uploaded_id(state, "cover_uploaded_ids", target_cid)
-                            pick_source = "cover_art_fallback"
-                            log_event("cover_art_fallback", cache_key=cache_key, error=repr(cover_error), fallback=str(fallback_path))
+                            pick_source = "music_fallback_file"
+                            log_event("music_fallback_file", cache_key=cache_key, error=repr(cover_error), fallback=str(fallback_path))
                 else:
                     raise ValueError(f"Unsupported restore kind: {kind!r}")
 
