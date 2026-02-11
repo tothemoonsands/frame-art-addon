@@ -46,7 +46,7 @@ def main() -> int:
         "--session-ttl-days",
         type=int,
         default=uploader.MUSIC_ASSOCIATION_SESSION_TTL_DAYS,
-        help="Keep session/shazam aliases only for records updated within this many days.",
+        help="Deprecated and ignored; session/shazam aliases no longer expire.",
     )
     parser.add_argument(
         "--apply",

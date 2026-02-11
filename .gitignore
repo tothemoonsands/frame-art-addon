@@ -1,6 +1,9 @@
 .DS_Store
 __MACOSX/
 ._*
+.nova/
 
 # Codex local context artifacts
 .codex/context/
+.codex/.DS_Store
+frame_art_uploader_ai/__pycache__/
