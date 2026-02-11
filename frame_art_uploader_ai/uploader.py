@@ -67,7 +67,8 @@ PHASE_SALT = {
 }
 UNKNOWN_PHASE = "night"
 MUSIC_RESTORE_KINDS = {"cover_art_reference_background", "cover_art_outpaint"}
-MUSIC_ASSOCIATION_SESSION_TTL_DAYS = 14
+# Deprecated: session/shazam aliases no longer expire.
+MUSIC_ASSOCIATION_SESSION_TTL_DAYS = 0
 
 RUNTIME_OPTIONS: dict[str, Any] = {}
 ADDON_VERSION = "0.3.6"
@@ -941,9 +942,8 @@ def compact_music_association_entries(
 ) -> tuple[dict[str, dict[str, Any]], dict[str, int]]:
     if not isinstance(entries, dict):
         return {}, {"input_entries": 0, "output_entries": 0, "trimmed_entries": 0}
-
-    now_utc = now.astimezone(timezone.utc) if isinstance(now, datetime) and now.tzinfo else datetime.now(timezone.utc)
-    session_cutoff = now_utc - timedelta(days=max(0, int(session_ttl_days)))
+    # Backward-compatible args retained; session/shazam aliases are now permanent.
+    _ = now, session_ttl_days
     grouped: dict[tuple[str, str, str, str, str, Any], dict[str, Any]] = {}
 
     for key, raw_record in entries.items():
@@ -996,18 +996,16 @@ def compact_music_association_entries(
         album = str(record.get("album", "")).strip()
         album_norm = normalized_album_association(artist, album)
         cache_key = str(record.get("cache_key", "")).strip()
-        updated_dt = parse_iso_timestamp(record.get("updated_at"))
 
         if album_norm:
             set_key(f"album_norm::{album_norm}")
         if cache_key:
             set_key(f"cache::{cache_key}")
 
-        if updated_dt and updated_dt >= session_cutoff:
-            if group["session_keys"]:
-                set_key(group["session_keys"][-1])
-            if group["shazam_keys"]:
-                set_key(group["shazam_keys"][-1])
+        if group["session_keys"]:
+            set_key(group["session_keys"][-1])
+        if group["shazam_keys"]:
+            set_key(group["shazam_keys"][-1])
 
     stats = {
         "input_entries": len(entries),
