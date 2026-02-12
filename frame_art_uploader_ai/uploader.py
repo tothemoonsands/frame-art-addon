@@ -71,7 +71,7 @@ MUSIC_RESTORE_KINDS = {"cover_art_reference_background", "cover_art_outpaint"}
 MUSIC_ASSOCIATION_SESSION_TTL_DAYS = 0
 
 RUNTIME_OPTIONS: dict[str, Any] = {}
-ADDON_VERSION = "0.3.7"
+ADDON_VERSION = "1.0.0"
 HOLIDAY_ALIASES = {
     "football": "huskers",
 }
@@ -2117,7 +2117,7 @@ def main() -> None:
     prefix = str(opts.get("filename_prefix", "ai_"))
     select_after = bool(opts.get("select_after_upload", True))
     openai_api_key = str(opts.get("openai_api_key", "")).strip()
-    openai_model = str(opts.get("openai_model", "chatgpt-image-latest")).strip() or "chatgpt-image-latest"
+    openai_model = str(opts.get("openai_model", "gpt-image-1.5")).strip() or "gpt-image-1.5"
 
     if not tv_ip:
         write_status({"ok": False, "error": "Missing tv_ip"})
