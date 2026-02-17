@@ -71,7 +71,7 @@ MUSIC_RESTORE_KINDS = {"cover_art_reference_background", "cover_art_outpaint"}
 MUSIC_ASSOCIATION_SESSION_TTL_DAYS = 0
 
 RUNTIME_OPTIONS: dict[str, Any] = {}
-ADDON_VERSION = "1.0.2"
+ADDON_VERSION = "1.0.4"
 HOLIDAY_ALIASES = {
     "football": "huskers",
 }
@@ -2064,11 +2064,103 @@ def is_broken_pipe_error(exc: Exception) -> bool:
     return "broken pipe" in message
 
 
+def is_art_socket_retryable_error(exc: Exception) -> bool:
+    if isinstance(exc, (BrokenPipeError, TimeoutError)):
+        return True
+    message = repr(exc).lower()
+    return (
+        "broken pipe" in message
+        or "timed out" in message
+        or "timeout" in message
+        or "websocket time out" in message
+        or "connection timed out" in message
+    )
+
+
+def select_and_verify_with_reconnect(
+    tv_ip: str,
+    art: Any,
+    target_cid: str,
+    attempts: int = 3,
+    sleep_s: float = 1.0,
+) -> tuple[Any, bool, Optional[Exception]]:
+    select_error: Optional[Exception] = None
+    current_art = art
+
+    for socket_attempt in range(2):
+        try:
+            current_art.select_image(target_cid, show=True)
+            for _ in range(max(1, attempts)):
+                time.sleep(sleep_s)
+                current_info = get_current_info(current_art)
+                current_id = extract_content_id(current_info)
+                if current_id == target_cid:
+                    return current_art, True, None
+                current_art.select_image(target_cid, show=True)
+            return current_art, False, None
+        except Exception as exc:
+            select_error = exc
+            if socket_attempt == 0 and is_art_socket_retryable_error(exc):
+                log_event(
+                    "select_retry",
+                    reason=repr(exc),
+                    selected_content_id=target_cid,
+                    action="reconnect_art_socket",
+                )
+                retry_tv = SamsungTVWS(tv_ip)
+                retry_art = retry_tv.art()
+                if not retry_art.supported():
+                    break
+                current_art = retry_art
+                continue
+            break
+
+    return current_art, False, select_error
+
+
+def invalidate_music_cached_content_id(catalog_key: str, content_id: str) -> None:
+    key_name = Path(str(catalog_key or "")).name
+    target_cid = str(content_id or "").strip()
+    if not key_name and not target_cid:
+        return
+
+    catalog = load_frame_art_catalog(MUSIC_CATALOG_PATH)
+    entries = catalog.get("entries") if isinstance(catalog.get("entries"), dict) else {}
+    if not isinstance(entries, dict):
+        entries = {}
+    if key_name:
+        entry = seed_catalog_entry(entries.get(key_name))
+        if not target_cid or str(entry.get("content_id", "")).strip() == target_cid:
+            entry["content_id"] = ""
+            entries[key_name] = entry
+            catalog["entries"] = entries
+            persist_frame_art_catalog(MUSIC_CATALOG_PATH, catalog)
+
+    assoc = load_frame_art_catalog(MUSIC_ASSOCIATIONS_PATH)
+    assoc_entries = assoc.get("entries") if isinstance(assoc.get("entries"), dict) else {}
+    assoc_changed = False
+    if isinstance(assoc_entries, dict):
+        for alias, raw_record in assoc_entries.items():
+            if not isinstance(raw_record, dict):
+                continue
+            rec_catalog_key = str(raw_record.get("catalog_key", "")).strip()
+            rec_content_id = str(raw_record.get("content_id", "")).strip()
+            if (key_name and rec_catalog_key == key_name) or (target_cid and rec_content_id == target_cid):
+                raw_record["content_id"] = ""
+                raw_record["verified"] = False
+                raw_record["updated_at"] = datetime.now(timezone.utc).isoformat()
+                assoc_entries[alias] = raw_record
+                assoc_changed = True
+    if assoc_changed:
+        assoc["entries"] = assoc_entries
+        persist_frame_art_catalog(MUSIC_ASSOCIATIONS_PATH, assoc)
+
+
 def upload_local_file_with_reconnect(tv_ip: str, art: Any, file_path: Path) -> tuple[Any, Optional[str]]:
     try:
         return art, upload_local_file(art, file_path)
     except Exception as exc:
-        if not is_broken_pipe_error(exc):
+        if not is_art_socket_retryable_error(exc):
             raise
 
         log_event("upload_retry", reason=repr(exc), file=str(file_path), action="reconnect_art_socket")
@@ -2634,18 +2726,13 @@ def main() -> None:
                                 )
 
                         select_attempt_error: Optional[Exception] = None
-                        try:
-                            art.select_image(target_cid, show=True)
-                            for _ in range(3):
-                                time.sleep(1.0)
-                                current_info = get_current_info(art)
-                                current_id = extract_content_id(current_info)
-                                if current_id == target_cid:
-                                    verified = True
-                                    break
-                                art.select_image(target_cid, show=True)
-                        except Exception as select_exc:
-                            select_attempt_error = select_exc
+                        art, verified, select_attempt_error = select_and_verify_with_reconnect(
+                            tv_ip,
+                            art,
+                            target_cid,
+                            attempts=3,
+                            sleep_s=1.0,
+                        )
 
                         retry_upload_file: Optional[Path] = pick_local_retry_file
                         retry_catalog_path: Optional[Path] = pick_local_retry_catalog_path
@@ -2661,6 +2748,12 @@ def main() -> None:
                             retry_catalog_path = MUSIC_CATALOG_PATH
                             retry_catalog_key = music_retry_catalog_key or music_catalog_key_for_path(music_retry_upload_path)
                             retry_event = "music_catalog_fallback_upload"
+                            log_event(
+                                "music_catalog_invalidate_stale_content_id",
+                                catalog_key=retry_catalog_key,
+                                stale_content_id=target_cid,
+                            )
+                            invalidate_music_cached_content_id(retry_catalog_key or "", target_cid or "")
 
                         if not verified and retry_upload_file is not None:
                             log_event(
@@ -2706,15 +2799,15 @@ def main() -> None:
                                     request_id=locals().get("request_id"),
                                 )
                                 pick_source = "music_cache_refreshed_upload"
-                            art.select_image(target_cid, show=True)
-                            for _ in range(3):
-                                time.sleep(1.0)
-                                current_info = get_current_info(art)
-                                current_id = extract_content_id(current_info)
-                                if current_id == target_cid:
-                                    verified = True
-                                    break
-                                art.select_image(target_cid, show=True)
+                            art, verified, retry_select_error = select_and_verify_with_reconnect(
+                                tv_ip,
+                                art,
+                                target_cid,
+                                attempts=3,
+                                sleep_s=1.0,
+                            )
+                            if retry_select_error is not None and not verified:
+                                select_attempt_error = retry_select_error
                 else:
                     verification_skipped = True
 
