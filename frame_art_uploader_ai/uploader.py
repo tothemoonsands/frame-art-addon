@@ -71,7 +71,7 @@ MUSIC_RESTORE_KINDS = {"cover_art_reference_background", "cover_art_outpaint"}
 MUSIC_ASSOCIATION_SESSION_TTL_DAYS = 0
 
 RUNTIME_OPTIONS: dict[str, Any] = {}
-ADDON_VERSION = "1.0.4"
+ADDON_VERSION = "1.0.5"
 HOLIDAY_ALIASES = {
     "football": "huskers",
 }
@@ -2077,6 +2077,14 @@ def is_art_socket_retryable_error(exc: Exception) -> bool:
     )
 
 
+def resolve_runtime_int_option(name: str, default: int, *, min_value: int, max_value: int) -> int:
+    try:
+        raw = int(RUNTIME_OPTIONS.get(name, default))
+    except Exception:
+        raw = default
+    return max(min_value, min(max_value, raw))
+
+
 def select_and_verify_with_reconnect(
     tv_ip: str,
     art: Any,
@@ -2086,8 +2094,9 @@ def select_and_verify_with_reconnect(
 ) -> tuple[Any, bool, Optional[Exception]]:
     select_error: Optional[Exception] = None
     current_art = art
+    socket_attempts = resolve_runtime_int_option("art_socket_retries", 3, min_value=1, max_value=6)
 
-    for socket_attempt in range(2):
+    for socket_attempt in range(socket_attempts):
         try:
             current_art.select_image(target_cid, show=True)
             for _ in range(max(1, attempts)):
@@ -2100,13 +2109,16 @@ def select_and_verify_with_reconnect(
             return current_art, False, None
         except Exception as exc:
             select_error = exc
-            if socket_attempt == 0 and is_art_socket_retryable_error(exc):
+            if socket_attempt < socket_attempts - 1 and is_art_socket_retryable_error(exc):
                 log_event(
                     "select_retry",
                     reason=repr(exc),
                     selected_content_id=target_cid,
                     action="reconnect_art_socket",
+                    attempt=socket_attempt + 1,
+                    max_attempts=socket_attempts,
                 )
+                time.sleep(min(0.5 * (socket_attempt + 1), 2.0))
                 retry_tv = SamsungTVWS(tv_ip)
                 retry_art = retry_tv.art()
                 if not retry_art.supported():
@@ -2157,18 +2169,36 @@ def invalidate_music_cached_content_id(catalog_key: str, content_id: str) -> Non
 
 
 def upload_local_file_with_reconnect(tv_ip: str, art: Any, file_path: Path) -> tuple[Any, Optional[str]]:
-    try:
-        return art, upload_local_file(art, file_path)
-    except Exception as exc:
-        if not is_art_socket_retryable_error(exc):
-            raise
+    current_art = art
+    upload_attempts = resolve_runtime_int_option("art_socket_retries", 3, min_value=1, max_value=6)
+    last_exc: Optional[Exception] = None
+    for attempt in range(upload_attempts):
+        try:
+            return current_art, upload_local_file(current_art, file_path)
+        except Exception as exc:
+            if not is_art_socket_retryable_error(exc):
+                raise
+            last_exc = exc
+            if attempt >= upload_attempts - 1:
+                break
+            log_event(
+                "upload_retry",
+                reason=repr(exc),
+                file=str(file_path),
+                action="reconnect_art_socket",
+                attempt=attempt + 1,
+                max_attempts=upload_attempts,
+            )
+            time.sleep(min(0.5 * (attempt + 1), 2.0))
+            retry_tv = SamsungTVWS(tv_ip)
+            retry_art = retry_tv.art()
+            if not retry_art.supported():
+                raise
+            current_art = retry_art
 
-        log_event("upload_retry", reason=repr(exc), file=str(file_path), action="reconnect_art_socket")
-        retry_tv = SamsungTVWS(tv_ip)
-        retry_art = retry_tv.art()
-        if not retry_art.supported():
-            raise
-        return retry_art, upload_local_file(retry_art, file_path)
+    if last_exc is not None:
+        raise last_exc
+    raise RuntimeError("upload_local_file_with_reconnect failed without an explicit exception")
 
 
 def cleanup_local_uploads(art: Any, state: dict, keep_count_local: int) -> tuple[list[str], Optional[str]]:
@@ -2210,6 +2240,8 @@ def main() -> None:
     select_after = bool(opts.get("select_after_upload", True))
     openai_api_key = str(opts.get("openai_api_key", "")).strip()
     openai_model = str(opts.get("openai_model", "gpt-image-1.5")).strip() or "gpt-image-1.5"
+    openai_timeout_s = resolve_runtime_int_option("openai_timeout_s", 120, min_value=30, max_value=600)
+    _ = resolve_runtime_int_option("art_socket_retries", 3, min_value=1, max_value=6)
 
     if not tv_ip:
         write_status({"ok": False, "error": "Missing tv_ip"})
@@ -2597,7 +2629,7 @@ def main() -> None:
                                     source_album_path=src_path,
                                     openai_api_key=openai_api_key,
                                     openai_model=openai_model,
-                                    timeout_s=45,
+                                    timeout_s=openai_timeout_s,
                                     album_shadow=True,
                                 )
                                 generation_mode = "openai_reference"
