@@ -2368,9 +2368,12 @@ def main() -> None:
                     selected_name = wide_path.name
                     file_count = 1
                     chosen_index = 0
+                    music_retry_upload_path: Optional[Path] = wide_path if wide_path.exists() else None
+                    music_retry_catalog_key: Optional[str] = None
 
                     if wide_path.exists():
                         catalog_key = music_catalog_key_for_path(wide_path)
+                        music_retry_catalog_key = catalog_key
                         cached_content_id = lookup_catalog_content_id(MUSIC_CATALOG_PATH, catalog_key)
                         association_content_id = (
                             str(association_record.get("content_id", "")).strip()
@@ -2644,26 +2647,65 @@ def main() -> None:
                         except Exception as select_exc:
                             select_attempt_error = select_exc
 
-                        if not verified and pick_local_retry_file is not None:
+                        retry_upload_file: Optional[Path] = pick_local_retry_file
+                        retry_catalog_path: Optional[Path] = pick_local_retry_catalog_path
+                        retry_catalog_key: Optional[str] = pick_local_retry_catalog_key
+                        retry_event = "catalog_pick_fallback_upload"
+                        if (
+                            not verified
+                            and retry_upload_file is None
+                            and kind in {"cover_art_reference_background", "cover_art_outpaint"}
+                            and music_retry_upload_path is not None
+                        ):
+                            retry_upload_file = music_retry_upload_path
+                            retry_catalog_path = MUSIC_CATALOG_PATH
+                            retry_catalog_key = music_retry_catalog_key or music_catalog_key_for_path(music_retry_upload_path)
+                            retry_event = "music_catalog_fallback_upload"
+
+                        if not verified and retry_upload_file is not None:
                             log_event(
-                                "catalog_pick_fallback_upload",
-                                file=str(pick_local_retry_file),
+                                retry_event,
+                                file=str(retry_upload_file),
                                 selected_content_id=target_cid,
                                 reason=repr(select_attempt_error) if select_attempt_error else "select_unverified",
                             )
-                            art, replacement_cid = upload_local_file_with_reconnect(tv_ip, art, pick_local_retry_file)
+                            art, replacement_cid = upload_local_file_with_reconnect(tv_ip, art, retry_upload_file)
                             if not replacement_cid:
                                 raise ValueError(
                                     f"Upload fallback completed but content_id was not discovered (kind={kind}, value={request_value!r}, resolved_folder={resolved_folder})"
                                 )
-                            append_local_uploaded_id(state, replacement_cid)
+                            if kind in {"cover_art_reference_background", "cover_art_outpaint"}:
+                                append_uploaded_id(state, "cover_uploaded_ids", replacement_cid)
+                            else:
+                                append_local_uploaded_id(state, replacement_cid)
                             target_cid = replacement_cid
-                            if pick_local_retry_catalog_path and pick_local_retry_catalog_key:
+                            if retry_catalog_path and retry_catalog_key:
                                 update_catalog_content_id(
-                                    pick_local_retry_catalog_path,
-                                    pick_local_retry_catalog_key,
+                                    retry_catalog_path,
+                                    retry_catalog_key,
                                     replacement_cid,
                                 )
+                            if kind in {"cover_art_reference_background", "cover_art_outpaint"}:
+                                update_music_association(
+                                    restore_payload,
+                                    cache_key=cache_key,
+                                    catalog_key=retry_catalog_key or "",
+                                    content_id=replacement_cid,
+                                    verified=True,
+                                    source_quality="trusted_cache",
+                                )
+                                update_music_index_entry(
+                                    artist=artist,
+                                    album=album,
+                                    collection_id=collection_id,
+                                    catalog_key=retry_catalog_key or "",
+                                    cache_key=cache_key,
+                                    content_id=replacement_cid,
+                                    wide_path=retry_upload_file,
+                                    compressed_path=retry_upload_file if retry_upload_file.suffix.lower() in {".jpg", ".jpeg"} else compressed_jpg_path,
+                                    request_id=locals().get("request_id"),
+                                )
+                                pick_source = "music_cache_refreshed_upload"
                             art.select_image(target_cid, show=True)
                             for _ in range(3):
                                 time.sleep(1.0)
