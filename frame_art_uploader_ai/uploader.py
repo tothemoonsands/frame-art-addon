@@ -71,7 +71,7 @@ MUSIC_RESTORE_KINDS = {"cover_art_reference_background", "cover_art_outpaint"}
 MUSIC_ASSOCIATION_SESSION_TTL_DAYS = 0
 
 RUNTIME_OPTIONS: dict[str, Any] = {}
-ADDON_VERSION = "1.0.5"
+ADDON_VERSION = "1.0.6"
 HOLIDAY_ALIASES = {
     "football": "huskers",
 }
@@ -2085,6 +2085,11 @@ def resolve_runtime_int_option(name: str, default: int, *, min_value: int, max_v
     return max(min_value, min(max_value, raw))
 
 
+def retry_backoff_seconds(attempt_index: int) -> float:
+    base = resolve_runtime_int_option("art_retry_backoff_s", 2, min_value=1, max_value=10)
+    return float(min(base * (attempt_index + 1), 20))
+
+
 def select_and_verify_with_reconnect(
     tv_ip: str,
     art: Any,
@@ -2094,7 +2099,7 @@ def select_and_verify_with_reconnect(
 ) -> tuple[Any, bool, Optional[Exception]]:
     select_error: Optional[Exception] = None
     current_art = art
-    socket_attempts = resolve_runtime_int_option("art_socket_retries", 3, min_value=1, max_value=6)
+    socket_attempts = resolve_runtime_int_option("art_socket_retries", 5, min_value=1, max_value=10)
 
     for socket_attempt in range(socket_attempts):
         try:
@@ -2118,13 +2123,27 @@ def select_and_verify_with_reconnect(
                     attempt=socket_attempt + 1,
                     max_attempts=socket_attempts,
                 )
-                time.sleep(min(0.5 * (socket_attempt + 1), 2.0))
-                retry_tv = SamsungTVWS(tv_ip)
-                retry_art = retry_tv.art()
-                if not retry_art.supported():
+                time.sleep(retry_backoff_seconds(socket_attempt))
+                try:
+                    retry_tv = SamsungTVWS(tv_ip)
+                    retry_art = retry_tv.art()
+                    if not retry_art.supported():
+                        select_error = RuntimeError("Art mode not supported / unreachable")
+                        break
+                    current_art = retry_art
+                    continue
+                except Exception as reconnect_exc:
+                    select_error = reconnect_exc
+                    log_event(
+                        "select_retry_reconnect_failed",
+                        reason=repr(reconnect_exc),
+                        selected_content_id=target_cid,
+                        attempt=socket_attempt + 1,
+                        max_attempts=socket_attempts,
+                    )
+                    if is_art_socket_retryable_error(reconnect_exc):
+                        continue
                     break
-                current_art = retry_art
-                continue
             break
 
     return current_art, False, select_error
@@ -2170,7 +2189,7 @@ def invalidate_music_cached_content_id(catalog_key: str, content_id: str) -> Non
 
 def upload_local_file_with_reconnect(tv_ip: str, art: Any, file_path: Path) -> tuple[Any, Optional[str]]:
     current_art = art
-    upload_attempts = resolve_runtime_int_option("art_socket_retries", 3, min_value=1, max_value=6)
+    upload_attempts = resolve_runtime_int_option("art_socket_retries", 5, min_value=1, max_value=10)
     last_exc: Optional[Exception] = None
     for attempt in range(upload_attempts):
         try:
@@ -2189,12 +2208,26 @@ def upload_local_file_with_reconnect(tv_ip: str, art: Any, file_path: Path) -> t
                 attempt=attempt + 1,
                 max_attempts=upload_attempts,
             )
-            time.sleep(min(0.5 * (attempt + 1), 2.0))
-            retry_tv = SamsungTVWS(tv_ip)
-            retry_art = retry_tv.art()
-            if not retry_art.supported():
-                raise
-            current_art = retry_art
+            time.sleep(retry_backoff_seconds(attempt))
+            try:
+                retry_tv = SamsungTVWS(tv_ip)
+                retry_art = retry_tv.art()
+                if not retry_art.supported():
+                    last_exc = RuntimeError("Art mode not supported / unreachable")
+                    break
+                current_art = retry_art
+            except Exception as reconnect_exc:
+                last_exc = reconnect_exc
+                log_event(
+                    "upload_retry_reconnect_failed",
+                    reason=repr(reconnect_exc),
+                    file=str(file_path),
+                    attempt=attempt + 1,
+                    max_attempts=upload_attempts,
+                )
+                if not is_art_socket_retryable_error(reconnect_exc):
+                    raise
+                continue
 
     if last_exc is not None:
         raise last_exc
@@ -2241,7 +2274,8 @@ def main() -> None:
     openai_api_key = str(opts.get("openai_api_key", "")).strip()
     openai_model = str(opts.get("openai_model", "gpt-image-1.5")).strip() or "gpt-image-1.5"
     openai_timeout_s = resolve_runtime_int_option("openai_timeout_s", 120, min_value=30, max_value=600)
-    _ = resolve_runtime_int_option("art_socket_retries", 3, min_value=1, max_value=6)
+    _ = resolve_runtime_int_option("art_socket_retries", 5, min_value=1, max_value=10)
+    _ = resolve_runtime_int_option("art_retry_backoff_s", 2, min_value=1, max_value=10)
 
     if not tv_ip:
         write_status({"ok": False, "error": "Missing tv_ip"})
