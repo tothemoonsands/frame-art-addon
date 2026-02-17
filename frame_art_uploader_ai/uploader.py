@@ -74,7 +74,7 @@ MUSIC_RESTORE_KINDS = {"cover_art_reference_background", "cover_art_outpaint"}
 MUSIC_ASSOCIATION_SESSION_TTL_DAYS = 0
 
 RUNTIME_OPTIONS: dict[str, Any] = {}
-ADDON_VERSION = "1.1"
+ADDON_VERSION = "1.2"
 HOLIDAY_ALIASES = {
     "football": "huskers",
 }
@@ -2523,6 +2523,10 @@ def main() -> None:
                 artist = ""
                 album = ""
                 track = ""
+                match_candidates_for_status: list[dict[str, Any]] = []
+                match_source_for_status: Optional[str] = None
+                match_confidence_for_status: Optional[float] = None
+                second_match_confidence_for_status: Optional[float] = None
 
                 if kind == "content_id":
                     target_cid = request_value
@@ -2714,8 +2718,20 @@ def main() -> None:
                     artist = str(restore_payload.get("artist", "")).strip()
                     album = str(restore_payload.get("album", "")).strip()
                     force_regen = bool(restore_payload.get("force_regen", False))
+
+                    def _maybe_float(value: Any) -> Optional[float]:
+                        if value in (None, ""):
+                            return None
+                        try:
+                            return float(value)
+                        except Exception:
+                            return None
+
                     association_record = lookup_music_association(restore_payload)
                     if isinstance(association_record, dict):
+                        match_source_for_status = str(association_record.get("match_source", "exact"))
+                        match_confidence_for_status = _maybe_float(association_record.get("match_confidence"))
+                        second_match_confidence_for_status = _maybe_float(association_record.get("second_match_confidence"))
                         log_event(
                             "music_association_hit",
                             match_source=str(association_record.get("match_source", "exact")),
@@ -2726,6 +2742,9 @@ def main() -> None:
                         )
                         match_candidates = association_record.get("match_candidates")
                         if isinstance(match_candidates, list) and match_candidates:
+                            match_candidates_for_status = [
+                                c for c in match_candidates[:5] if isinstance(c, dict)
+                            ]
                             log_event(
                                 "music_match_candidates",
                                 candidates=match_candidates,
@@ -3226,6 +3245,10 @@ def main() -> None:
                         "mask_mode": "none" if kind in {"cover_art_outpaint", "cover_art_reference_background"} else None,
                         "openai_request_id": locals().get("request_id"),
                         "openai_model_used": locals().get("model_used"),
+                        "match_source": match_source_for_status,
+                        "match_confidence": match_confidence_for_status,
+                        "second_match_confidence": second_match_confidence_for_status,
+                        "match_candidates": match_candidates_for_status,
                     }
                 )
             except Exception as e:
@@ -3237,6 +3260,10 @@ def main() -> None:
                         "kind": payload_kind,
                         "requested_at": requested_at,
                         "error": repr(e),
+                        "match_source": locals().get("match_source_for_status"),
+                        "match_confidence": locals().get("match_confidence_for_status"),
+                        "second_match_confidence": locals().get("second_match_confidence_for_status"),
+                        "match_candidates": locals().get("match_candidates_for_status", []),
                     }
                 )
             finally:
