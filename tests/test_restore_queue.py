@@ -3,6 +3,7 @@ import sys
 import tempfile
 import types
 import unittest
+from datetime import datetime, timezone
 from pathlib import Path
 from unittest import mock
 
@@ -43,10 +44,14 @@ class RestoreQueueTests(unittest.TestCase):
         self.inbox = self.root / "frame_art_restore_request.json"
         self.queue = self.root / "frame_art_restore_queue"
         self.lock = self.root / "frame_art_uploader_worker.lock"
+        self.music_overrides = self.root / "frame_art_music_overrides.json"
+        self.music_catalog = self.root / "frame_art_music_catalog.json"
 
         uploader.RESTORE_REQUEST_PATH = str(self.inbox)
         uploader.RESTORE_QUEUE_DIR = self.queue
         uploader.WORKER_LOCK_PATH = self.lock
+        uploader.MUSIC_OVERRIDES_PATH = self.music_overrides
+        uploader.MUSIC_CATALOG_PATH = self.music_catalog
 
     def tearDown(self) -> None:
         self.tmp.cleanup()
@@ -169,6 +174,63 @@ class RestoreQueueTests(unittest.TestCase):
         self.assertIsNotNone(second)
 
         self.assertFalse(uploader.is_superseded_music_request(first, "cover_art_reference_background"))
+
+    def test_parse_music_feedback_payload(self):
+        payload = {
+            "kind": "music_feedback",
+            "requested_at": datetime.now(timezone.utc).isoformat(),
+            "show": True,
+            "action": "regen_now",
+            "issue_type": "wrong_album_art",
+            "artist": "Artist",
+            "album": "Album",
+            "track": "Track",
+            "music_session_key": "session-1",
+            "collection_id": "123",
+            "current_content_id": "MY_F42",
+            "cache_key": "itc_123",
+            "candidate_catalog_key": "123__3840x2160.jpg",
+            "notes": "bad background",
+        }
+        normalized, requested_show, err = uploader.parse_restore_request_payload(payload)
+        self.assertIsNone(err)
+        self.assertTrue(requested_show)
+        self.assertEqual("music_feedback", normalized["kind"])
+        self.assertEqual("regen_now", normalized["action"])
+        self.assertEqual("wrong_album_art", normalized["issue_type"])
+        self.assertEqual(123, normalized["collection_id"])
+        self.assertEqual("MY_F42", normalized["current_content_id"])
+
+    def test_manual_override_preferred_for_lookup(self):
+        ok = uploader.set_music_override_for_album(
+            artist="The Artist",
+            album="The Album",
+            catalog_key="123__3840x2160.jpg",
+            reason="manual",
+        )
+        self.assertTrue(ok)
+        uploader.atomic_write_json(
+            self.music_catalog,
+            {
+                "version": 1,
+                "updated_at": "",
+                "entries": {
+                    "123__3840x2160.jpg": {
+                        "content_id": "MY_F123",
+                        "updated_at": "",
+                    }
+                },
+            },
+        )
+        match = uploader.lookup_music_association(
+            {
+                "artist": "The Artist",
+                "album": "The Album",
+            }
+        )
+        self.assertIsNotNone(match)
+        self.assertEqual("manual_override", match.get("match_source"))
+        self.assertEqual("MY_F123", match.get("content_id"))
 
 
 class AmbientSeedTests(unittest.TestCase):

@@ -49,6 +49,9 @@ AMBIENT_CATALOG_PATH = Path("/share/frame_art_ambient_catalog.json")
 MUSIC_CATALOG_PATH = Path("/share/frame_art_music_catalog.json")
 MUSIC_ASSOCIATIONS_PATH = Path("/share/frame_art_music_associations.json")
 MUSIC_ERRORS_PATH = Path("/share/frame_art_music_errors.json")
+MUSIC_TRIAGE_PATH = Path("/share/frame_art_music_triage.json")
+MUSIC_OVERRIDES_PATH = Path("/share/frame_art_music_overrides.json")
+MUSIC_FEEDBACK_QUEUE_DIR = Path("/share/frame_art_music_feedback_queue")
 MUSIC_INDEX_PATHS = [
     Path("/media/frame_ai/music/index.json"),
     Path("/root/media/frame_ai/music/index.json"),
@@ -71,7 +74,7 @@ MUSIC_RESTORE_KINDS = {"cover_art_reference_background", "cover_art_outpaint"}
 MUSIC_ASSOCIATION_SESSION_TTL_DAYS = 0
 
 RUNTIME_OPTIONS: dict[str, Any] = {}
-ADDON_VERSION = "1.0.6"
+ADDON_VERSION = "1.1"
 HOLIDAY_ALIASES = {
     "football": "huskers",
 }
@@ -485,6 +488,33 @@ def parse_restore_request_payload(payload: Any) -> tuple[Optional[dict], Optiona
         normalized["track"] = track
         normalized["listening_mode"] = str(payload.get("listening_mode", "")).strip()
         normalized["source_preference"] = str(payload.get("source_preference", "")).strip().lower()
+        collection_id_raw = payload.get("collection_id")
+        if collection_id_raw in (None, ""):
+            normalized["collection_id"] = None
+        else:
+            try:
+                normalized["collection_id"] = int(collection_id_raw)
+            except Exception:
+                normalized["collection_id"] = None
+        normalized["force_regen"] = bool(payload.get("force_regen", False))
+
+    if kind == "music_feedback":
+        if requested_show is None:
+            requested_show = True
+        normalized["requested_at"] = str(payload.get("requested_at", "")).strip()
+        normalized["action"] = str(payload.get("action", "queue_only")).strip().lower() or "queue_only"
+        normalized["issue_type"] = str(payload.get("issue_type", "")).strip().lower()
+        normalized["artist"] = str(payload.get("artist", "")).strip()
+        normalized["album"] = str(payload.get("album", "")).strip()
+        normalized["track"] = str(payload.get("track", "")).strip()
+        normalized["music_session_key"] = str(payload.get("music_session_key", "")).strip()
+        normalized["listening_mode"] = str(payload.get("listening_mode", "")).strip()
+        normalized["key_source"] = str(payload.get("key_source", "")).strip().lower()
+        normalized["shazam_key"] = str(payload.get("shazam_key", "")).strip()
+        normalized["cache_key"] = str(payload.get("cache_key", "")).strip()
+        normalized["current_content_id"] = str(payload.get("current_content_id", "")).strip()
+        normalized["candidate_catalog_key"] = str(payload.get("candidate_catalog_key", "")).strip()
+        normalized["notes"] = str(payload.get("notes", "")).strip()
         collection_id_raw = payload.get("collection_id")
         if collection_id_raw in (None, ""):
             normalized["collection_id"] = None
@@ -1072,6 +1102,101 @@ def append_music_error(entry: dict[str, Any]) -> None:
     persist_frame_art_catalog(MUSIC_ERRORS_PATH, catalog)
 
 
+def load_music_triage() -> dict[str, Any]:
+    if not MUSIC_TRIAGE_PATH.exists():
+        return {"version": 1, "updated_at": "", "issues": []}
+    try:
+        data = json.loads(MUSIC_TRIAGE_PATH.read_text(encoding="utf-8"))
+    except Exception:
+        return {"version": 1, "updated_at": "", "issues": []}
+    if not isinstance(data, dict):
+        return {"version": 1, "updated_at": "", "issues": []}
+    issues = data.get("issues")
+    if not isinstance(issues, list):
+        issues = []
+    data["version"] = 1
+    data["issues"] = issues
+    data.setdefault("updated_at", "")
+    return data
+
+
+def persist_music_triage(catalog: dict[str, Any]) -> None:
+    catalog["version"] = 1
+    catalog["updated_at"] = datetime.now(timezone.utc).isoformat()
+    catalog.setdefault("issues", [])
+    atomic_write_json(MUSIC_TRIAGE_PATH, catalog)
+
+
+def append_music_triage_issue(entry: dict[str, Any]) -> str:
+    catalog = load_music_triage()
+    issues = catalog.get("issues")
+    if not isinstance(issues, list):
+        issues = []
+        catalog["issues"] = issues
+    issue_id = uuid.uuid4().hex[:12]
+    payload = dict(entry)
+    payload["id"] = issue_id
+    payload["timestamp"] = datetime.now(timezone.utc).isoformat()
+    issues.append(payload)
+    persist_music_triage(catalog)
+    return issue_id
+
+
+def load_music_overrides() -> dict[str, Any]:
+    return load_frame_art_catalog(MUSIC_OVERRIDES_PATH)
+
+
+def persist_music_overrides(catalog: dict[str, Any]) -> None:
+    persist_frame_art_catalog(MUSIC_OVERRIDES_PATH, catalog)
+
+
+def set_music_override_for_album(*, artist: str, album: str, catalog_key: str, reason: str) -> bool:
+    album_norm = normalized_album_association(artist, album)
+    if not album_norm:
+        return False
+    key = f"album_norm::{album_norm}"
+    catalog = load_music_overrides()
+    entries = catalog.setdefault("entries", {})
+    if not isinstance(entries, dict):
+        entries = {}
+        catalog["entries"] = entries
+    entries[key] = {
+        "artist": artist,
+        "album": album,
+        "catalog_key": catalog_key,
+        "reason": reason,
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+    }
+    persist_music_overrides(catalog)
+    return True
+
+
+def lookup_music_override(artist: str, album: str) -> Optional[dict[str, Any]]:
+    album_norm = normalized_album_association(artist, album)
+    if not album_norm:
+        return None
+    catalog = load_music_overrides()
+    entries = catalog.get("entries") if isinstance(catalog.get("entries"), dict) else {}
+    key = f"album_norm::{album_norm}"
+    override = entries.get(key) if isinstance(entries.get(key), dict) else None
+    if not isinstance(override, dict):
+        return None
+
+    catalog_key = str(override.get("catalog_key", "")).strip()
+    if not catalog_key:
+        return None
+    content_id = lookup_catalog_content_id(MUSIC_CATALOG_PATH, catalog_key) or ""
+    return {
+        "cache_key": music_catalog_stem(catalog_key),
+        "catalog_key": catalog_key,
+        "content_id": content_id,
+        "artist": artist,
+        "album": album,
+        "match_confidence": 1.0,
+        "match_source": "manual_override",
+    }
+
+
 def normalized_album_association(artist: str, album: str) -> str:
     merged = f"{artist} {album}".strip().lower()
     merged = re.sub(r"[^a-z0-9]+", " ", merged)
@@ -1615,6 +1740,12 @@ def lookup_music_association(restore_payload: dict[str, Any]) -> Optional[dict[s
         collection_match["album"] = str(restore_payload.get("album", "")).strip()
         return collection_match
 
+    artist = str(restore_payload.get("artist", "")).strip()
+    album = str(restore_payload.get("album", "")).strip()
+    override_match = lookup_music_override(artist, album)
+    if isinstance(override_match, dict):
+        return override_match
+
     catalog = load_frame_art_catalog(MUSIC_ASSOCIATIONS_PATH)
     entries = catalog.get("entries") if isinstance(catalog.get("entries"), dict) else {}
     if not isinstance(entries, dict) or not entries:
@@ -1622,8 +1753,6 @@ def lookup_music_association(restore_payload: dict[str, Any]) -> Optional[dict[s
 
     music_session_key = str(restore_payload.get("music_session_key", "")).strip()
     shazam_key = str(restore_payload.get("shazam_key", "")).strip()
-    artist = str(restore_payload.get("artist", "")).strip()
-    album = str(restore_payload.get("album", "")).strip()
     album_key_raw = (artist + " — " + album).strip()
     album_key_norm = normalized_album_association(artist, album)
 
@@ -1916,6 +2045,51 @@ def enqueue_restore_inbox_if_present() -> Optional[Path]:
     queued = RESTORE_QUEUE_DIR / unique
     os.replace(inbox, queued)
     return queued
+
+
+def enqueue_restore_payload(payload: dict[str, Any]) -> Path:
+    RESTORE_QUEUE_DIR.mkdir(parents=True, exist_ok=True)
+    unique = f"{time.time_ns()}_{os.getpid()}_{uuid.uuid4().hex}.json"
+    queued = RESTORE_QUEUE_DIR / unique
+    atomic_write_json(queued, payload)
+    return queued
+
+
+def enqueue_music_feedback_item(payload: dict[str, Any]) -> Path:
+    MUSIC_FEEDBACK_QUEUE_DIR.mkdir(parents=True, exist_ok=True)
+    unique = f"{time.time_ns()}_{os.getpid()}_{uuid.uuid4().hex}.json"
+    queued = MUSIC_FEEDBACK_QUEUE_DIR / unique
+    atomic_write_json(queued, payload)
+    return queued
+
+
+def resolve_music_catalog_path(catalog_key: str) -> Optional[Path]:
+    key = Path(str(catalog_key or "").strip()).name
+    if not key:
+        return None
+    for root in (COMPRESSED_DIR, WIDESCREEN_DIR):
+        candidate = root / key
+        if candidate.exists() and candidate.is_file():
+            return candidate
+    return None
+
+
+def build_music_request_from_feedback(payload: dict[str, Any], *, show: bool, force_regen: bool = False) -> dict[str, Any]:
+    return {
+        "kind": "cover_art_reference_background",
+        "requested_at": datetime.now(timezone.utc).isoformat(),
+        "show": show,
+        "music_session_key": str(payload.get("music_session_key", "")).strip(),
+        "listening_mode": str(payload.get("listening_mode", "")).strip(),
+        "artist": str(payload.get("artist", "")).strip(),
+        "album": str(payload.get("album", "")).strip(),
+        "track": str(payload.get("track", "")).strip(),
+        "key_source": str(payload.get("key_source", "")).strip().lower(),
+        "shazam_key": str(payload.get("shazam_key", "")).strip(),
+        "collection_id": parse_collection_id_value(payload.get("collection_id")),
+        "source_preference": "itunes",
+        "force_regen": force_regen,
+    }
 
 
 def dequeue_next_restore_work_item() -> Optional[Path]:
@@ -2442,11 +2616,104 @@ def main() -> None:
                         seed_status = handle_music_seed_restore(tv_ip, art, restore_payload, requested_at)
                     write_status({**seed_status, "tv_ip": tv_ip, "addon_version": ADDON_VERSION})
                     continue
+                elif kind == "music_feedback":
+                    artist = str(restore_payload.get("artist", "")).strip()
+                    album = str(restore_payload.get("album", "")).strip()
+                    track = str(restore_payload.get("track", "")).strip()
+                    action = str(restore_payload.get("action", "queue_only")).strip().lower() or "queue_only"
+                    issue_type = str(restore_payload.get("issue_type", "")).strip().lower()
+                    notes = str(restore_payload.get("notes", "")).strip()
+                    requested_at = str(restore_payload.get("requested_at", "")).strip()
+                    candidate_catalog_key = str(restore_payload.get("candidate_catalog_key", "")).strip()
+                    current_content_id = str(restore_payload.get("current_content_id", "")).strip()
+                    cache_key = str(restore_payload.get("cache_key", "")).strip()
+                    issue_id = append_music_triage_issue(
+                        {
+                            "status": "open" if action == "queue_only" else "queued",
+                            "action": action,
+                            "issue_type": issue_type,
+                            "artist": artist,
+                            "album": album,
+                            "track": track,
+                            "music_session_key": str(restore_payload.get("music_session_key", "")).strip(),
+                            "collection_id": parse_collection_id_value(restore_payload.get("collection_id")),
+                            "current_content_id": current_content_id,
+                            "cache_key": cache_key,
+                            "candidate_catalog_key": candidate_catalog_key,
+                            "notes": notes,
+                        }
+                    )
+                    enqueue_music_feedback_item(
+                        {
+                            "issue_id": issue_id,
+                            "requested_at": requested_at,
+                            "action": action,
+                            "issue_type": issue_type,
+                            "artist": artist,
+                            "album": album,
+                            "track": track,
+                            "cache_key": cache_key,
+                            "candidate_catalog_key": candidate_catalog_key,
+                            "current_content_id": current_content_id,
+                            "notes": notes,
+                        }
+                    )
+
+                    followup_kind = "none"
+                    if action == "regen_now":
+                        association_record = lookup_music_association(restore_payload)
+                        if isinstance(association_record, dict):
+                            stale_catalog_key = str(association_record.get("catalog_key", "")).strip()
+                            stale_content_id = str(association_record.get("content_id", "")).strip()
+                            if stale_catalog_key and stale_content_id:
+                                invalidate_music_cached_content_id(stale_catalog_key, stale_content_id)
+                        followup_payload = build_music_request_from_feedback(restore_payload, show=show_flag, force_regen=True)
+                        enqueue_restore_payload(followup_payload)
+                        followup_kind = "cover_art_reference_background"
+                    elif action == "use_candidate_now":
+                        if not candidate_catalog_key:
+                            raise ValueError("music_feedback use_candidate_now requires candidate_catalog_key")
+                        candidate_path = resolve_music_catalog_path(candidate_catalog_key)
+                        if candidate_path is None:
+                            raise ValueError(f"music_feedback candidate not found: {candidate_catalog_key}")
+                        set_music_override_for_album(
+                            artist=artist,
+                            album=album,
+                            catalog_key=Path(candidate_catalog_key).name,
+                            reason=f"issue_type:{issue_type or 'manual'}",
+                        )
+                        followup_payload = build_music_request_from_feedback(restore_payload, show=show_flag, force_regen=False)
+                        enqueue_restore_payload(followup_payload)
+                        followup_kind = "cover_art_reference_background"
+
+                    write_status(
+                        {
+                            "ok": True,
+                            "mode": "restore",
+                            "tv_ip": tv_ip,
+                            "kind": kind,
+                            "requested_at": requested_at,
+                            "issue_id": issue_id,
+                            "issue_type": issue_type,
+                            "action": action,
+                            "followup_kind": followup_kind,
+                            "artist": artist,
+                            "album": album,
+                            "track": track,
+                            "cache_key": cache_key,
+                            "current_content_id": current_content_id,
+                            "candidate_catalog_key": candidate_catalog_key,
+                            "notes": notes,
+                            "addon_version": ADDON_VERSION,
+                        }
+                    )
+                    continue
                 elif kind in {"cover_art_reference_background", "cover_art_outpaint"}:
                     ensure_dirs()
                     source_url = str(restore_payload.get("artwork_url", "")).strip()
                     artist = str(restore_payload.get("artist", "")).strip()
                     album = str(restore_payload.get("album", "")).strip()
+                    force_regen = bool(restore_payload.get("force_regen", False))
                     association_record = lookup_music_association(restore_payload)
                     if isinstance(association_record, dict):
                         log_event(
@@ -2528,6 +2795,11 @@ def main() -> None:
                     chosen_index = 0
                     music_retry_upload_path: Optional[Path] = wide_path if wide_path.exists() else None
                     music_retry_catalog_key: Optional[str] = None
+
+                    if force_regen:
+                        selected_name = compressed_jpg_path.name
+                        music_retry_upload_path = None
+                        wide_path = Path("__force_regen__")
 
                     if wide_path.exists():
                         catalog_key = music_catalog_key_for_path(wide_path)
