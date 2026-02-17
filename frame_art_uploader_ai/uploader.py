@@ -71,7 +71,7 @@ MUSIC_RESTORE_KINDS = {"cover_art_reference_background", "cover_art_outpaint"}
 MUSIC_ASSOCIATION_SESSION_TTL_DAYS = 0
 
 RUNTIME_OPTIONS: dict[str, Any] = {}
-ADDON_VERSION = "1.0.0"
+ADDON_VERSION = "1.0.2"
 HOLIDAY_ALIASES = {
     "football": "huskers",
 }
