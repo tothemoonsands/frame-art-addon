@@ -74,7 +74,7 @@ MUSIC_RESTORE_KINDS = {"cover_art_reference_background", "cover_art_outpaint"}
 MUSIC_ASSOCIATION_SESSION_TTL_DAYS = 0
 
 RUNTIME_OPTIONS: dict[str, Any] = {}
-ADDON_VERSION = "1.2"
+ADDON_VERSION = "1.3"
 HOLIDAY_ALIASES = {
     "football": "huskers",
 }
@@ -2933,10 +2933,10 @@ def main() -> None:
                                                 album_info = item
                                                 break
                                     source_url = resolve_artwork_url(album_info)
-                                elif artist and album:
+                                if not source_url and artist and album:
                                     album_info = itunes_search(artist, album, timeout_s=10)
                                     source_url = resolve_artwork_url(album_info)
-                                else:
+                                if not source_url and not (artist and album) and collection_id is None:
                                     raise ValueError("unsupported metadata; provide artwork_url, collection_id, or artist+album")
 
                             if not source_url:
