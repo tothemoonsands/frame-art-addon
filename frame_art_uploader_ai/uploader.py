@@ -1,6 +1,7 @@
 import json
 import os
 import re
+import shutil
 import time
 import uuid
 from difflib import SequenceMatcher
@@ -56,6 +57,12 @@ MUSIC_INDEX_PATHS = [
     Path("/media/frame_ai/music/index.json"),
     Path("/root/media/frame_ai/music/index.json"),
 ]
+MUSIC_MANIFEST_PATHS = [
+    Path("/media/frame_ai/music/manifest.json"),
+    Path("/root/media/frame_ai/music/manifest.json"),
+    Path("/media/frame_ai/music/manifest.jsonl"),
+    Path("/root/media/frame_ai/music/manifest.jsonl"),
+]
 
 MYF_RE = re.compile(r"^MY[_-]F(\d+)", re.IGNORECASE)
 ALLOWED_EXTENSIONS = {".jpg", ".jpeg", ".png"}
@@ -74,7 +81,7 @@ MUSIC_RESTORE_KINDS = {"cover_art_reference_background", "cover_art_outpaint"}
 MUSIC_ASSOCIATION_SESSION_TTL_DAYS = 0
 
 RUNTIME_OPTIONS: dict[str, Any] = {}
-ADDON_VERSION = "1.4"
+ADDON_VERSION = "1.6"
 HOLIDAY_ALIASES = {
     "football": "huskers",
 }
@@ -1370,6 +1377,143 @@ def load_music_index_entries() -> dict[str, Any]:
         if isinstance(entries, dict):
             return entries
     return {}
+
+
+def load_music_manifest_entries() -> dict[str, Any]:
+    for path in MUSIC_MANIFEST_PATHS:
+        if not path.exists():
+            continue
+        try:
+            if path.suffix.lower() == ".jsonl":
+                entries: dict[str, Any] = {}
+                for line in path.read_text(encoding="utf-8").splitlines():
+                    line = line.strip()
+                    if not line:
+                        continue
+                    item = json.loads(line)
+                    if not isinstance(item, dict):
+                        continue
+                    key = str(item.get("text_key") or item.get("collection_id") or item.get("collectionId") or "").strip()
+                    if key:
+                        entries[key] = item
+                if entries:
+                    return entries
+                continue
+
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        if not isinstance(payload, dict):
+            continue
+        manifest_entries = payload.get("entries")
+        if isinstance(manifest_entries, dict):
+            return manifest_entries
+        return payload
+    return {}
+
+
+def resolve_music_source_art_path(raw_path: str) -> Optional[Path]:
+    raw = str(raw_path or "").strip()
+    if not raw:
+        return None
+    p = Path(raw)
+    if p.is_absolute() and p.exists() and p.is_file():
+        return p
+
+    rel = Path(raw.lstrip("/"))
+    base_roots = [
+        Path("/media/frame_ai/music"),
+        Path("/root/media/frame_ai/music"),
+        Path("/media/frame_ai"),
+        Path("/root/media/frame_ai"),
+    ]
+    candidates: list[Path] = []
+    for root in base_roots:
+        candidates.append(root / rel)
+        candidates.append(root / rel.name)
+
+    marker = "/out/source_art/"
+    if marker in raw:
+        suffix = raw.split(marker, 1)[1]
+        for root in (Path("/media/frame_ai/music/out/source_art"), Path("/root/media/frame_ai/music/out/source_art")):
+            candidates.append(root / suffix)
+    marker2 = "/source_art/"
+    if marker2 in raw:
+        suffix2 = raw.split(marker2, 1)[1]
+        for root in (Path("/media/frame_ai/music/source_art"), Path("/root/media/frame_ai/music/source_art")):
+            candidates.append(root / suffix2)
+
+    seen: set[str] = set()
+    for candidate in candidates:
+        key = str(candidate)
+        if key in seen:
+            continue
+        seen.add(key)
+        if candidate.exists() and candidate.is_file():
+            return candidate
+    return None
+
+
+def select_index_item_for_source(
+    *,
+    artist: str,
+    album: str,
+    collection_id: Optional[int],
+) -> Optional[dict[str, Any]]:
+    text_key_query = music_text_key(artist, album)
+    for entries in (load_music_index_entries(), load_music_manifest_entries()):
+        if not isinstance(entries, dict):
+            continue
+        if isinstance(collection_id, int):
+            item = entries.get(str(collection_id))
+            if isinstance(item, dict):
+                return item
+            for record in entries.values():
+                if not isinstance(record, dict):
+                    continue
+                rec_cid = parse_collection_id_value(record.get("collection_id"))
+                if rec_cid is None:
+                    rec_cid = parse_collection_id_value(record.get("collectionId"))
+                if rec_cid == collection_id:
+                    return record
+        if text_key_query:
+            for record in entries.values():
+                if not isinstance(record, dict):
+                    continue
+                text_key = str(record.get("text_key", "")).strip()
+                if text_key and music_text_equivalent(text_key_query, text_key):
+                    return record
+    return None
+
+
+def maybe_stage_source_art_from_index(
+    *,
+    src_path: Path,
+    artist: str,
+    album: str,
+    collection_id: Optional[int],
+) -> Optional[Path]:
+    item = select_index_item_for_source(artist=artist, album=album, collection_id=collection_id)
+    if not isinstance(item, dict):
+        return None
+    for key in ("source_art_path", "source_path", "source_album_path"):
+        raw = str(item.get(key, "")).strip()
+        candidate = resolve_music_source_art_path(raw)
+        if candidate is None:
+            continue
+        src_path.parent.mkdir(parents=True, exist_ok=True)
+        if candidate != src_path:
+            shutil.copy2(candidate, src_path)
+        log_event(
+            "music_source_staged_from_index",
+            source_key=key,
+            source_path=str(candidate),
+            staged_path=str(src_path),
+            collection_id=collection_id,
+            text_key=str(item.get("text_key", "")).strip(),
+        )
+        return candidate
+    return None
 
 
 def find_music_file_candidate_by_name(filename: str) -> Optional[Path]:
@@ -2922,7 +3066,15 @@ def main() -> None:
                                 )
                                 raise ValueError("Ambiguous music match; generation blocked to prevent duplicate cache entries")
 
-                            if not source_url:
+                            if not src_path.exists():
+                                maybe_stage_source_art_from_index(
+                                    src_path=src_path,
+                                    artist=artist,
+                                    album=album,
+                                    collection_id=collection_id,
+                                )
+
+                            if not source_url and not src_path.exists():
                                 if collection_id is not None:
                                     lookup = itunes_lookup(collection_id, timeout_s=10)
                                     results = lookup.get("results") if isinstance(lookup, dict) else []
@@ -2934,8 +3086,26 @@ def main() -> None:
                                                 break
                                     source_url = resolve_artwork_url(album_info)
                                 if not source_url and artist and album:
-                                    album_info = itunes_search(artist, album, timeout_s=10)
-                                    source_url = resolve_artwork_url(album_info)
+                                    album_candidates: list[str] = []
+
+                                    def add_album_candidate(value: str) -> None:
+                                        v = str(value or "").strip()
+                                        if v and v not in album_candidates:
+                                            album_candidates.append(v)
+
+                                    add_album_candidate(album)
+                                    add_album_candidate(re.sub(r"\s*\([^)]*\)\s*", " ", album))
+                                    add_album_candidate(re.sub(r"\s*\[[^\]]*\]\s*", " ", album))
+                                    if ":" in album:
+                                        add_album_candidate(album.split(":", 1)[0])
+                                        add_album_candidate(album.split(":", 1)[1])
+                                    add_album_candidate(re.sub(r"\s*[-–]\s*expanded.*$", "", album, flags=re.IGNORECASE))
+
+                                    for album_candidate in album_candidates:
+                                        album_info = itunes_search(artist, album_candidate, timeout_s=10)
+                                        source_url = resolve_artwork_url(album_info)
+                                        if source_url:
+                                            break
                                 if not source_url and not (artist and album) and collection_id is None:
                                     raise ValueError("unsupported metadata; provide artwork_url, collection_id, or artist+album")
 
