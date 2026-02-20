@@ -7,4 +7,5 @@ __MACOSX/
 .codex/context/
 .codex/.DS_Store
 frame_art_uploader_ai/__pycache__/
+tests/__pycache__/
 tmp/
