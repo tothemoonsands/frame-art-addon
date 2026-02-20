@@ -81,7 +81,7 @@ MUSIC_RESTORE_KINDS = {"cover_art_reference_background", "cover_art_outpaint"}
 MUSIC_ASSOCIATION_SESSION_TTL_DAYS = 0
 
 RUNTIME_OPTIONS: dict[str, Any] = {}
-ADDON_VERSION = "1.6"
+ADDON_VERSION = "1.7"
 HOLIDAY_ALIASES = {
     "football": "huskers",
 }
@@ -2671,6 +2671,7 @@ def main() -> None:
                 match_source_for_status: Optional[str] = None
                 match_confidence_for_status: Optional[float] = None
                 second_match_confidence_for_status: Optional[float] = None
+                pending_pick_last_applied: Optional[str] = None
 
                 if kind == "content_id":
                     target_cid = request_value
@@ -2752,9 +2753,9 @@ def main() -> None:
                                     content_id=target_cid,
                                 )
 
-                        state["last_applied"] = str(pick_file)
+                        pending_pick_last_applied = str(pick_file)
                     else:
-                        state["last_applied"] = f"samsung:{target_cid}"
+                        pending_pick_last_applied = f"samsung:{target_cid}"
                 elif kind in SEED_KINDS:
                     if kind == "ambient_seed":
                         seed_status = handle_ambient_seed_restore(tv_ip, art, restore_payload, requested_at)
@@ -3337,6 +3338,9 @@ def main() -> None:
                                 select_attempt_error = retry_select_error
                 else:
                     verification_skipped = True
+
+                if kind == "pick" and pending_pick_last_applied and verified:
+                    state["last_applied"] = pending_pick_last_applied
 
                 deleted_local: list[str] = []
                 cleanup_error: Optional[str] = None
