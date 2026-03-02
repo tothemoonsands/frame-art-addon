@@ -82,7 +82,7 @@ MUSIC_RESTORE_KINDS = {"cover_art_reference_background", "cover_art_outpaint"}
 MUSIC_ASSOCIATION_SESSION_TTL_DAYS = 0
 
 RUNTIME_OPTIONS: dict[str, Any] = {}
-ADDON_VERSION = "1.13"
+ADDON_VERSION = "1.14"
 HOLIDAY_ALIASES = {
     "football": "huskers",
 }
@@ -2710,6 +2710,20 @@ def record_upload_timeout_outcome(*, had_timeout: bool, upload_succeeded: bool) 
     save_state(state)
 
 
+def create_tv_client(tv_ip: str) -> Any:
+    ws_timeout = resolve_runtime_int_option("art_ws_open_timeout_s", 15, min_value=3, max_value=60)
+    return register_tv_connection(SamsungTVWS(tv_ip, timeout=ws_timeout))
+
+
+def create_art_client(tv: Any) -> Any:
+    art_timeout = resolve_runtime_int_option("art_channel_timeout_s", 12, min_value=3, max_value=60)
+    try:
+        return tv.art(timeout=art_timeout)
+    except TypeError:
+        # Backward compatibility with client versions that do not accept art(timeout=...).
+        return tv.art()
+
+
 def select_and_verify_with_reconnect(
     tv_ip: str,
     art: Any,
@@ -2745,8 +2759,8 @@ def select_and_verify_with_reconnect(
                 )
                 time.sleep(retry_backoff_seconds(socket_attempt))
                 try:
-                    retry_tv = register_tv_connection(SamsungTVWS(tv_ip))
-                    retry_art = retry_tv.art()
+                    retry_tv = create_tv_client(tv_ip)
+                    retry_art = create_art_client(retry_tv)
                     if not retry_art.supported():
                         select_error = RuntimeError("Art mode not supported / unreachable")
                         break
@@ -2812,8 +2826,8 @@ def upload_local_file_with_reconnect(tv_ip: str, art: Any, file_path: Path) -> t
     maybe_wait_for_upload_timeout_cooldown()
     if bool(RUNTIME_OPTIONS.get("art_preconnect_before_upload", True)):
         try:
-            retry_tv = register_tv_connection(SamsungTVWS(tv_ip))
-            retry_art = retry_tv.art()
+            retry_tv = create_tv_client(tv_ip)
+            retry_art = create_art_client(retry_tv)
             if retry_art.supported():
                 current_art = retry_art
                 log_event("upload_preconnect", file=str(file_path), action="refresh_art_socket")
@@ -2850,8 +2864,8 @@ def upload_local_file_with_reconnect(tv_ip: str, art: Any, file_path: Path) -> t
             )
             time.sleep(retry_backoff_seconds(attempt))
             try:
-                retry_tv = register_tv_connection(SamsungTVWS(tv_ip))
-                retry_art = retry_tv.art()
+                retry_tv = create_tv_client(tv_ip)
+                retry_art = create_art_client(retry_tv)
                 if not retry_art.supported():
                     last_exc = RuntimeError("Art mode not supported / unreachable")
                     break
@@ -2929,8 +2943,11 @@ def main() -> None:
     if dequeue_next_restore_work_item() is None:
         return
 
-    tv = register_tv_connection(SamsungTVWS(tv_ip))
-    art = tv.art()
+    _ = resolve_runtime_int_option("art_ws_open_timeout_s", 15, min_value=3, max_value=60)
+    _ = resolve_runtime_int_option("art_channel_timeout_s", 12, min_value=3, max_value=60)
+
+    tv = create_tv_client(tv_ip)
+    art = create_art_client(tv)
 
     if not art.supported():
         write_status(
