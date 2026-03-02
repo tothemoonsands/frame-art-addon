@@ -82,7 +82,7 @@ MUSIC_RESTORE_KINDS = {"cover_art_reference_background", "cover_art_outpaint"}
 MUSIC_ASSOCIATION_SESSION_TTL_DAYS = 0
 
 RUNTIME_OPTIONS: dict[str, Any] = {}
-ADDON_VERSION = "1.10"
+ADDON_VERSION = "1.12"
 HOLIDAY_ALIASES = {
     "football": "huskers",
 }
@@ -320,6 +320,8 @@ def load_state() -> dict:
             "local_uploaded_ids": [],
             "cover_uploaded_ids": [],
             "pending_keep_count_cleanup": False,
+            "upload_timeout_streak": 0,
+            "upload_timeout_cooldown_until": 0.0,
         }
     try:
         data = json.loads(p.read_text(encoding="utf-8"))
@@ -329,6 +331,8 @@ def load_state() -> dict:
             "local_uploaded_ids": [],
             "cover_uploaded_ids": [],
             "pending_keep_count_cleanup": False,
+            "upload_timeout_streak": 0,
+            "upload_timeout_cooldown_until": 0.0,
         }
     if not isinstance(data, dict):
         return {
@@ -336,11 +340,21 @@ def load_state() -> dict:
             "local_uploaded_ids": [],
             "cover_uploaded_ids": [],
             "pending_keep_count_cleanup": False,
+            "upload_timeout_streak": 0,
+            "upload_timeout_cooldown_until": 0.0,
         }
     data.setdefault("last_applied", None)
     data["local_uploaded_ids"] = sanitize_local_uploaded_ids(data.get("local_uploaded_ids"))
     data["cover_uploaded_ids"] = sanitize_local_uploaded_ids(data.get("cover_uploaded_ids"))
     data["pending_keep_count_cleanup"] = bool(data.get("pending_keep_count_cleanup", False))
+    try:
+        data["upload_timeout_streak"] = max(0, int(data.get("upload_timeout_streak", 0)))
+    except Exception:
+        data["upload_timeout_streak"] = 0
+    try:
+        data["upload_timeout_cooldown_until"] = float(data.get("upload_timeout_cooldown_until", 0.0))
+    except Exception:
+        data["upload_timeout_cooldown_until"] = 0.0
     return data
 
 
@@ -2595,6 +2609,71 @@ def retry_backoff_seconds(attempt_index: int) -> float:
     return float(min(base * (attempt_index + 1), 60))
 
 
+def is_art_timeout_error(exc: Exception) -> bool:
+    if isinstance(exc, TimeoutError):
+        return True
+    message = repr(exc).lower()
+    return (
+        "timed out" in message
+        or "timeout" in message
+        or "websocket time out" in message
+        or "connection timed out" in message
+    )
+
+
+def upload_timeout_cooldown_config() -> tuple[int, int]:
+    trigger_count = resolve_runtime_int_option("art_timeout_cooldown_after", 3, min_value=2, max_value=8)
+    cooldown_s = resolve_runtime_int_option("art_timeout_cooldown_s", 45, min_value=5, max_value=180)
+    return trigger_count, cooldown_s
+
+
+def maybe_wait_for_upload_timeout_cooldown() -> None:
+    state = load_state()
+    cooldown_until = float(state.get("upload_timeout_cooldown_until", 0.0) or 0.0)
+    remaining = cooldown_until - time.time()
+    if remaining <= 0:
+        return
+    wait_s = min(remaining, 120.0)
+    log_event(
+        "upload_timeout_cooldown_wait",
+        remaining_s=round(wait_s, 2),
+        cooldown_until=int(cooldown_until),
+    )
+    time.sleep(wait_s)
+
+
+def record_upload_timeout_outcome(*, had_timeout: bool, upload_succeeded: bool) -> None:
+    state = load_state()
+    streak = int(state.get("upload_timeout_streak", 0) or 0)
+    cooldown_until = float(state.get("upload_timeout_cooldown_until", 0.0) or 0.0)
+
+    if upload_succeeded:
+        if streak > 0 or cooldown_until > 0:
+            state["upload_timeout_streak"] = 0
+            state["upload_timeout_cooldown_until"] = 0.0
+            save_state(state)
+        return
+
+    if not had_timeout:
+        return
+
+    trigger_count, cooldown_s = upload_timeout_cooldown_config()
+    streak += 1
+    state["upload_timeout_streak"] = streak
+    if streak >= trigger_count:
+        until_ts = time.time() + float(cooldown_s)
+        state["upload_timeout_cooldown_until"] = until_ts
+        log_event(
+            "upload_timeout_cooldown_set",
+            timeout_streak=streak,
+            trigger_count=trigger_count,
+            cooldown_s=cooldown_s,
+            cooldown_until=int(until_ts),
+        )
+        state["upload_timeout_streak"] = 0
+    save_state(state)
+
+
 def select_and_verify_with_reconnect(
     tv_ip: str,
     art: Any,
@@ -2694,6 +2773,7 @@ def invalidate_music_cached_content_id(catalog_key: str, content_id: str) -> Non
 
 def upload_local_file_with_reconnect(tv_ip: str, art: Any, file_path: Path) -> tuple[Any, Optional[str]]:
     current_art = art
+    maybe_wait_for_upload_timeout_cooldown()
     if bool(RUNTIME_OPTIONS.get("art_preconnect_before_upload", True)):
         try:
             retry_tv = SamsungTVWS(tv_ip)
@@ -2710,13 +2790,18 @@ def upload_local_file_with_reconnect(tv_ip: str, art: Any, file_path: Path) -> t
             )
     upload_attempts = resolve_runtime_int_option("art_socket_retries", 5, min_value=1, max_value=10)
     last_exc: Optional[Exception] = None
+    had_timeout = False
     for attempt in range(upload_attempts):
         try:
-            return current_art, upload_local_file(current_art, file_path)
+            uploaded = upload_local_file(current_art, file_path)
+            record_upload_timeout_outcome(had_timeout=had_timeout, upload_succeeded=True)
+            return current_art, uploaded
         except Exception as exc:
             if not is_art_socket_retryable_error(exc):
+                record_upload_timeout_outcome(had_timeout=had_timeout, upload_succeeded=False)
                 raise
             last_exc = exc
+            had_timeout = had_timeout or is_art_timeout_error(exc)
             if attempt >= upload_attempts - 1:
                 break
             log_event(
@@ -2745,9 +2830,12 @@ def upload_local_file_with_reconnect(tv_ip: str, art: Any, file_path: Path) -> t
                     max_attempts=upload_attempts,
                 )
                 if not is_art_socket_retryable_error(reconnect_exc):
+                    record_upload_timeout_outcome(had_timeout=had_timeout, upload_succeeded=False)
                     raise
+                had_timeout = had_timeout or is_art_timeout_error(reconnect_exc)
                 continue
 
+    record_upload_timeout_outcome(had_timeout=had_timeout, upload_succeeded=False)
     if last_exc is not None:
         raise last_exc
     raise RuntimeError("upload_local_file_with_reconnect failed without an explicit exception")
@@ -2800,6 +2888,11 @@ def main() -> None:
         write_status({"ok": False, "error": "Missing tv_ip"})
         return
 
+    # Fast path: do not open TV websocket when there is no queued restore work.
+    enqueue_restore_inbox_if_present()
+    if dequeue_next_restore_work_item() is None:
+        return
+
     tv = SamsungTVWS(tv_ip)
     art = tv.art()
 
@@ -2812,8 +2905,6 @@ def main() -> None:
             }
         )
         return
-
-    enqueue_restore_inbox_if_present()
 
     with worker_lock() as has_lock:
         if not has_lock:

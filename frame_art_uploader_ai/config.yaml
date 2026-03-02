@@ -1,6 +1,6 @@
 name: Frame Art Uploader AI
 slug: frame_art_uploader_ai
-version: "1.10"
+version: "1.12"
 description: >
   Upload the newest AI-generated image to Samsung Frame Art Mode,
   enforce true full-bleed display (16:9 crop + 4K upscale),
@@ -64,6 +64,8 @@ options:
   openai_timeout_s: 120
   art_socket_retries: 5
   art_retry_backoff_s: 2
+  art_timeout_cooldown_after: 3
+  art_timeout_cooldown_s: 45
   legacy_masked_outpaint: false
   debug_logging: false
 
@@ -139,5 +141,7 @@ schema:
   openai_timeout_s: int
   art_socket_retries: int
   art_retry_backoff_s: int
+  art_timeout_cooldown_after: int
+  art_timeout_cooldown_s: int
   legacy_masked_outpaint: bool
   debug_logging: bool
