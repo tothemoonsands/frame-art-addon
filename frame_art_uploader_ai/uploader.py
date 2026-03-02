@@ -82,7 +82,7 @@ MUSIC_RESTORE_KINDS = {"cover_art_reference_background", "cover_art_outpaint"}
 MUSIC_ASSOCIATION_SESSION_TTL_DAYS = 0
 
 RUNTIME_OPTIONS: dict[str, Any] = {}
-ADDON_VERSION = "1.9"
+ADDON_VERSION = "1.10"
 HOLIDAY_ALIASES = {
     "football": "huskers",
 }
@@ -2591,8 +2591,8 @@ def resolve_runtime_int_option(name: str, default: int, *, min_value: int, max_v
 
 
 def retry_backoff_seconds(attempt_index: int) -> float:
-    base = resolve_runtime_int_option("art_retry_backoff_s", 2, min_value=1, max_value=10)
-    return float(min(base * (attempt_index + 1), 20))
+    base = resolve_runtime_int_option("art_retry_backoff_s", 2, min_value=1, max_value=30)
+    return float(min(base * (attempt_index + 1), 60))
 
 
 def select_and_verify_with_reconnect(
@@ -2794,7 +2794,7 @@ def main() -> None:
     openai_model = str(opts.get("openai_model", "gpt-image-1.5")).strip() or "gpt-image-1.5"
     openai_timeout_s = resolve_runtime_int_option("openai_timeout_s", 120, min_value=30, max_value=600)
     _ = resolve_runtime_int_option("art_socket_retries", 5, min_value=1, max_value=10)
-    _ = resolve_runtime_int_option("art_retry_backoff_s", 2, min_value=1, max_value=10)
+    _ = resolve_runtime_int_option("art_retry_backoff_s", 2, min_value=1, max_value=30)
 
     if not tv_ip:
         write_status({"ok": False, "error": "Missing tv_ip"})

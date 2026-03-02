@@ -515,10 +515,11 @@ def generate_reference_frame_from_album(
     t0 = time.perf_counter()
     emit("encode_outputs_start")
     background_out = BytesIO()
-    background.save(background_out, format="PNG", optimize=True, compress_level=9)
+    # Intermediate artifacts: optimize for speed; final TV upload is JPEG-compressed downstream.
+    background.save(background_out, format="PNG", optimize=False, compress_level=1)
 
     final_out = BytesIO()
-    final.save(final_out, format="PNG", optimize=True, compress_level=9)
+    final.save(final_out, format="PNG", optimize=False, compress_level=1)
     emit(
         "encode_outputs_done",
         duration_ms=int((time.perf_counter() - t0) * 1000),
@@ -591,9 +592,10 @@ def generate_local_fallback_frame_from_album(
     t0 = time.perf_counter()
     emit("fallback_encode_outputs_start")
     background_out = BytesIO()
-    background.save(background_out, format="PNG", optimize=True, compress_level=9)
+    # Intermediate artifacts: optimize for speed; final TV upload is JPEG-compressed downstream.
+    background.save(background_out, format="PNG", optimize=False, compress_level=1)
     final_out = BytesIO()
-    final.save(final_out, format="PNG", optimize=True, compress_level=9)
+    final.save(final_out, format="PNG", optimize=False, compress_level=1)
     emit(
         "fallback_encode_outputs_done",
         duration_ms=int((time.perf_counter() - t0) * 1000),
