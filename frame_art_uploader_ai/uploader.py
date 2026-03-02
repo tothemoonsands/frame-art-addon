@@ -31,6 +31,7 @@ from cover_art import (
     generate_local_fallback_frame_from_album,
     itunes_lookup,
     itunes_search,
+    itunes_track_search,
     normalize_key,
     generate_reference_frame_from_album,
     resolve_artwork_url,
@@ -81,7 +82,7 @@ MUSIC_RESTORE_KINDS = {"cover_art_reference_background", "cover_art_outpaint"}
 MUSIC_ASSOCIATION_SESSION_TTL_DAYS = 0
 
 RUNTIME_OPTIONS: dict[str, Any] = {}
-ADDON_VERSION = "1.8"
+ADDON_VERSION = "1.9"
 HOLIDAY_ALIASES = {
     "football": "huskers",
 }
@@ -1369,8 +1370,26 @@ def lookup_music_override(artist: str, album: str) -> Optional[dict[str, Any]]:
     }
 
 
-def normalized_album_association(artist: str, album: str) -> str:
+def canonical_music_artist(artist: str) -> str:
+    raw = str(artist or "").strip()
+    if not raw:
+        return ""
+    parts = re.split(r"\s*(?:,|&|\band\b|\bwith\b|\bfeat\.?\b|\bfeaturing\b|\bx\b)\s*", raw, flags=re.IGNORECASE)
+    for piece in parts:
+        normalized = normalize_music_text(piece)
+        if normalized:
+            return piece.strip()
+    return raw
+
+
+def normalized_album_association_legacy(artist: str, album: str) -> str:
     merged = f"{artist} {album}".strip().lower()
+    merged = re.sub(r"[^a-z0-9]+", " ", merged)
+    return re.sub(r"\s+", " ", merged).strip()
+
+
+def normalized_album_association(artist: str, album: str) -> str:
+    merged = f"{canonical_music_artist(artist)} {album}".strip().lower()
     merged = re.sub(r"[^a-z0-9]+", " ", merged)
     return re.sub(r"\s+", " ", merged).strip()
 
@@ -2064,6 +2083,7 @@ def lookup_music_association(restore_payload: dict[str, Any]) -> Optional[dict[s
     shazam_key = str(restore_payload.get("shazam_key", "")).strip()
     album_key_raw = (artist + " — " + album).strip()
     album_key_norm = normalized_album_association(artist, album)
+    album_key_norm_legacy = normalized_album_association_legacy(artist, album)
 
     candidate_keys: list[str] = []
     if music_session_key:
@@ -2074,6 +2094,8 @@ def lookup_music_association(restore_payload: dict[str, Any]) -> Optional[dict[s
         candidate_keys.append(f"album::{album_key_raw}")
     if album_key_norm:
         candidate_keys.append(f"album_norm::{album_key_norm}")
+    if album_key_norm_legacy and album_key_norm_legacy != album_key_norm:
+        candidate_keys.append(f"album_norm::{album_key_norm_legacy}")
     album_loose = normalize_music_text_loose(f"{artist} {album}".strip())
     if album_loose:
         candidate_keys.append(f"album_loose::{album_loose}")
@@ -2672,6 +2694,20 @@ def invalidate_music_cached_content_id(catalog_key: str, content_id: str) -> Non
 
 def upload_local_file_with_reconnect(tv_ip: str, art: Any, file_path: Path) -> tuple[Any, Optional[str]]:
     current_art = art
+    if bool(RUNTIME_OPTIONS.get("art_preconnect_before_upload", True)):
+        try:
+            retry_tv = SamsungTVWS(tv_ip)
+            retry_art = retry_tv.art()
+            if retry_art.supported():
+                current_art = retry_art
+                log_event("upload_preconnect", file=str(file_path), action="refresh_art_socket")
+        except Exception as preconnect_exc:
+            log_event(
+                "upload_preconnect_failed",
+                file=str(file_path),
+                reason=repr(preconnect_exc),
+                action="refresh_art_socket",
+            )
     upload_attempts = resolve_runtime_int_option("art_socket_retries", 5, min_value=1, max_value=10)
     last_exc: Optional[Exception] = None
     for attempt in range(upload_attempts):
@@ -3027,6 +3063,7 @@ def main() -> None:
                     source_url = str(restore_payload.get("artwork_url", "")).strip()
                     artist = str(restore_payload.get("artist", "")).strip()
                     album = str(restore_payload.get("album", "")).strip()
+                    track = str(restore_payload.get("track", "")).strip()
                     force_regen = bool(restore_payload.get("force_regen", False))
 
                     def _maybe_float(value: Any) -> Optional[float]:
@@ -3333,6 +3370,23 @@ def main() -> None:
                                         )
                                         if source_url:
                                             break
+                                if not source_url and artist and track:
+                                    track_lookup_started_at = time.perf_counter()
+                                    log_music_generation_step("itunes_track_search_start", track_candidate=track)
+                                    track_info = itunes_track_search(artist, track, timeout_s=10)
+                                    source_url = resolve_artwork_url(track_info)
+                                    if collection_id is None and isinstance(track_info, dict):
+                                        resolved_collection = parse_collection_id_value(track_info.get("collectionId"))
+                                        if resolved_collection is not None:
+                                            collection_id = resolved_collection
+                                    log_music_generation_step(
+                                        "itunes_track_search_done",
+                                        duration_ms=int((time.perf_counter() - track_lookup_started_at) * 1000),
+                                        source_url_found=bool(source_url),
+                                        match_collection_id=track_info.get("collectionId") if isinstance(track_info, dict) else None,
+                                        match_collection_name=track_info.get("collectionName") if isinstance(track_info, dict) else None,
+                                        match_artist_name=track_info.get("artistName") if isinstance(track_info, dict) else None,
+                                    )
                                 if not source_url and not (artist and album) and collection_id is None:
                                     log_music_generation_step(
                                         "artwork_resolution_failed",

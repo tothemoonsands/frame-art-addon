@@ -28,6 +28,7 @@ if "cover_art" not in sys.modules:
     cover.ensure_dirs = lambda *a, **k: None
     cover.itunes_lookup = lambda *a, **k: {}
     cover.itunes_search = lambda *a, **k: {}
+    cover.itunes_track_search = lambda *a, **k: {}
     cover.normalize_key = lambda *a, **k: "k"
     cover.generate_reference_frame_from_album = lambda *a, **k: (b"", b"", None, None)
     cover.generate_local_fallback_frame_from_album = lambda *a, **k: (b"", b"")
@@ -822,6 +823,16 @@ class CoverArtPayloadNormalizationTests(unittest.TestCase):
         self.assertEqual("childish gambino", artist.lower())
         self.assertEqual("awaken, my love!", album.lower())
 
+    def test_normalized_album_association_collab_variants_share_key(self):
+        base = uploader.normalized_album_association("Loyle Carner", "Yesterday's Gone")
+        collab = uploader.normalized_album_association("Loyle Carner & Tom Misch", "Yesterday's Gone")
+        multi = uploader.normalized_album_association(
+            "Loyle Carner, Rebel Kleff & Kiko Bun",
+            "Yesterday's Gone",
+        )
+        self.assertEqual(base, collab)
+        self.assertEqual(base, multi)
+
 
 class MusicAssociationLookupTests(unittest.TestCase):
     def setUp(self) -> None:
@@ -1217,7 +1228,7 @@ class MusicAssociationLookupTests(unittest.TestCase):
 
         compacted, stats = uploader.compact_music_association_entries(entries, session_ttl_days=30)
         self.assertLess(stats["output_entries"], stats["input_entries"])
-        self.assertIn("album_norm::tom misch yussef dayes what kinda music", compacted)
+        self.assertIn("album_norm::tom misch what kinda music", compacted)
         self.assertIn("cache::itc_1497226866", compacted)
         self.assertIn("session::What Kinda Music", compacted)
         self.assertNotIn("album::Tom Misch & Yussef Dayes — What Kinda Music", compacted)
@@ -1240,7 +1251,7 @@ class MusicAssociationLookupTests(unittest.TestCase):
 
         assoc = json.loads(self.assoc.read_text(encoding="utf-8"))
         entries = assoc["entries"]
-        self.assertIn("album_norm::tom misch yussef dayes what kinda music", entries)
+        self.assertIn("album_norm::tom misch what kinda music", entries)
         self.assertIn("cache::itc_1497226866", entries)
         self.assertIn("session::What Kinda Music", entries)
         self.assertNotIn("album::Tom Misch & Yussef Dayes — What Kinda Music", entries)

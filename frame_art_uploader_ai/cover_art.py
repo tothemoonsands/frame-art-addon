@@ -5,6 +5,7 @@ import json
 import re
 import tempfile
 import time
+from difflib import SequenceMatcher
 from io import BytesIO
 from pathlib import Path
 from typing import Any, Callable, Optional
@@ -37,11 +38,105 @@ FRAME_FINAL_WIDTH = 3840
 FRAME_FINAL_HEIGHT = 2160
 
 _slug_re = re.compile(r"[^a-z0-9]+")
+_artist_split_re = re.compile(r"\s*(?:,|&|\band\b|\bwith\b|\bfeat\.?\b|\bfeaturing\b|\bx\b)\s*", flags=re.IGNORECASE)
 ALLOWED_EXTENSIONS = {".jpg", ".jpeg", ".png"}
 
 
 def _normalize_text(value: str) -> str:
     return _slug_re.sub(" ", value.lower()).strip()
+
+
+def _tokens(value: str) -> set[str]:
+    return {token for token in _normalize_text(value).split() if token}
+
+
+def _artist_variants(artist: str) -> list[str]:
+    raw = str(artist or "").strip()
+    if not raw:
+        return []
+    variants: list[str] = []
+    seen: set[str] = set()
+
+    def add(candidate: str) -> None:
+        normalized = str(candidate or "").strip()
+        key = _normalize_text(normalized)
+        if not key or key in seen:
+            return
+        seen.add(key)
+        variants.append(normalized)
+
+    add(raw)
+    for piece in _artist_split_re.split(raw):
+        add(piece)
+    return variants
+
+
+def _canonical_artist_for_cache(artist: str) -> str:
+    raw = str(artist or "").strip()
+    if not raw:
+        return ""
+    pieces = _artist_split_re.split(raw)
+    for piece in pieces:
+        candidate = str(piece or "").strip()
+        if _normalize_text(candidate):
+            return candidate
+    return raw
+
+
+def _score_itunes_album_result(item: Any, *, wanted_artist: str, wanted_album: str) -> float:
+    if not isinstance(item, dict):
+        return -1.0
+    item_album_raw = str(item.get("collectionName", "")).strip()
+    item_artist_raw = str(item.get("artistName", "")).strip()
+    if not (item_album_raw or item_artist_raw):
+        return -1.0
+
+    wanted_album_norm = _normalize_text(wanted_album)
+    wanted_artist_norm = _normalize_text(wanted_artist)
+    item_album_norm = _normalize_text(item_album_raw)
+    item_artist_norm = _normalize_text(item_artist_raw)
+
+    score = 0.0
+
+    if wanted_album_norm:
+        if item_album_norm == wanted_album_norm:
+            score += 7.0
+        elif wanted_album_norm in item_album_norm or item_album_norm in wanted_album_norm:
+            score += 4.0
+        score += SequenceMatcher(None, wanted_album_norm, item_album_norm).ratio() * 3.0
+
+    if wanted_artist_norm:
+        if item_artist_norm == wanted_artist_norm:
+            score += 6.0
+        elif wanted_artist_norm in item_artist_norm or item_artist_norm in wanted_artist_norm:
+            score += 3.0
+        wanted_tokens = _tokens(wanted_artist_norm)
+        item_tokens = _tokens(item_artist_norm)
+        if wanted_tokens and item_tokens:
+            overlap = len(wanted_tokens & item_tokens) / float(len(wanted_tokens | item_tokens))
+            score += overlap * 2.0
+
+    if wanted_album_norm and wanted_artist_norm and item_album_norm and item_artist_norm:
+        score += SequenceMatcher(None, f"{wanted_artist_norm} {wanted_album_norm}", f"{item_artist_norm} {item_album_norm}").ratio() * 1.5
+    return score
+
+
+def _itunes_search_results(term: str, *, entity: str, limit: int, timeout_s: int) -> list[dict]:
+    query = quote_plus(term.strip())
+    resp = requests.get(
+        f"https://itunes.apple.com/search?term={query}&entity={entity}&limit={limit}",
+        timeout=timeout_s,
+    )
+    resp.raise_for_status()
+    data = resp.json() if resp.text else {}
+    results = data.get("results") if isinstance(data, dict) else None
+    if not isinstance(results, list):
+        return []
+    out: list[dict] = []
+    for item in results:
+        if isinstance(item, dict):
+            out.append(item)
+    return out
 
 
 def _slug(value: str) -> str:
@@ -51,9 +146,11 @@ def _slug(value: str) -> str:
 def normalize_key(collection_id: Optional[int], artist: str, album: str) -> str:
     if collection_id is not None:
         return f"itc_{collection_id}"
-    combined = f"{artist} {album}".strip()
+    canonical_artist = _canonical_artist_for_cache(artist)
+    combined = f"{canonical_artist} {album}".strip()
+    combined_norm = _normalize_text(combined) or "unknown"
     slug = _slug(combined) or "unknown"
-    short_hash = hashlib.sha1(combined.encode("utf-8")).hexdigest()[:8]
+    short_hash = hashlib.sha1(combined_norm.encode("utf-8")).hexdigest()[:8]
     return f"aa_{slug}_{short_hash}"
 
 
@@ -74,38 +171,74 @@ def itunes_lookup(collection_id: int, timeout_s: int = 10) -> dict:
 
 
 def itunes_search(artist: str, album: str, timeout_s: int = 10) -> dict:
-    term = quote_plus(f"{artist} {album}".strip())
-    resp = requests.get(
-        f"https://itunes.apple.com/search?term={term}&entity=album&limit=3",
-        timeout=timeout_s,
-    )
-    resp.raise_for_status()
-    data = resp.json() if resp.text else {}
-    results = data.get("results") if isinstance(data, dict) else None
-    if not isinstance(results, list) or not results:
+    artist_variants = _artist_variants(artist) or [str(artist or "").strip()]
+    wanted_album = str(album or "").strip()
+    collected: list[dict] = []
+    seen_ids: set[str] = set()
+
+    for artist_variant in artist_variants:
+        term = f"{artist_variant} {wanted_album}".strip()
+        for item in _itunes_search_results(term, entity="album", limit=10, timeout_s=timeout_s):
+            dedupe_key = str(item.get("collectionId") or item.get("collectionName") or item.get("artistName") or "")
+            if dedupe_key in seen_ids:
+                continue
+            seen_ids.add(dedupe_key)
+            collected.append(item)
+
+    if not collected:
         return {}
 
-    wanted_album = _normalize_text(album)
-    wanted_artist = _normalize_text(artist)
+    best_item: dict[str, Any] = {}
+    best_score = -1.0
+    for item in collected:
+        item_score = max(
+            _score_itunes_album_result(item, wanted_artist=variant, wanted_album=wanted_album)
+            for variant in artist_variants
+        )
+        if item_score > best_score:
+            best_score = item_score
+            best_item = item
 
-    def score(item: Any) -> int:
-        if not isinstance(item, dict):
-            return -1
-        item_album = _normalize_text(str(item.get("collectionName", "")))
-        item_artist = _normalize_text(str(item.get("artistName", "")))
-        s = 0
-        if wanted_album and item_album == wanted_album:
-            s += 5
-        elif wanted_album and wanted_album in item_album:
-            s += 3
-        if wanted_artist and item_artist == wanted_artist:
-            s += 4
-        elif wanted_artist and wanted_artist in item_artist:
-            s += 2
-        return s
+    # Reject weak/noisy hits so caller can try alternate resolution paths.
+    return best_item if best_score >= 4.0 else {}
 
-    best = max(results, key=score)
-    return best if isinstance(best, dict) else {}
+
+def itunes_track_search(artist: str, track: str, timeout_s: int = 10) -> dict:
+    artist_variants = _artist_variants(artist) or [str(artist or "").strip()]
+    wanted_track = _normalize_text(track)
+    if not wanted_track:
+        return {}
+
+    collected: list[dict] = []
+    seen_ids: set[str] = set()
+    for artist_variant in artist_variants:
+        term = f"{artist_variant} {track}".strip()
+        for item in _itunes_search_results(term, entity="song", limit=10, timeout_s=timeout_s):
+            dedupe_key = str(item.get("trackId") or item.get("collectionId") or item.get("trackName") or "")
+            if dedupe_key in seen_ids:
+                continue
+            seen_ids.add(dedupe_key)
+            collected.append(item)
+
+    if not collected:
+        return {}
+
+    best_item: dict[str, Any] = {}
+    best_score = -1.0
+    for item in collected:
+        item_track = _normalize_text(str(item.get("trackName", "")).strip())
+        item_artist = str(item.get("artistName", "")).strip()
+        track_score = SequenceMatcher(None, wanted_track, item_track).ratio() * 8.0
+        artist_score = max(
+            SequenceMatcher(None, _normalize_text(variant), _normalize_text(item_artist)).ratio()
+            for variant in artist_variants
+        ) * 3.0
+        score = track_score + artist_score
+        if score > best_score:
+            best_score = score
+            best_item = item
+
+    return best_item if best_score >= 6.0 else {}
 
 
 def resolve_artwork_url(result: dict) -> str:
