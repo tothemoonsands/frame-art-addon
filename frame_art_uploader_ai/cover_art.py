@@ -4,9 +4,10 @@ import hashlib
 import json
 import re
 import tempfile
+import time
 from io import BytesIO
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 from urllib.parse import quote_plus
 
 import requests
@@ -328,8 +329,22 @@ def generate_reference_frame_from_album(
     seed: Optional[int] = None,
     timeout_s: int = 90,
     album_shadow: bool = True,
+    step_hook: Optional[Callable[[str, dict[str, Any]], None]] = None,
 ) -> tuple[bytes, bytes, Optional[str], Optional[str]]:
+    def emit(stage: str, **fields: Any) -> None:
+        if step_hook is not None:
+            step_hook(stage, fields)
+
+    t0 = time.perf_counter()
+    emit("build_reference_canvas_start", source_path=str(source_album_path))
     reference_canvas_png = build_reference_canvas_from_album(str(source_album_path))
+    emit(
+        "build_reference_canvas_done",
+        duration_ms=int((time.perf_counter() - t0) * 1000),
+        canvas_bytes=len(reference_canvas_png),
+    )
+    t0 = time.perf_counter()
+    emit("openai_request_start", model=openai_model, timeout_s=timeout_s, seed=seed)
     generated_bytes, request_id, model_used = _request_openai_reference_background(
         input_canvas_png=reference_canvas_png,
         openai_api_key=openai_api_key,
@@ -337,15 +352,46 @@ def generate_reference_frame_from_album(
         seed=seed,
         timeout_s=timeout_s,
     )
+    emit(
+        "openai_request_done",
+        duration_ms=int((time.perf_counter() - t0) * 1000),
+        request_id=request_id,
+        model_used=model_used,
+        generated_bytes=len(generated_bytes),
+    )
 
+    t0 = time.perf_counter()
+    emit("background_convert_start")
     background = ha_edit_to_frame(generated_bytes)
+    emit(
+        "background_convert_done",
+        duration_ms=int((time.perf_counter() - t0) * 1000),
+        width=background.width,
+        height=background.height,
+    )
+    t0 = time.perf_counter()
+    emit("album_composite_start", album_shadow=album_shadow)
     final = composite_album(background, source_album_path, album_shadow=album_shadow)
+    emit(
+        "album_composite_done",
+        duration_ms=int((time.perf_counter() - t0) * 1000),
+        width=final.width,
+        height=final.height,
+    )
 
+    t0 = time.perf_counter()
+    emit("encode_outputs_start")
     background_out = BytesIO()
     background.save(background_out, format="PNG", optimize=True, compress_level=9)
 
     final_out = BytesIO()
     final.save(final_out, format="PNG", optimize=True, compress_level=9)
+    emit(
+        "encode_outputs_done",
+        duration_ms=int((time.perf_counter() - t0) * 1000),
+        final_png_bytes=final_out.tell(),
+        background_png_bytes=background_out.tell(),
+    )
 
     return final_out.getvalue(), background_out.getvalue(), request_id, model_used
 
@@ -353,7 +399,14 @@ def generate_reference_frame_from_album(
 def generate_local_fallback_frame_from_album(
     source_album_path: Path,
     album_shadow: bool = True,
+    step_hook: Optional[Callable[[str, dict[str, Any]], None]] = None,
 ) -> tuple[bytes, bytes]:
+    def emit(stage: str, **fields: Any) -> None:
+        if step_hook is not None:
+            step_hook(stage, fields)
+
+    t0 = time.perf_counter()
+    emit("fallback_background_start", source_path=str(source_album_path))
     with Image.open(source_album_path) as src:
         source_rgb = src.convert("RGB")
     background = ImageOps.fit(
@@ -385,13 +438,35 @@ def generate_local_fallback_frame_from_album(
         Image.new("RGB", (FRAME_FINAL_WIDTH, FRAME_FINAL_HEIGHT), (10, 10, 10)),
         vignette_mask,
     )
+    emit(
+        "fallback_background_done",
+        duration_ms=int((time.perf_counter() - t0) * 1000),
+        width=background.width,
+        height=background.height,
+    )
 
+    t0 = time.perf_counter()
+    emit("fallback_album_composite_start", album_shadow=album_shadow)
     final = composite_album(background, source_album_path, album_shadow=album_shadow)
+    emit(
+        "fallback_album_composite_done",
+        duration_ms=int((time.perf_counter() - t0) * 1000),
+        width=final.width,
+        height=final.height,
+    )
 
+    t0 = time.perf_counter()
+    emit("fallback_encode_outputs_start")
     background_out = BytesIO()
     background.save(background_out, format="PNG", optimize=True, compress_level=9)
     final_out = BytesIO()
     final.save(final_out, format="PNG", optimize=True, compress_level=9)
+    emit(
+        "fallback_encode_outputs_done",
+        duration_ms=int((time.perf_counter() - t0) * 1000),
+        final_png_bytes=final_out.tell(),
+        background_png_bytes=background_out.tell(),
+    )
     return final_out.getvalue(), background_out.getvalue()
 
 

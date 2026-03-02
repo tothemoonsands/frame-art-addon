@@ -1,6 +1,6 @@
 #!/bin/sh
 set -e
 
-echo "Frame Art Uploader AI: starting..."
+echo "[$(date -u +"%Y-%m-%dT%H:%M:%SZ")] launcher event=start component=frame_art_uploader_ai"
 python3 /app/uploader.py
-echo "Frame Art Uploader AI: done."
+echo "[$(date -u +"%Y-%m-%dT%H:%M:%SZ")] launcher event=done component=frame_art_uploader_ai"

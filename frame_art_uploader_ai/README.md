@@ -27,3 +27,9 @@ For each completed restore queue item, the add-on writes `frame_art_uploader_las
 - `requested_at`: request timestamp from payload (if provided)
 
 The file reflects the most recently completed request.
+
+## Logging
+
+- `debug_logging` (add-on option, default `false`): when `false`, console logs are compact and human-readable.
+- Set `debug_logging: true` for full per-step verbose logs (including detailed generation pipeline fields).
+- Optional: set environment variable `FRAME_ART_LOG_JSON=1` to also emit JSON log lines alongside readable lines.

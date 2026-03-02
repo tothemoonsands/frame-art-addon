@@ -81,7 +81,7 @@ MUSIC_RESTORE_KINDS = {"cover_art_reference_background", "cover_art_outpaint"}
 MUSIC_ASSOCIATION_SESSION_TTL_DAYS = 0
 
 RUNTIME_OPTIONS: dict[str, Any] = {}
-ADDON_VERSION = "1.7"
+ADDON_VERSION = "1.8"
 HOLIDAY_ALIASES = {
     "football": "huskers",
 }
@@ -92,11 +92,176 @@ HOLIDAY_ALIASES = {
 # ------------------------------------------------------------
 
 def log_event(event: str, **fields: Any) -> None:
-    payload = {"event": event, **fields}
-    print(json.dumps(payload, separators=(",", ":"), sort_keys=True))
+    ts_wall = fields.get("ts_wall")
+    if not isinstance(ts_wall, str) or not ts_wall:
+        ts_wall = datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
+
+    payload = {"event": event, "ts_wall": ts_wall, **fields}
+    rendered_payload = payload if is_debug_logging() else compact_log_payload(payload)
+    print(format_log_line(rendered_payload), flush=True)
+    if should_emit_json_logs():
+        print(json.dumps(rendered_payload, separators=(",", ":"), sort_keys=True), flush=True)
+
+
+def should_emit_json_logs() -> bool:
+    value = str(os.getenv("FRAME_ART_LOG_JSON", "")).strip().lower()
+    if value in {"1", "true", "yes", "on"}:
+        return True
+    if value in {"0", "false", "no", "off"}:
+        return False
+    return bool(RUNTIME_OPTIONS.get("log_json", False))
+
+
+def is_debug_logging() -> bool:
+    value = str(os.getenv("FRAME_ART_DEBUG_LOGGING", "")).strip().lower()
+    if value in {"1", "true", "yes", "on"}:
+        return True
+    if value in {"0", "false", "no", "off"}:
+        return False
+    return bool(RUNTIME_OPTIONS.get("debug_logging", False))
+
+
+def compact_log_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    event = str(payload.get("event", ""))
+    base_keep = {"event", "ts_wall", "ts"}
+
+    event_keep_map: dict[str, set[str]] = {
+        "status": {
+            "kind",
+            "ok",
+            "mode",
+            "requested_at",
+            "selected_content_id",
+            "pick_source",
+            "verified",
+            "verification_skipped",
+            "effective_show",
+            "error",
+            "tv_ip",
+            "addon_version",
+        },
+        "restore_request": {
+            "kind",
+            "chosen",
+            "pick_source",
+            "resolved_folder",
+            "file_count",
+            "chosen_index",
+            "cleanup_deletions",
+            "cleanup_error",
+        },
+        "music_generation_step": {
+            "kind",
+            "stage",
+            "cache_key",
+            "artist",
+            "album",
+            "collection_id",
+            "album_candidate",
+            "source_url_found",
+            "mode",
+            "request_id",
+            "selected_content_id",
+            "duration_ms",
+            "total_duration_ms",
+            "reason",
+            "error",
+        },
+        "music_generated": {
+            "cache_key",
+            "mode",
+            "compressed_within_limit",
+            "compressed_bytes",
+            "path",
+            "background_path",
+        },
+        "music_openai_fallback": {"cache_key", "mode", "error"},
+        "music_fallback_file": {"cache_key", "fallback", "error"},
+        "upload_retry": {"file", "attempt", "max_attempts", "reason"},
+        "upload_retry_reconnect_failed": {"file", "attempt", "max_attempts", "reason"},
+        "select_retry": {"selected_content_id", "attempt", "max_attempts", "reason"},
+        "select_retry_reconnect_failed": {"selected_content_id", "attempt", "max_attempts", "reason"},
+    }
+    keep = base_keep | event_keep_map.get(
+        event,
+        {"kind", "stage", "ok", "mode", "reason", "error", "duration_ms", "total_duration_ms"},
+    )
+    compacted: dict[str, Any] = {}
+    for key, value in payload.items():
+        if key not in keep:
+            continue
+        if value is None or value == "":
+            continue
+        if isinstance(value, (list, dict)) and not value:
+            continue
+        compacted[key] = value
+    return compacted
+
+
+def format_log_value(value: Any, max_len: int = 200) -> str:
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, (int, float)):
+        return str(value)
+    if isinstance(value, str):
+        text = value
+        if len(text) > max_len:
+            text = text[: max_len - 3] + "..."
+        return json.dumps(text, ensure_ascii=False)
+    if isinstance(value, (list, dict)):
+        text = json.dumps(value, separators=(",", ":"), ensure_ascii=False)
+        if len(text) > max_len:
+            text = text[: max_len - 3] + "..."
+        return text
+    return json.dumps(value, ensure_ascii=False)
+
+
+def format_log_line(payload: dict[str, Any]) -> str:
+    ts_wall = str(payload.get("ts_wall", ""))
+    event = str(payload.get("event", "event"))
+    mono = payload.get("ts")
+    parts: list[str] = [f"[{ts_wall}]", event]
+    if isinstance(mono, (int, float)):
+        parts.append(f"mono_s={mono:.3f}")
+
+    priority = [
+        "kind",
+        "stage",
+        "ok",
+        "mode",
+        "action",
+        "reason",
+        "cache_key",
+        "artist",
+        "album",
+        "collection_id",
+        "selected_content_id",
+        "request_id",
+        "duration_ms",
+        "total_duration_ms",
+        "error",
+    ]
+    skip_keys = {"event", "ts_wall", "ts"}
+    ordered_keys = [k for k in priority if k in payload and k not in skip_keys]
+    ordered_keys.extend(sorted(k for k in payload.keys() if k not in skip_keys and k not in ordered_keys))
+
+    for key in ordered_keys:
+        value = payload.get(key)
+        if value is None:
+            continue
+        if value == "":
+            continue
+        if isinstance(value, (list, dict)) and not value:
+            continue
+        parts.append(f"{key}={format_log_value(value)}")
+    return " ".join(parts)
 
 
 def write_status(payload: dict) -> None:
+    payload.setdefault(
+        "ts_wall",
+        datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z"),
+    )
     payload["ts"] = time.monotonic()
     atomic_write_json(Path(STATUS_PATH), payload)
     log_event("status", **payload)
@@ -3055,6 +3220,29 @@ def main() -> None:
                         FALLBACK_DIR.mkdir(parents=True, exist_ok=True)
                         cover_error: Optional[Exception] = None
                         fallback_path: Optional[Path] = None
+                        generation_started_at = time.perf_counter()
+
+                        def log_music_generation_step(stage: str, **fields: Any) -> None:
+                            log_event(
+                                "music_generation_step",
+                                stage=stage,
+                                cache_key=cache_key,
+                                kind=kind,
+                                artist=artist,
+                                album=album,
+                                collection_id=collection_id,
+                                **fields,
+                            )
+
+                        def emit_cover_art_step(stage: str, fields: dict[str, Any]) -> None:
+                            log_music_generation_step(stage, **fields)
+
+                        log_music_generation_step(
+                            "start",
+                            force_regen=force_regen,
+                            source_exists=src_path.exists(),
+                            source_url_provided=bool(source_url),
+                        )
                         try:
                             if isinstance(association_record, dict) and bool(association_record.get("generation_blocked", False)):
                                 log_event(
@@ -3065,18 +3253,34 @@ def main() -> None:
                                     second_match_confidence=association_record.get("second_match_confidence"),
                                     candidates=association_record.get("match_candidates"),
                                 )
+                                log_music_generation_step(
+                                    "blocked",
+                                    reason="ambiguous_match",
+                                    match_source=association_record.get("match_source"),
+                                    match_confidence=association_record.get("match_confidence"),
+                                    second_match_confidence=association_record.get("second_match_confidence"),
+                                )
                                 raise ValueError("Ambiguous music match; generation blocked to prevent duplicate cache entries")
 
                             if not src_path.exists():
+                                stage_started_at = time.perf_counter()
+                                log_music_generation_step("stage_source_from_index_start")
                                 maybe_stage_source_art_from_index(
                                     src_path=src_path,
                                     artist=artist,
                                     album=album,
                                     collection_id=collection_id,
                                 )
+                                log_music_generation_step(
+                                    "stage_source_from_index_done",
+                                    duration_ms=int((time.perf_counter() - stage_started_at) * 1000),
+                                    source_exists=src_path.exists(),
+                                )
 
                             if not source_url and not src_path.exists():
                                 if collection_id is not None:
+                                    lookup_started_at = time.perf_counter()
+                                    log_music_generation_step("itunes_lookup_start")
                                     lookup = itunes_lookup(collection_id, timeout_s=10)
                                     results = lookup.get("results") if isinstance(lookup, dict) else []
                                     album_info = {}
@@ -3086,6 +3290,12 @@ def main() -> None:
                                                 album_info = item
                                                 break
                                     source_url = resolve_artwork_url(album_info)
+                                    log_music_generation_step(
+                                        "itunes_lookup_done",
+                                        duration_ms=int((time.perf_counter() - lookup_started_at) * 1000),
+                                        result_count=len(results) if isinstance(results, list) else 0,
+                                        source_url_found=bool(source_url),
+                                    )
                                 if not source_url and artist and album:
                                     album_candidates: list[str] = []
 
@@ -3102,37 +3312,82 @@ def main() -> None:
                                         add_album_candidate(album.split(":", 1)[1])
                                     add_album_candidate(re.sub(r"\s*[-–]\s*expanded.*$", "", album, flags=re.IGNORECASE))
 
+                                    log_music_generation_step(
+                                        "itunes_search_candidates",
+                                        candidate_count=len(album_candidates),
+                                        candidates=album_candidates,
+                                    )
                                     for album_candidate in album_candidates:
+                                        search_started_at = time.perf_counter()
+                                        log_music_generation_step("itunes_search_start", album_candidate=album_candidate)
                                         album_info = itunes_search(artist, album_candidate, timeout_s=10)
                                         source_url = resolve_artwork_url(album_info)
+                                        log_music_generation_step(
+                                            "itunes_search_done",
+                                            album_candidate=album_candidate,
+                                            duration_ms=int((time.perf_counter() - search_started_at) * 1000),
+                                            source_url_found=bool(source_url),
+                                            match_collection_id=album_info.get("collectionId") if isinstance(album_info, dict) else None,
+                                            match_collection_name=album_info.get("collectionName") if isinstance(album_info, dict) else None,
+                                            match_artist_name=album_info.get("artistName") if isinstance(album_info, dict) else None,
+                                        )
                                         if source_url:
                                             break
                                 if not source_url and not (artist and album) and collection_id is None:
+                                    log_music_generation_step(
+                                        "artwork_resolution_failed",
+                                        reason="unsupported_metadata",
+                                    )
                                     raise ValueError("unsupported metadata; provide artwork_url, collection_id, or artist+album")
 
                             if not source_url and not src_path.exists():
+                                log_music_generation_step(
+                                    "artwork_resolution_failed",
+                                    reason="unable_to_resolve_artwork_url",
+                                )
                                 raise ValueError("Unable to resolve artwork URL from request metadata")
 
                             if not src_path.exists():
+                                download_started_at = time.perf_counter()
+                                log_music_generation_step("download_artwork_start")
                                 download_artwork(source_url, str(src_path), timeout_s=15)
+                                log_music_generation_step(
+                                    "download_artwork_done",
+                                    duration_ms=int((time.perf_counter() - download_started_at) * 1000),
+                                    source_path=str(src_path),
+                                    source_bytes=src_path.stat().st_size if src_path.exists() else None,
+                                )
 
                             use_legacy_masked = bool(RUNTIME_OPTIONS.get("legacy_masked_outpaint", False))
                             if use_legacy_masked:
                                 log_event("legacy_masked_outpaint_requested", enabled=True, note="using reference_no_mask pipeline")
 
                             try:
+                                log_music_generation_step("generate_reference_frame_start", openai_model=openai_model)
                                 final_png, background_png, request_id, model_used = generate_reference_frame_from_album(
                                     source_album_path=src_path,
                                     openai_api_key=openai_api_key,
                                     openai_model=openai_model,
                                     timeout_s=openai_timeout_s,
                                     album_shadow=True,
+                                    step_hook=emit_cover_art_step,
                                 )
                                 generation_mode = "openai_reference"
+                                log_music_generation_step(
+                                    "generate_reference_frame_done",
+                                    mode=generation_mode,
+                                    request_id=request_id,
+                                    model_used=model_used,
+                                )
                             except Exception as gen_exc:
+                                log_music_generation_step(
+                                    "generate_reference_frame_failed",
+                                    error=repr(gen_exc),
+                                )
                                 final_png, background_png = generate_local_fallback_frame_from_album(
                                     source_album_path=src_path,
                                     album_shadow=True,
+                                    step_hook=emit_cover_art_step,
                                 )
                                 request_id = None
                                 model_used = "local-fallback"
@@ -3147,23 +3402,55 @@ def main() -> None:
                                     error=repr(gen_exc),
                                     mode=generation_mode,
                                 )
+                                log_music_generation_step("fallback_generation_done", mode=generation_mode)
 
+                            write_started_at = time.perf_counter()
+                            log_music_generation_step("write_outputs_start")
                             wide_png_path.parent.mkdir(parents=True, exist_ok=True)
                             background_path.parent.mkdir(parents=True, exist_ok=True)
                             compressed_jpg_path.parent.mkdir(parents=True, exist_ok=True)
                             wide_png_path.write_bytes(final_png)
                             background_path.write_bytes(background_png)
+                            log_music_generation_step(
+                                "write_outputs_done",
+                                duration_ms=int((time.perf_counter() - write_started_at) * 1000),
+                                wide_png_path=str(wide_png_path),
+                                wide_png_bytes=wide_png_path.stat().st_size if wide_png_path.exists() else None,
+                                background_path=str(background_path),
+                                background_png_bytes=background_path.stat().st_size if background_path.exists() else None,
+                            )
+                            compress_started_at = time.perf_counter()
+                            log_music_generation_step("compress_start", max_bytes=JPEG_MAX_BYTES)
                             compressed_ok, compressed_size = compress_png_path_to_jpeg_max_bytes(
                                 wide_png_path,
                                 compressed_jpg_path,
                                 max_bytes=JPEG_MAX_BYTES,
                             )
+                            log_music_generation_step(
+                                "compress_done",
+                                duration_ms=int((time.perf_counter() - compress_started_at) * 1000),
+                                compressed_within_limit=compressed_ok,
+                                compressed_bytes=compressed_size,
+                                compressed_path=str(compressed_jpg_path),
+                            )
                             wide_path = compressed_jpg_path if compressed_jpg_path.exists() else wide_png_path
                             encoded_type = guess_file_type(wide_path)
                             encoded_bytes = wide_path.stat().st_size
+                            upload_started_at = time.perf_counter()
+                            log_music_generation_step(
+                                "upload_start",
+                                upload_path=str(wide_path),
+                                encoded_type=encoded_type,
+                                encoded_bytes=encoded_bytes,
+                            )
                             art, target_cid = upload_local_file_with_reconnect(tv_ip, art, wide_path)
                             if not target_cid:
                                 raise ValueError("Generated music upload succeeded but content_id was not found")
+                            log_music_generation_step(
+                                "upload_done",
+                                duration_ms=int((time.perf_counter() - upload_started_at) * 1000),
+                                selected_content_id=target_cid,
+                            )
                             append_uploaded_id(state, "cover_uploaded_ids", target_cid)
                             catalog_key = music_catalog_key_for_path(wide_path)
                             update_catalog_content_id(MUSIC_CATALOG_PATH, catalog_key, target_cid)
@@ -3187,6 +3474,11 @@ def main() -> None:
                                 request_id=request_id,
                             )
                             pick_source = generation_mode
+                            log_music_generation_step(
+                                "catalog_and_index_updated",
+                                catalog_key=catalog_key,
+                                selected_content_id=target_cid,
+                            )
                             log_event(
                                 "music_generated",
                                 cache_key=cache_key,
@@ -3196,8 +3488,19 @@ def main() -> None:
                                 path=str(wide_path),
                                 background_path=str(background_path),
                             )
+                            log_music_generation_step(
+                                "complete",
+                                total_duration_ms=int((time.perf_counter() - generation_started_at) * 1000),
+                                mode=generation_mode,
+                                selected_content_id=target_cid,
+                            )
                         except Exception as e:
                             cover_error = e
+                            log_music_generation_step(
+                                "failed",
+                                total_duration_ms=int((time.perf_counter() - generation_started_at) * 1000),
+                                error=repr(e),
+                            )
                             append_music_error(
                                 {
                                     "cache_key": cache_key,
@@ -3221,6 +3524,11 @@ def main() -> None:
                             append_uploaded_id(state, "cover_uploaded_ids", target_cid)
                             pick_source = "music_fallback_file"
                             log_event("music_fallback_file", cache_key=cache_key, error=repr(cover_error), fallback=str(fallback_path))
+                            log_music_generation_step(
+                                "fallback_file_uploaded",
+                                fallback_path=str(fallback_path),
+                                selected_content_id=target_cid,
+                            )
                 else:
                     raise ValueError(f"Unsupported restore kind: {kind!r}")
 
