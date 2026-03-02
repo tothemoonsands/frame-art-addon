@@ -82,10 +82,11 @@ MUSIC_RESTORE_KINDS = {"cover_art_reference_background", "cover_art_outpaint"}
 MUSIC_ASSOCIATION_SESSION_TTL_DAYS = 0
 
 RUNTIME_OPTIONS: dict[str, Any] = {}
-ADDON_VERSION = "1.12"
+ADDON_VERSION = "1.13"
 HOLIDAY_ALIASES = {
     "football": "huskers",
 }
+ACTIVE_TV_CONNECTIONS: list[Any] = []
 
 
 # ------------------------------------------------------------
@@ -360,6 +361,41 @@ def load_state() -> dict:
 
 def save_state(state: dict) -> None:
     Path(STATE_PATH).write_text(json.dumps(state, indent=2), encoding="utf-8")
+
+
+def register_tv_connection(tv: Any) -> Any:
+    if tv is not None:
+        ACTIVE_TV_CONNECTIONS.append(tv)
+    return tv
+
+
+def safe_close_tv_connection(tv: Any, *, context: str = "unknown") -> None:
+    if tv is None:
+        return
+    for method_name in ("close", "disconnect", "stop"):
+        method = getattr(tv, method_name, None)
+        if not callable(method):
+            continue
+        try:
+            method()
+            log_event("art_socket_closed", context=context, method=method_name)
+            return
+        except Exception as exc:
+            log_event("art_socket_close_failed", context=context, method=method_name, reason=repr(exc))
+            return
+
+
+def close_registered_tv_connections(*, context: str) -> None:
+    seen_ids: set[int] = set()
+    while ACTIVE_TV_CONNECTIONS:
+        tv = ACTIVE_TV_CONNECTIONS.pop()
+        if tv is None:
+            continue
+        tv_id = id(tv)
+        if tv_id in seen_ids:
+            continue
+        seen_ids.add(tv_id)
+        safe_close_tv_connection(tv, context=context)
 
 
 def parse_bool(value: Any) -> Optional[bool]:
@@ -2709,7 +2745,7 @@ def select_and_verify_with_reconnect(
                 )
                 time.sleep(retry_backoff_seconds(socket_attempt))
                 try:
-                    retry_tv = SamsungTVWS(tv_ip)
+                    retry_tv = register_tv_connection(SamsungTVWS(tv_ip))
                     retry_art = retry_tv.art()
                     if not retry_art.supported():
                         select_error = RuntimeError("Art mode not supported / unreachable")
@@ -2776,7 +2812,7 @@ def upload_local_file_with_reconnect(tv_ip: str, art: Any, file_path: Path) -> t
     maybe_wait_for_upload_timeout_cooldown()
     if bool(RUNTIME_OPTIONS.get("art_preconnect_before_upload", True)):
         try:
-            retry_tv = SamsungTVWS(tv_ip)
+            retry_tv = register_tv_connection(SamsungTVWS(tv_ip))
             retry_art = retry_tv.art()
             if retry_art.supported():
                 current_art = retry_art
@@ -2814,7 +2850,7 @@ def upload_local_file_with_reconnect(tv_ip: str, art: Any, file_path: Path) -> t
             )
             time.sleep(retry_backoff_seconds(attempt))
             try:
-                retry_tv = SamsungTVWS(tv_ip)
+                retry_tv = register_tv_connection(SamsungTVWS(tv_ip))
                 retry_art = retry_tv.art()
                 if not retry_art.supported():
                     last_exc = RuntimeError("Art mode not supported / unreachable")
@@ -2893,7 +2929,7 @@ def main() -> None:
     if dequeue_next_restore_work_item() is None:
         return
 
-    tv = SamsungTVWS(tv_ip)
+    tv = register_tv_connection(SamsungTVWS(tv_ip))
     art = tv.art()
 
     if not art.supported():
@@ -3953,3 +3989,5 @@ if __name__ == "__main__":
     except Exception as e:
         write_status({"ok": False, "error": repr(e)})
         raise
+    finally:
+        close_registered_tv_connections(context="process_exit")
