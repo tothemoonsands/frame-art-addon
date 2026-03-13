@@ -1433,6 +1433,44 @@ class MusicAssociationLookupTests(unittest.TestCase):
             request["artwork_url"],
         )
 
+    def test_set_music_override_for_album_accepts_remote_artwork_url(self):
+        changed = uploader.set_music_override_for_album(
+            artist="Childish Gambino",
+            album='"Awaken, My Love!"',
+            artwork_url="https://a5.mzstatic.com/us/r1000/0/Music221/v4/example/cover.jpg",
+            reason="manual_search_result",
+        )
+        self.assertTrue(changed)
+        override = uploader.lookup_music_override("Childish Gambino", '"Awaken, My Love!"')
+        self.assertIsNotNone(override)
+        self.assertEqual(
+            "https://a5.mzstatic.com/us/r1000/0/Music221/v4/example/cover.jpg",
+            override["artwork_url"],
+        )
+        self.assertEqual("manual_override", override["match_source"])
+        self.assertFalse(override["cache_reuse_recommended"])
+
+    def test_lookup_music_association_uses_remote_artwork_url_override(self):
+        uploader.set_music_override_for_album(
+            artist="Childish Gambino",
+            album='"Awaken, My Love!"',
+            artwork_url="https://a5.mzstatic.com/us/r1000/0/Music221/v4/example/cover.jpg",
+            reason="manual_search_result",
+        )
+        assoc = uploader.lookup_music_association(
+            {
+                "artist": "Childish Gambino",
+                "album": '"Awaken, My Love!"',
+                "collection_id": None,
+                "music_session_key": "album-session",
+            }
+        )
+        self.assertIsNotNone(assoc)
+        self.assertEqual(
+            "https://a5.mzstatic.com/us/r1000/0/Music221/v4/example/cover.jpg",
+            assoc["artwork_url"],
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

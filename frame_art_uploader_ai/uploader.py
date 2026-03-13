@@ -83,7 +83,7 @@ MUSIC_RESTORE_KINDS = {"cover_art_reference_background", "cover_art_outpaint"}
 MUSIC_ASSOCIATION_SESSION_TTL_DAYS = 0
 
 RUNTIME_OPTIONS: dict[str, Any] = {}
-ADDON_VERSION = "1.19"
+ADDON_VERSION = "1.20"
 HOLIDAY_ALIASES = {
     "football": "huskers",
 }
@@ -1387,7 +1387,14 @@ def persist_music_overrides(catalog: dict[str, Any]) -> None:
     persist_frame_art_catalog(MUSIC_OVERRIDES_PATH, catalog)
 
 
-def set_music_override_for_album(*, artist: str, album: str, catalog_key: str, reason: str) -> bool:
+def set_music_override_for_album(
+    *,
+    artist: str,
+    album: str,
+    catalog_key: str = "",
+    artwork_url: str = "",
+    reason: str,
+) -> bool:
     album_norm = normalized_album_association(artist, album)
     if not album_norm:
         return False
@@ -1397,10 +1404,15 @@ def set_music_override_for_album(*, artist: str, album: str, catalog_key: str, r
     if not isinstance(entries, dict):
         entries = {}
         catalog["entries"] = entries
+    catalog_key = Path(str(catalog_key or "").strip()).name
+    artwork_url = normalize_remote_artwork_url(artwork_url)
+    if not catalog_key and not artwork_url:
+        return False
     entries[key] = {
         "artist": artist,
         "album": album,
         "catalog_key": catalog_key,
+        "artwork_url": artwork_url,
         "reason": reason,
         "updated_at": datetime.now(timezone.utc).isoformat(),
     }
@@ -1420,10 +1432,11 @@ def lookup_music_override(artist: str, album: str) -> Optional[dict[str, Any]]:
         return None
 
     catalog_key = str(override.get("catalog_key", "")).strip()
-    if not catalog_key:
+    artwork_url = normalize_remote_artwork_url(override.get("artwork_url"))
+    if not catalog_key and not artwork_url:
         return None
-    content_id = lookup_catalog_content_id(MUSIC_CATALOG_PATH, catalog_key) or ""
-    return {
+    content_id = lookup_catalog_content_id(MUSIC_CATALOG_PATH, catalog_key) or "" if catalog_key else ""
+    result = {
         "cache_key": music_catalog_stem(catalog_key),
         "catalog_key": catalog_key,
         "content_id": content_id,
@@ -1434,6 +1447,10 @@ def lookup_music_override(artist: str, album: str) -> Optional[dict[str, Any]]:
         "match_confidence": 1.0,
         "match_source": "manual_override",
     }
+    if artwork_url:
+        result["artwork_url"] = artwork_url
+        result["cache_reuse_recommended"] = False
+    return result
 
 
 def clear_music_override_for_album(*, artist: str, album: str) -> bool:
@@ -3361,6 +3378,14 @@ def main() -> None:
                                 cleanup_catalog_key,
                                 stale_content_id or str(restore_payload.get("current_content_id", "")).strip(),
                             )
+                        manual_artwork_url = normalize_remote_artwork_url(restore_payload.get("artwork_url"))
+                        if manual_artwork_url:
+                            set_music_override_for_album(
+                                artist=artist,
+                                album=album,
+                                artwork_url=manual_artwork_url,
+                                reason=f"issue_type:{issue_type or 'manual_search_result'}",
+                            )
                         followup_payload = build_music_request_from_feedback(restore_payload, show=show_flag, force_regen=True)
                         enqueue_restore_payload(followup_payload)
                         followup_kind = "cover_art_reference_background"
@@ -3415,7 +3440,6 @@ def main() -> None:
                     track = str(restore_payload.get("track", "")).strip()
                     force_regen = bool(restore_payload.get("force_regen", False))
                     force_new_background = bool(restore_payload.get("force_new_background", False))
-                    manual_artwork_url_provided = bool(source_url)
 
                     def _maybe_float(value: Any) -> Optional[float]:
                         if value in (None, ""):
@@ -3426,6 +3450,9 @@ def main() -> None:
                             return None
 
                     association_record = lookup_music_association(restore_payload)
+                    if not source_url and isinstance(association_record, dict):
+                        source_url = normalize_remote_artwork_url(association_record.get("artwork_url"))
+                    manual_artwork_url_provided = bool(source_url)
                     if isinstance(association_record, dict):
                         match_source_for_status = str(association_record.get("match_source", "exact"))
                         match_confidence_for_status = _maybe_float(association_record.get("match_confidence"))
