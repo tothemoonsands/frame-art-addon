@@ -1471,6 +1471,43 @@ class MusicAssociationLookupTests(unittest.TestCase):
             assoc["artwork_url"],
         )
 
+    def test_lookup_music_association_prefers_override_over_collection_id_match(self):
+        uploader.atomic_write_json(
+            self.catalog,
+            {
+                "version": 1,
+                "updated_at": "",
+                "entries": {
+                    "123__3840x2160.jpg": {
+                        "content_id": "MY_F123",
+                        "collection_id": 123,
+                        "artist": "Wrong Artist",
+                        "album": "Wrong Album",
+                        "updated_at": "",
+                    }
+                },
+            },
+        )
+        uploader.set_music_override_for_album(
+            artist="Childish Gambino",
+            album='"Awaken, My Love!"',
+            artwork_url="https://a5.mzstatic.com/us/r1000/0/Music221/v4/example/cover.jpg",
+            reason="manual_search_result",
+        )
+        assoc = uploader.lookup_music_association(
+            {
+                "artist": "Childish Gambino",
+                "album": '"Awaken, My Love!"',
+                "collection_id": 123,
+            }
+        )
+        self.assertIsNotNone(assoc)
+        self.assertEqual("manual_override", assoc["match_source"])
+        self.assertEqual(
+            "https://a5.mzstatic.com/us/r1000/0/Music221/v4/example/cover.jpg",
+            assoc["artwork_url"],
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

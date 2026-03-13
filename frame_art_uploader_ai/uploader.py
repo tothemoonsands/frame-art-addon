@@ -2186,18 +2186,18 @@ def lookup_music_association_fuzzy(restore_payload: dict[str, Any]) -> Optional[
 
 
 def lookup_music_association(restore_payload: dict[str, Any]) -> Optional[dict[str, Any]]:
-    collection_id = parse_collection_id_value(restore_payload.get("collection_id"))
-    collection_match = find_music_match_by_collection_id(collection_id)
-    if isinstance(collection_match, dict):
-        collection_match["artist"] = str(restore_payload.get("artist", "")).strip()
-        collection_match["album"] = str(restore_payload.get("album", "")).strip()
-        return collection_match
-
     artist = str(restore_payload.get("artist", "")).strip()
     album = str(restore_payload.get("album", "")).strip()
     override_match = lookup_music_override(artist, album)
     if isinstance(override_match, dict):
         return override_match
+
+    collection_id = parse_collection_id_value(restore_payload.get("collection_id"))
+    collection_match = find_music_match_by_collection_id(collection_id)
+    if isinstance(collection_match, dict):
+        collection_match["artist"] = artist
+        collection_match["album"] = album
+        return collection_match
 
     catalog = load_frame_art_catalog(MUSIC_ASSOCIATIONS_PATH)
     entries = catalog.get("entries") if isinstance(catalog.get("entries"), dict) else {}
