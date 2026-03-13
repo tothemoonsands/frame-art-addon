@@ -11,6 +11,7 @@ import fcntl
 from io import BytesIO
 from pathlib import Path
 from typing import Any, Optional
+from urllib.parse import urlparse
 
 from PIL import Image
 from samsungtvws import SamsungTVWS
@@ -82,7 +83,7 @@ MUSIC_RESTORE_KINDS = {"cover_art_reference_background", "cover_art_outpaint"}
 MUSIC_ASSOCIATION_SESSION_TTL_DAYS = 0
 
 RUNTIME_OPTIONS: dict[str, Any] = {}
-ADDON_VERSION = "1.17"
+ADDON_VERSION = "1.18"
 HOLIDAY_ALIASES = {
     "football": "huskers",
 }
@@ -669,7 +670,7 @@ def parse_restore_request_payload(payload: Any) -> tuple[Optional[dict], Optiona
         if requested_show is None:
             requested_show = True
         normalized["requested_at"] = str(payload.get("requested_at", "")).strip()
-        normalized["artwork_url"] = str(payload.get("artwork_url", "")).strip()
+        normalized["artwork_url"] = normalize_remote_artwork_url(payload.get("artwork_url"))
         artist = str(payload.get("artist", "")).strip()
         album = str(payload.get("album", "")).strip()
         track = str(payload.get("track", "")).strip()
@@ -738,7 +739,7 @@ def parse_restore_request_payload(payload: Any) -> tuple[Optional[dict], Optiona
         normalized["current_content_id"] = str(payload.get("current_content_id", "")).strip()
         normalized["candidate_catalog_key"] = str(payload.get("candidate_catalog_key", "")).strip()
         normalized["notes"] = str(payload.get("notes", "")).strip()
-        normalized["artwork_url"] = str(payload.get("artwork_url", "")).strip()
+        normalized["artwork_url"] = normalize_remote_artwork_url(payload.get("artwork_url"))
         collection_id_raw = payload.get("collection_id")
         if collection_id_raw in (None, ""):
             normalized["collection_id"] = None
@@ -1611,6 +1612,16 @@ def parse_collection_id_value(value: Any) -> Optional[int]:
         return int(str(value).strip())
     except Exception:
         return None
+
+
+def normalize_remote_artwork_url(value: Any) -> str:
+    raw = str(value or "").strip()
+    if not raw:
+        return ""
+    parsed = urlparse(raw)
+    if parsed.scheme.lower() not in {"http", "https"} or not parsed.netloc:
+        return ""
+    return raw
 
 
 def music_candidate_adjusted_score(
@@ -2611,6 +2622,7 @@ def resolve_music_catalog_path(catalog_key: str) -> Optional[Path]:
 
 
 def build_music_request_from_feedback(payload: dict[str, Any], *, show: bool, force_regen: bool = False) -> dict[str, Any]:
+    artwork_url = normalize_remote_artwork_url(payload.get("artwork_url"))
     return {
         "kind": "cover_art_reference_background",
         "requested_at": datetime.now(timezone.utc).isoformat(),
@@ -2622,8 +2634,8 @@ def build_music_request_from_feedback(payload: dict[str, Any], *, show: bool, fo
         "track": str(payload.get("track", "")).strip(),
         "key_source": str(payload.get("key_source", "")).strip().lower(),
         "shazam_key": str(payload.get("shazam_key", "")).strip(),
-        "collection_id": parse_collection_id_value(payload.get("collection_id")),
-        "artwork_url": str(payload.get("artwork_url", "")).strip(),
+        "collection_id": None if artwork_url else parse_collection_id_value(payload.get("collection_id")),
+        "artwork_url": artwork_url,
         "source_preference": "itunes",
         "force_regen": force_regen,
     }
@@ -3388,12 +3400,13 @@ def main() -> None:
                     continue
                 elif kind in {"cover_art_reference_background", "cover_art_outpaint"}:
                     ensure_dirs()
-                    source_url = str(restore_payload.get("artwork_url", "")).strip()
+                    source_url = normalize_remote_artwork_url(restore_payload.get("artwork_url"))
                     source_preference = str(restore_payload.get("source_preference", "")).strip().lower()
                     artist = str(restore_payload.get("artist", "")).strip()
                     album = str(restore_payload.get("album", "")).strip()
                     track = str(restore_payload.get("track", "")).strip()
                     force_regen = bool(restore_payload.get("force_regen", False))
+                    manual_artwork_url_provided = bool(source_url)
 
                     def _maybe_float(value: Any) -> Optional[float]:
                         if value in (None, ""):
@@ -3439,10 +3452,13 @@ def main() -> None:
                             collection_id = int(collection_id_raw)
                         except Exception:
                             collection_id = None
-                    if collection_id is None and isinstance(association_record, dict):
+                    if collection_id is None and not manual_artwork_url_provided and isinstance(association_record, dict):
                         assoc_collection_id = association_record.get("collection_id")
                         if isinstance(assoc_collection_id, int):
                             collection_id = assoc_collection_id
+
+                    if manual_artwork_url_provided:
+                        collection_id = None
 
                     cache_key = normalize_key(collection_id, artist, album)
                     stem_key = music_generation_stem(
@@ -3507,7 +3523,7 @@ def main() -> None:
                         music_retry_upload_path = None
                         wide_path = Path("__force_regen__")
 
-                    has_manual_artwork_url = bool(source_url)
+                    has_manual_artwork_url = manual_artwork_url_provided
 
                     reuse_cached_association = (
                         not force_regen

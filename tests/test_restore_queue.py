@@ -1142,6 +1142,24 @@ class MusicAssociationLookupTests(unittest.TestCase):
         )
         self.assertEqual("1497226866", stem)
 
+    def test_normalize_remote_artwork_url_rejects_cache_key_like_values(self):
+        self.assertEqual("", uploader.normalize_remote_artwork_url("aa_childish-gambino-awaken_254d4073"))
+        self.assertEqual("", uploader.normalize_remote_artwork_url("1497226866"))
+
+    def test_build_music_request_from_feedback_drops_collection_id_when_manual_artwork_url_present(self):
+        request = uploader.build_music_request_from_feedback(
+            {
+                "artist": "Childish Gambino",
+                "album": '"Awaken, My Love!"',
+                "collection_id": 123,
+                "artwork_url": "https://a5.mzstatic.com/us/r1000/0/Music211/v4/f1/3c/d7/f13cd7ab-7319-028a-8807-5991d0b308d4/0044003187658_Cover.jpg",
+            },
+            show=True,
+            force_regen=True,
+        )
+        self.assertIsNone(request["collection_id"])
+        self.assertTrue(request["artwork_url"].startswith("https://"))
+
     def test_fuzzy_ambiguous_returns_regenerate_recommendation(self):
         uploader.atomic_write_json(
             self.catalog,
