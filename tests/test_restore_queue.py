@@ -925,6 +925,7 @@ class MusicAssociationLookupTests(unittest.TestCase):
         self.assertIsInstance(matched, dict)
         self.assertEqual("MY_F1001", matched.get("content_id"))
         self.assertEqual("association_fuzzy", matched.get("match_source"))
+        self.assertTrue(matched.get("cache_reuse_recommended"))
 
     def test_fuzzy_lookup_from_catalog_filename(self):
         uploader.atomic_write_json(

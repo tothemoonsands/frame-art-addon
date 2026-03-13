@@ -1530,6 +1530,8 @@ def music_similarity(query: str, candidate: str) -> float:
         return 0.0
     if query_norm == candidate_norm:
         return 1.0
+    if music_text_equivalent(query, candidate):
+        return 0.96
     if query_norm in candidate_norm or candidate_norm in query_norm:
         return 0.93
 
@@ -1603,7 +1605,7 @@ def music_candidate_adjusted_score(
 ) -> float:
     adjusted = score
     if is_aa_catalog_key(catalog_key, cache_key):
-        adjusted -= 0.08
+        adjusted -= 0.04
     if is_numeric_catalog_key(catalog_key):
         adjusted += 0.02
     if verified:
@@ -2111,7 +2113,7 @@ def lookup_music_association_fuzzy(restore_payload: dict[str, Any]) -> Optional[
         )
 
     best_margin = best_score - second_best_score if second_best_score > 0.0 else best_score
-    cache_reuse_recommended = best_score >= 0.82 and (best_margin >= 0.05 or second_best_score == 0.0)
+    cache_reuse_recommended = best_score >= 0.76 and (best_margin >= 0.04 or second_best_score == 0.0)
     if best_score < 0.70:
         return None
 
