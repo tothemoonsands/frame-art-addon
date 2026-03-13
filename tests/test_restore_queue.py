@@ -192,6 +192,7 @@ class RestoreQueueTests(unittest.TestCase):
             "cache_key": "itc_123",
             "candidate_catalog_key": "123__3840x2160.jpg",
             "notes": "bad background",
+            "artwork_url": "https://example.com/cover.jpg",
         }
         normalized, requested_show, err = uploader.parse_restore_request_payload(payload)
         self.assertIsNone(err)
@@ -201,6 +202,7 @@ class RestoreQueueTests(unittest.TestCase):
         self.assertEqual("wrong_album_art", normalized["issue_type"])
         self.assertEqual(123, normalized["collection_id"])
         self.assertEqual("MY_F42", normalized["current_content_id"])
+        self.assertEqual("https://example.com/cover.jpg", normalized["artwork_url"])
 
     def test_manual_override_preferred_for_lookup(self):
         ok = uploader.set_music_override_for_album(
@@ -1303,6 +1305,26 @@ class MusicAssociationLookupTests(unittest.TestCase):
                 force_regen=False,
                 source_preference="",
             )
+        )
+
+    def test_build_music_request_from_feedback_preserves_manual_artwork_url(self):
+        request = uploader.build_music_request_from_feedback(
+            {
+                "music_session_key": "session-1",
+                "artist": "Joey Bada$$",
+                "album": "Lonely At The Top",
+                "track": "Lonely At The Top",
+                "key_source": "sonos",
+                "shazam_key": "",
+                "collection_id": None,
+                "artwork_url": "https://a5.mzstatic.com/us/r1000/0/Music211/v4/87/05/04/87050482-1f16-8d12-9038-eb015dac5e46/196873464527.jpg",
+            },
+            show=True,
+            force_regen=True,
+        )
+        self.assertEqual(
+            "https://a5.mzstatic.com/us/r1000/0/Music211/v4/87/05/04/87050482-1f16-8d12-9038-eb015dac5e46/196873464527.jpg",
+            request["artwork_url"],
         )
 
 

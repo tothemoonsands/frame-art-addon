@@ -82,7 +82,7 @@ MUSIC_RESTORE_KINDS = {"cover_art_reference_background", "cover_art_outpaint"}
 MUSIC_ASSOCIATION_SESSION_TTL_DAYS = 0
 
 RUNTIME_OPTIONS: dict[str, Any] = {}
-ADDON_VERSION = "1.16"
+ADDON_VERSION = "1.17"
 HOLIDAY_ALIASES = {
     "football": "huskers",
 }
@@ -738,6 +738,7 @@ def parse_restore_request_payload(payload: Any) -> tuple[Optional[dict], Optiona
         normalized["current_content_id"] = str(payload.get("current_content_id", "")).strip()
         normalized["candidate_catalog_key"] = str(payload.get("candidate_catalog_key", "")).strip()
         normalized["notes"] = str(payload.get("notes", "")).strip()
+        normalized["artwork_url"] = str(payload.get("artwork_url", "")).strip()
         collection_id_raw = payload.get("collection_id")
         if collection_id_raw in (None, ""):
             normalized["collection_id"] = None
@@ -2527,6 +2528,7 @@ def build_music_request_from_feedback(payload: dict[str, Any], *, show: bool, fo
         "key_source": str(payload.get("key_source", "")).strip().lower(),
         "shazam_key": str(payload.get("shazam_key", "")).strip(),
         "collection_id": parse_collection_id_value(payload.get("collection_id")),
+        "artwork_url": str(payload.get("artwork_url", "")).strip(),
         "source_preference": "itunes",
         "force_regen": force_regen,
     }
