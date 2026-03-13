@@ -843,8 +843,10 @@ class MusicAssociationLookupTests(unittest.TestCase):
         self.assoc = self.root / "music_associations.json"
         self.catalog = self.root / "music_catalog.json"
         self.index = self.root / "index.json"
+        self.overrides = self.root / "music_overrides.json"
         self.old_compressed_dir = uploader.COMPRESSED_DIR
         self.old_widescreen_dir = uploader.WIDESCREEN_DIR
+        self.old_music_overrides = uploader.MUSIC_OVERRIDES_PATH
         uploader.COMPRESSED_DIR = self.root / "widescreen-compressed"
         uploader.WIDESCREEN_DIR = self.root / "widescreen"
         uploader.COMPRESSED_DIR.mkdir(parents=True, exist_ok=True)
@@ -852,10 +854,12 @@ class MusicAssociationLookupTests(unittest.TestCase):
         uploader.MUSIC_ASSOCIATIONS_PATH = self.assoc
         uploader.MUSIC_CATALOG_PATH = self.catalog
         uploader.MUSIC_INDEX_PATHS = [self.index]
+        uploader.MUSIC_OVERRIDES_PATH = self.overrides
 
     def tearDown(self) -> None:
         uploader.COMPRESSED_DIR = self.old_compressed_dir
         uploader.WIDESCREEN_DIR = self.old_widescreen_dir
+        uploader.MUSIC_OVERRIDES_PATH = self.old_music_overrides
         self.tmp.cleanup()
 
     def test_lookup_by_normalized_album_key(self):
@@ -1148,6 +1152,40 @@ class MusicAssociationLookupTests(unittest.TestCase):
         self.assertFalse(matched.get("cache_reuse_recommended"))
         self.assertEqual("fuzzy_ambiguous_regenerate", matched.get("cache_reuse_reason"))
         self.assertIsInstance(matched.get("match_candidates"), list)
+
+    def test_invalidate_music_association_for_album_removes_aliases_and_override(self):
+        uploader.update_music_association(
+            {
+                "music_session_key": "session-1",
+                "artist": "Childish Gambino",
+                "album": '"Awaken, My Love!"',
+                "key_source": "sonos",
+            },
+            cache_key="itc_123",
+            catalog_key="123__3840x2160.jpg",
+            content_id="MY_F123",
+            verified=True,
+            source_quality="trusted_cache",
+        )
+        uploader.set_music_override_for_album(
+            artist="Childish Gambino",
+            album='"Awaken, My Love!"',
+            catalog_key="123__3840x2160.jpg",
+            reason="manual",
+        )
+
+        cleared = uploader.invalidate_music_association_for_album(
+            artist="Childish Gambino",
+            album='"Awaken, My Love!"',
+            collection_id=123,
+            cache_key="itc_123",
+        )
+
+        self.assertTrue(cleared)
+        assoc = json.loads(self.assoc.read_text(encoding="utf-8"))
+        self.assertEqual({}, assoc["entries"])
+        overrides = json.loads(self.overrides.read_text(encoding="utf-8"))
+        self.assertEqual({}, overrides["entries"])
 
     def test_update_music_index_entry_uses_collection_id_key(self):
         wide = self.root / "1440795324__3840x2160.jpg"

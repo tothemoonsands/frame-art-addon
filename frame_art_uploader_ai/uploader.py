@@ -1434,6 +1434,23 @@ def lookup_music_override(artist: str, album: str) -> Optional[dict[str, Any]]:
     }
 
 
+def clear_music_override_for_album(*, artist: str, album: str) -> bool:
+    album_norm = normalized_album_association(artist, album)
+    if not album_norm:
+        return False
+    catalog = load_music_overrides()
+    entries = catalog.get("entries") if isinstance(catalog.get("entries"), dict) else {}
+    if not isinstance(entries, dict):
+        return False
+    key = f"album_norm::{album_norm}"
+    if key not in entries:
+        return False
+    del entries[key]
+    catalog["entries"] = entries
+    persist_music_overrides(catalog)
+    return True
+
+
 def canonical_music_artist(artist: str) -> str:
     raw = str(artist or "").strip()
     if not raw:
@@ -2113,7 +2130,7 @@ def lookup_music_association_fuzzy(restore_payload: dict[str, Any]) -> Optional[
         )
 
     best_margin = best_score - second_best_score if second_best_score > 0.0 else best_score
-    cache_reuse_recommended = best_score >= 0.76 and (best_margin >= 0.04 or second_best_score == 0.0)
+    cache_reuse_recommended = best_score >= 0.74 and (best_margin >= 0.03 or second_best_score == 0.0)
     if best_score < 0.70:
         return None
 
@@ -2202,6 +2219,74 @@ def should_reuse_music_association(record: dict[str, Any]) -> bool:
         return True
     if match_source in {"manual_override", "collection_id_catalog_exact", "index_text_key_exact", "fresh_generation"}:
         return True
+    return True
+
+
+def invalidate_music_association_for_album(
+    *,
+    artist: str,
+    album: str,
+    collection_id: Optional[int] = None,
+    cache_key: str = "",
+) -> bool:
+    assoc = load_frame_art_catalog(MUSIC_ASSOCIATIONS_PATH)
+    entries = assoc.get("entries") if isinstance(assoc.get("entries"), dict) else {}
+    if not isinstance(entries, dict) or not entries:
+        cleared_override = clear_music_override_for_album(artist=artist, album=album)
+        return cleared_override
+
+    album_norm = normalized_album_association(artist, album)
+    target_cache_key = str(cache_key or "").strip()
+    target_collection_id = collection_id if isinstance(collection_id, int) else None
+
+    aliases_to_remove: set[str] = set()
+    dedupe_targets: set[tuple[str, str, Any]] = set()
+
+    for alias, raw_record in entries.items():
+        if not isinstance(alias, str) or not isinstance(raw_record, dict):
+            continue
+        rec_artist = str(raw_record.get("artist", "")).strip()
+        rec_album = str(raw_record.get("album", "")).strip()
+        rec_album_norm = normalized_album_association(rec_artist, rec_album)
+        rec_cache_key = str(raw_record.get("cache_key", "")).strip()
+        rec_collection_id = raw_record.get("collection_id")
+
+        matches_album = bool(album_norm and rec_album_norm == album_norm)
+        matches_cache = bool(target_cache_key and rec_cache_key == target_cache_key)
+        matches_collection = bool(target_collection_id is not None and rec_collection_id == target_collection_id)
+        if not (matches_album or matches_cache or matches_collection):
+            continue
+
+        aliases_to_remove.add(alias)
+        dedupe_targets.add(
+            (
+                rec_cache_key,
+                str(raw_record.get("catalog_key", "")).strip(),
+                rec_collection_id,
+            )
+        )
+
+    if dedupe_targets:
+        for alias, raw_record in entries.items():
+            if not isinstance(alias, str) or not isinstance(raw_record, dict):
+                continue
+            dedupe_key = (
+                str(raw_record.get("cache_key", "")).strip(),
+                str(raw_record.get("catalog_key", "")).strip(),
+                raw_record.get("collection_id"),
+            )
+            if dedupe_key in dedupe_targets:
+                aliases_to_remove.add(alias)
+
+    if not aliases_to_remove:
+        return clear_music_override_for_album(artist=artist, album=album)
+
+    for alias in aliases_to_remove:
+        entries.pop(alias, None)
+
+    assoc["entries"] = entries
+    persist_frame_art_catalog(MUSIC_ASSOCIATIONS_PATH, assoc)
+    clear_music_override_for_album(artist=artist, album=album)
     return True
 
 
@@ -3222,11 +3307,21 @@ def main() -> None:
                     followup_kind = "none"
                     if action == "regen_now":
                         association_record = lookup_music_association(restore_payload)
+                        assoc_collection_id = None
+                        assoc_cache_key = ""
                         if isinstance(association_record, dict):
                             stale_catalog_key = str(association_record.get("catalog_key", "")).strip()
                             stale_content_id = str(association_record.get("content_id", "")).strip()
+                            assoc_collection_id = parse_collection_id_value(association_record.get("collection_id"))
+                            assoc_cache_key = str(association_record.get("cache_key", "")).strip()
                             if stale_catalog_key and stale_content_id:
                                 invalidate_music_cached_content_id(stale_catalog_key, stale_content_id)
+                        invalidate_music_association_for_album(
+                            artist=artist,
+                            album=album,
+                            collection_id=parse_collection_id_value(restore_payload.get("collection_id")) or assoc_collection_id,
+                            cache_key=str(restore_payload.get("cache_key", "")).strip() or assoc_cache_key,
+                        )
                         followup_payload = build_music_request_from_feedback(restore_payload, show=show_flag, force_regen=True)
                         enqueue_restore_payload(followup_payload)
                         followup_kind = "cover_art_reference_background"
@@ -3384,8 +3479,11 @@ def main() -> None:
                         music_retry_upload_path = None
                         wide_path = Path("__force_regen__")
 
+                    has_manual_artwork_url = bool(source_url)
+
                     reuse_cached_association = (
                         not force_regen
+                        and not has_manual_artwork_url
                         and isinstance(association_record, dict)
                         and should_reuse_music_association(association_record)
                     )
