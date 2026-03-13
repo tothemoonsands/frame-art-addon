@@ -1296,6 +1296,34 @@ class MusicAssociationLookupTests(unittest.TestCase):
         self.assertEqual("milt jackson — sunflower 40th anniversary edition", index["entries"][entry_key]["text_key"])
         self.assertEqual("MY_F2002", index["entries"][entry_key]["content_id"])
 
+    def test_update_music_index_entry_persists_source_background_and_artwork_url(self):
+        source = self.root / "source.jpg"
+        background = self.root / "background.png"
+        wide = self.root / "aa_childish-gambino-awaken_254d4073__3840x2160.jpg"
+        source.write_bytes(b"s")
+        background.write_bytes(b"b")
+        wide.write_bytes(b"x")
+        uploader.update_music_index_entry(
+            artist="Childish Gambino",
+            album='"Awaken, My Love!"',
+            collection_id=None,
+            catalog_key=wide.name,
+            cache_key="aa_childish-gambino-awaken_254d4073",
+            content_id="MY_F2003",
+            wide_path=wide,
+            compressed_path=wide,
+            request_id="req_manual",
+            source_path=source,
+            background_path=background,
+            artwork_url="https://a5.mzstatic.com/us/r1000/0/Music211/v4/example/cover.jpg",
+        )
+        index = json.loads(self.index.read_text(encoding="utf-8"))
+        entry = index["entries"]["aa_childish-gambino-awaken_254d4073"]
+        self.assertEqual(str(source), entry["source_path"])
+        self.assertEqual(str(source), entry["source_art_path"])
+        self.assertEqual(str(background), entry["background_output_path"])
+        self.assertEqual("https://a5.mzstatic.com/us/r1000/0/Music211/v4/example/cover.jpg", entry["artwork_url"])
+
     def test_update_music_index_entry_skips_invalid_json_without_overwrite(self):
         self.index.write_text("{not-json", encoding="utf-8")
         original = self.index.read_text(encoding="utf-8")

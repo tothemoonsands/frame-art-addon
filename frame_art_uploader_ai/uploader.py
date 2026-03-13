@@ -83,7 +83,7 @@ MUSIC_RESTORE_KINDS = {"cover_art_reference_background", "cover_art_outpaint"}
 MUSIC_ASSOCIATION_SESSION_TTL_DAYS = 0
 
 RUNTIME_OPTIONS: dict[str, Any] = {}
-ADDON_VERSION = "1.21"
+ADDON_VERSION = "1.22"
 HOLIDAY_ALIASES = {
     "football": "huskers",
 }
@@ -1985,6 +1985,9 @@ def update_music_index_entry(
     wide_path: Path,
     compressed_path: Path,
     request_id: Optional[str],
+    source_path: Optional[Path] = None,
+    background_path: Optional[Path] = None,
+    artwork_url: str = "",
 ) -> None:
     index_path = select_music_index_write_path()
     catalog, is_valid = load_frame_art_catalog_with_validity(index_path)
@@ -2013,6 +2016,16 @@ def update_music_index_entry(
     payload["prompt_variant"] = "reference_background_nomask"
     payload["output_path"] = str(wide_path)
     payload["compressed_output_path"] = str(compressed_path)
+    source_path_str = str(source_path).strip() if source_path else ""
+    if source_path_str:
+        payload["source_path"] = source_path_str
+        payload["source_art_path"] = source_path_str
+    background_path_str = str(background_path).strip() if background_path else ""
+    if background_path_str:
+        payload["background_output_path"] = background_path_str
+    normalized_artwork_url = normalize_remote_artwork_url(artwork_url)
+    if normalized_artwork_url:
+        payload["artwork_url"] = normalized_artwork_url
     if request_id:
         payload["request_id"] = request_id
     payload["updated_at"] = datetime.now(timezone.utc).isoformat()
@@ -3966,6 +3979,9 @@ def main() -> None:
                                 wide_path=wide_path,
                                 compressed_path=compressed_jpg_path if compressed_jpg_path.exists() else wide_path,
                                 request_id=request_id,
+                                source_path=src_path if src_path.exists() else None,
+                                background_path=background_path if background_path.exists() else None,
+                                artwork_url=source_url,
                             )
                             pick_source = generation_mode
                             log_music_generation_step(
