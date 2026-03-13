@@ -1283,6 +1283,28 @@ class MusicAssociationLookupTests(unittest.TestCase):
         self.assertEqual(1.0, record.get("cache_reuse_confidence"))
         self.assertTrue(uploader.should_reuse_music_association(record))
 
+    def test_should_refresh_music_source_art_for_force_regen(self):
+        self.assertTrue(
+            uploader.should_refresh_music_source_art(
+                force_regen=True,
+                source_preference="",
+            )
+        )
+
+    def test_should_refresh_music_source_art_for_itunes_preference(self):
+        self.assertTrue(
+            uploader.should_refresh_music_source_art(
+                force_regen=False,
+                source_preference="itunes",
+            )
+        )
+        self.assertFalse(
+            uploader.should_refresh_music_source_art(
+                force_regen=False,
+                source_preference="",
+            )
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

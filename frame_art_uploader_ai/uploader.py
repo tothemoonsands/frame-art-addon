@@ -82,7 +82,7 @@ MUSIC_RESTORE_KINDS = {"cover_art_reference_background", "cover_art_outpaint"}
 MUSIC_ASSOCIATION_SESSION_TTL_DAYS = 0
 
 RUNTIME_OPTIONS: dict[str, Any] = {}
-ADDON_VERSION = "1.15"
+ADDON_VERSION = "1.16"
 HOLIDAY_ALIASES = {
     "football": "huskers",
 }
@@ -2202,6 +2202,12 @@ def should_reuse_music_association(record: dict[str, Any]) -> bool:
     return True
 
 
+def should_refresh_music_source_art(*, force_regen: bool, source_preference: str) -> bool:
+    if force_regen:
+        return True
+    return str(source_preference or "").strip().lower() == "itunes"
+
+
 def update_music_association(
     restore_payload: dict[str, Any],
     *,
@@ -3261,6 +3267,7 @@ def main() -> None:
                 elif kind in {"cover_art_reference_background", "cover_art_outpaint"}:
                     ensure_dirs()
                     source_url = str(restore_payload.get("artwork_url", "")).strip()
+                    source_preference = str(restore_payload.get("source_preference", "")).strip().lower()
                     artist = str(restore_payload.get("artist", "")).strip()
                     album = str(restore_payload.get("album", "")).strip()
                     track = str(restore_payload.get("track", "")).strip()
@@ -3504,6 +3511,7 @@ def main() -> None:
                         log_music_generation_step(
                             "start",
                             force_regen=force_regen,
+                            source_preference=source_preference,
                             source_exists=src_path.exists(),
                             source_url_provided=bool(source_url),
                         )
@@ -3527,7 +3535,19 @@ def main() -> None:
                                     cache_reuse_confidence=association_record.get("cache_reuse_confidence"),
                                 )
 
-                            if not src_path.exists():
+                            refresh_source_art = should_refresh_music_source_art(
+                                force_regen=force_regen,
+                                source_preference=source_preference,
+                            )
+                            if refresh_source_art and src_path.exists():
+                                src_path.unlink(missing_ok=True)
+                                log_music_generation_step(
+                                    "source_art_reset",
+                                    reason="force_regen" if force_regen else "source_preference_itunes",
+                                    source_path=str(src_path),
+                                )
+
+                            if not src_path.exists() and not refresh_source_art:
                                 stage_started_at = time.perf_counter()
                                 log_music_generation_step("stage_source_from_index_start")
                                 maybe_stage_source_art_from_index(
