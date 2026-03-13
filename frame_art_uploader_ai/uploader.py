@@ -3491,6 +3491,28 @@ def main() -> None:
                     track = str(restore_payload.get("track", "")).strip()
                     force_regen = bool(restore_payload.get("force_regen", False))
                     force_new_background = bool(restore_payload.get("force_new_background", False))
+                    if source_url:
+                        parsed_source_url = urlparse(source_url)
+                        log_event(
+                            "music_request_source_url_present",
+                            kind=kind,
+                            artist=artist,
+                            album=album,
+                            force_regen=force_regen,
+                            force_new_background=force_new_background,
+                            source_url_host=parsed_source_url.netloc,
+                            source_url_length=len(source_url),
+                        )
+                    else:
+                        log_event(
+                            "music_request_source_url_missing",
+                            kind=kind,
+                            artist=artist,
+                            album=album,
+                            force_regen=force_regen,
+                            force_new_background=force_new_background,
+                            payload_keys=sorted(str(k) for k in restore_payload.keys()),
+                        )
 
                     def _maybe_float(value: Any) -> Optional[float]:
                         if value in (None, ""):
