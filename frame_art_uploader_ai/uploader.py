@@ -83,7 +83,7 @@ MUSIC_RESTORE_KINDS = {"cover_art_reference_background", "cover_art_outpaint"}
 MUSIC_ASSOCIATION_SESSION_TTL_DAYS = 0
 
 RUNTIME_OPTIONS: dict[str, Any] = {}
-ADDON_VERSION = "1.18"
+ADDON_VERSION = "1.19"
 HOLIDAY_ALIASES = {
     "football": "huskers",
 }
@@ -721,6 +721,7 @@ def parse_restore_request_payload(payload: Any) -> tuple[Optional[dict], Optiona
             except Exception:
                 normalized["collection_id"] = None
         normalized["force_regen"] = bool(payload.get("force_regen", False))
+        normalized["force_new_background"] = bool(payload.get("force_new_background", False))
 
     if kind == "music_feedback":
         if requested_show is None:
@@ -2623,6 +2624,8 @@ def resolve_music_catalog_path(catalog_key: str) -> Optional[Path]:
 
 def build_music_request_from_feedback(payload: dict[str, Any], *, show: bool, force_regen: bool = False) -> dict[str, Any]:
     artwork_url = normalize_remote_artwork_url(payload.get("artwork_url"))
+    action = str(payload.get("action", "")).strip().lower()
+    force_new_background = action == "regen_background"
     return {
         "kind": "cover_art_reference_background",
         "requested_at": datetime.now(timezone.utc).isoformat(),
@@ -2634,10 +2637,11 @@ def build_music_request_from_feedback(payload: dict[str, Any], *, show: bool, fo
         "track": str(payload.get("track", "")).strip(),
         "key_source": str(payload.get("key_source", "")).strip().lower(),
         "shazam_key": str(payload.get("shazam_key", "")).strip(),
-        "collection_id": None if artwork_url else parse_collection_id_value(payload.get("collection_id")),
-        "artwork_url": artwork_url,
+        "collection_id": None if (artwork_url or force_new_background) else parse_collection_id_value(payload.get("collection_id")),
+        "artwork_url": "" if force_new_background else artwork_url,
         "source_preference": "itunes",
         "force_regen": force_regen,
+        "force_new_background": force_new_background,
     }
 
 
@@ -3360,6 +3364,10 @@ def main() -> None:
                         followup_payload = build_music_request_from_feedback(restore_payload, show=show_flag, force_regen=True)
                         enqueue_restore_payload(followup_payload)
                         followup_kind = "cover_art_reference_background"
+                    elif action == "regen_background":
+                        followup_payload = build_music_request_from_feedback(restore_payload, show=show_flag, force_regen=False)
+                        enqueue_restore_payload(followup_payload)
+                        followup_kind = "cover_art_reference_background"
                     elif action == "use_candidate_now":
                         if not candidate_catalog_key:
                             raise ValueError("music_feedback use_candidate_now requires candidate_catalog_key")
@@ -3406,6 +3414,7 @@ def main() -> None:
                     album = str(restore_payload.get("album", "")).strip()
                     track = str(restore_payload.get("track", "")).strip()
                     force_regen = bool(restore_payload.get("force_regen", False))
+                    force_new_background = bool(restore_payload.get("force_new_background", False))
                     manual_artwork_url_provided = bool(source_url)
 
                     def _maybe_float(value: Any) -> Optional[float]:
@@ -3527,6 +3536,7 @@ def main() -> None:
 
                     reuse_cached_association = (
                         not force_regen
+                        and not force_new_background
                         and not has_manual_artwork_url
                         and isinstance(association_record, dict)
                         and should_reuse_music_association(association_record)
@@ -3657,6 +3667,7 @@ def main() -> None:
                         log_music_generation_step(
                             "start",
                             force_regen=force_regen,
+                            force_new_background=force_new_background,
                             source_preference=source_preference,
                             source_exists=src_path.exists(),
                             source_url_provided=bool(source_url),
@@ -3681,9 +3692,12 @@ def main() -> None:
                                     cache_reuse_confidence=association_record.get("cache_reuse_confidence"),
                                 )
 
-                            refresh_source_art = bool(source_url) or should_refresh_music_source_art(
+                            refresh_source_art = bool(source_url) or (
+                                not force_new_background
+                                and should_refresh_music_source_art(
                                 force_regen=force_regen,
                                 source_preference=source_preference,
+                                )
                             )
                             if refresh_source_art and src_path.exists():
                                 src_path.unlink(missing_ok=True)

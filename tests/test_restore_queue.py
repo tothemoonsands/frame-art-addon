@@ -204,6 +204,19 @@ class RestoreQueueTests(unittest.TestCase):
         self.assertEqual("MY_F42", normalized["current_content_id"])
         self.assertEqual("https://example.com/cover.jpg", normalized["artwork_url"])
 
+    def test_parse_cover_art_request_includes_force_new_background(self):
+        payload = {
+            "kind": "cover_art_reference_background",
+            "requested_at": datetime.now(timezone.utc).isoformat(),
+            "artist": "Artist",
+            "album": "Album",
+            "force_new_background": True,
+        }
+        normalized, requested_show, err = uploader.parse_restore_request_payload(payload)
+        self.assertIsNone(err)
+        self.assertTrue(requested_show)
+        self.assertTrue(normalized["force_new_background"])
+
     def test_manual_override_preferred_for_lookup(self):
         ok = uploader.set_music_override_for_album(
             artist="The Artist",
@@ -1159,6 +1172,23 @@ class MusicAssociationLookupTests(unittest.TestCase):
         )
         self.assertIsNone(request["collection_id"])
         self.assertTrue(request["artwork_url"].startswith("https://"))
+
+    def test_build_music_request_from_feedback_for_regen_background_preserves_source(self):
+        request = uploader.build_music_request_from_feedback(
+            {
+                "action": "regen_background",
+                "artist": "Childish Gambino",
+                "album": '"Awaken, My Love!"',
+                "collection_id": 123,
+                "artwork_url": "https://a5.mzstatic.com/us/r1000/0/Music211/v4/f1/3c/d7/f13cd7ab-7319-028a-8807-5991d0b308d4/0044003187658_Cover.jpg",
+            },
+            show=True,
+            force_regen=False,
+        )
+        self.assertTrue(request["force_new_background"])
+        self.assertFalse(request["force_regen"])
+        self.assertIsNone(request["collection_id"])
+        self.assertEqual("", request["artwork_url"])
 
     def test_fuzzy_ambiguous_returns_regenerate_recommendation(self):
         uploader.atomic_write_json(
