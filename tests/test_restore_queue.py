@@ -1087,7 +1087,8 @@ class MusicAssociationLookupTests(unittest.TestCase):
         )
 
         self.assertIsInstance(matched, dict)
-        self.assertTrue(matched.get("generation_blocked"))
+        self.assertFalse(matched.get("cache_reuse_recommended"))
+        self.assertGreaterEqual(float(matched.get("cache_reuse_confidence", 0.0)), 0.70)
 
     def test_lookup_prefers_collection_id_numeric_catalog_match(self):
         uploader.atomic_write_json(
@@ -1115,7 +1116,7 @@ class MusicAssociationLookupTests(unittest.TestCase):
         self.assertEqual("1497226866__3840x2160.jpg", matched.get("catalog_key"))
         self.assertEqual("MY_F1362", matched.get("content_id"))
 
-    def test_fuzzy_ambiguous_returns_generation_block(self):
+    def test_fuzzy_ambiguous_returns_regenerate_recommendation(self):
         uploader.atomic_write_json(
             self.catalog,
             {
@@ -1141,8 +1142,8 @@ class MusicAssociationLookupTests(unittest.TestCase):
             }
         )
         self.assertIsInstance(matched, dict)
-        self.assertTrue(matched.get("generation_blocked"))
-        self.assertEqual("fuzzy_ambiguous_blocked", matched.get("match_source"))
+        self.assertFalse(matched.get("cache_reuse_recommended"))
+        self.assertEqual("fuzzy_ambiguous_regenerate", matched.get("cache_reuse_reason"))
         self.assertIsInstance(matched.get("match_candidates"), list)
 
     def test_update_music_index_entry_uses_collection_id_key(self):
@@ -1256,6 +1257,31 @@ class MusicAssociationLookupTests(unittest.TestCase):
         self.assertIn("session::What Kinda Music", entries)
         self.assertNotIn("album::Tom Misch & Yussef Dayes — What Kinda Music", entries)
         self.assertNotIn("album_loose::tom misch yussef dayes what kinda music", entries)
+
+    def test_generated_music_association_is_preferred_for_future_reuse(self):
+        uploader.update_music_association(
+            {
+                "music_session_key": "Sunflower Session",
+                "artist": "Milt Jackson",
+                "album": "Sunflower",
+                "key_source": "sonos",
+            },
+            cache_key="sunflower_k1",
+            catalog_key="aa_milt-jackson-sunflower_deadbeef__3840x2160.jpg",
+            content_id="MY_F3003",
+            verified=False,
+            source_quality="generated",
+            match_source="fresh_generation",
+            match_confidence=1.0,
+            cache_reuse_confidence=1.0,
+            cache_reuse_recommended=True,
+        )
+
+        assoc = json.loads(self.assoc.read_text(encoding="utf-8"))
+        record = assoc["entries"]["album_norm::milt jackson sunflower"]
+        self.assertTrue(record.get("cache_reuse_recommended"))
+        self.assertEqual(1.0, record.get("cache_reuse_confidence"))
+        self.assertTrue(uploader.should_reuse_music_association(record))
 
 
 if __name__ == "__main__":

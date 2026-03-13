@@ -82,7 +82,7 @@ MUSIC_RESTORE_KINDS = {"cover_art_reference_background", "cover_art_outpaint"}
 MUSIC_ASSOCIATION_SESSION_TTL_DAYS = 0
 
 RUNTIME_OPTIONS: dict[str, Any] = {}
-ADDON_VERSION = "1.14"
+ADDON_VERSION = "1.15"
 HOLIDAY_ALIASES = {
     "football": "huskers",
 }
@@ -1170,6 +1170,7 @@ def parse_iso_timestamp(value: Any) -> Optional[datetime]:
 
 
 def music_association_record_rank(record: dict[str, Any]) -> tuple[int, int, float]:
+    cache_reuse_rank = 1 if bool(record.get("cache_reuse_recommended", False)) else 0
     verified_rank = 1 if bool(record.get("verified", False)) else 0
     quality = str(record.get("source_quality", "")).strip().lower()
     if quality == "trusted_cache":
@@ -1178,9 +1179,14 @@ def music_association_record_rank(record: dict[str, Any]) -> tuple[int, int, flo
         quality_rank = 1
     else:
         quality_rank = 0
+    confidence_rank = 0.0
+    try:
+        confidence_rank = float(record.get("cache_reuse_confidence", record.get("match_confidence", 0.0)) or 0.0)
+    except Exception:
+        confidence_rank = 0.0
     updated_dt = parse_iso_timestamp(record.get("updated_at"))
     updated_rank = updated_dt.timestamp() if updated_dt else 0.0
-    return verified_rank, quality_rank, updated_rank
+    return cache_reuse_rank, verified_rank, quality_rank, confidence_rank, updated_rank
 
 
 def choose_music_association_record(existing: dict[str, Any], candidate: dict[str, Any]) -> dict[str, Any]:
@@ -1213,6 +1219,11 @@ def compact_music_association_entries(
         record.setdefault("collection_id", None)
         record.setdefault("verified", False)
         record.setdefault("source_quality", "generated")
+        record.setdefault("match_source", "")
+        record.setdefault("match_confidence", 0.0)
+        record.setdefault("second_match_confidence", 0.0)
+        record.setdefault("cache_reuse_confidence", record.get("match_confidence", 0.0))
+        record.setdefault("cache_reuse_recommended", False)
         record.setdefault("updated_at", "")
 
         signature = (
@@ -1415,6 +1426,8 @@ def lookup_music_override(artist: str, album: str) -> Optional[dict[str, Any]]:
         "content_id": content_id,
         "artist": artist,
         "album": album,
+        "cache_reuse_confidence": 1.0,
+        "cache_reuse_recommended": True,
         "match_confidence": 1.0,
         "match_source": "manual_override",
     }
@@ -1826,6 +1839,8 @@ def find_exact_music_index_match(artist: str, album: str) -> Optional[dict[str, 
             "content_id": str(index_item.get("content_id", "")).strip(),
             "artist": artist,
             "album": album,
+            "cache_reuse_confidence": 1.0,
+            "cache_reuse_recommended": True,
             "match_confidence": 1.0,
             "match_source": "index_text_key_exact",
         }
@@ -1870,6 +1885,8 @@ def find_music_match_by_collection_id(collection_id: Optional[int]) -> Optional[
                 "catalog_key": name,
                 "content_id": content_id,
                 "collection_id": collection_id,
+                "cache_reuse_confidence": 1.0,
+                "cache_reuse_recommended": True,
                 "match_confidence": 1.0,
                 "match_source": "collection_id_catalog_exact",
             }
@@ -2092,22 +2109,23 @@ def lookup_music_association_fuzzy(restore_payload: dict[str, Any]) -> Optional[
             }
         )
 
-    if best_score >= 0.78 and (best_score - second_best_score >= 0.05 or second_best_score == 0.0):
-        best_record["match_candidates"] = top_candidates
-        return best_record
+    best_margin = best_score - second_best_score if second_best_score > 0.0 else best_score
+    cache_reuse_recommended = best_score >= 0.82 and (best_margin >= 0.05 or second_best_score == 0.0)
+    if best_score < 0.70:
+        return None
 
-    if best_score >= 0.74 and second_best_score >= 0.70 and (best_score - second_best_score) < 0.05:
-        return {
-            "generation_blocked": True,
-            "match_source": "fuzzy_ambiguous_blocked",
-            "match_confidence": round(best_score, 4),
-            "second_match_confidence": round(second_best_score, 4),
-            "match_candidates": top_candidates,
-            "artist": artist,
-            "album": album,
-        }
-
-    return None
+    best_record["match_candidates"] = top_candidates
+    best_record["second_match_confidence"] = round(second_best_score, 4)
+    best_record["cache_reuse_confidence"] = round(best_score, 4)
+    best_record["cache_reuse_margin"] = round(best_margin, 4)
+    best_record["cache_reuse_recommended"] = cache_reuse_recommended
+    if cache_reuse_recommended:
+        best_record["cache_reuse_reason"] = "fuzzy_confident"
+    elif second_best_score >= 0.70 and best_margin < 0.05:
+        best_record["cache_reuse_reason"] = "fuzzy_ambiguous_regenerate"
+    else:
+        best_record["cache_reuse_reason"] = "fuzzy_low_confidence_regenerate"
+    return best_record
 
 
 def lookup_music_association(restore_payload: dict[str, Any]) -> Optional[dict[str, Any]]:
@@ -2167,6 +2185,23 @@ def lookup_music_association(restore_payload: dict[str, Any]) -> Optional[dict[s
     return lookup_music_association_fuzzy(restore_payload)
 
 
+def should_reuse_music_association(record: dict[str, Any]) -> bool:
+    if not isinstance(record, dict):
+        return False
+    if bool(record.get("generation_blocked", False)):
+        return False
+    if "cache_reuse_recommended" in record:
+        return bool(record.get("cache_reuse_recommended", False))
+
+    quality = str(record.get("source_quality", "")).strip().lower()
+    match_source = str(record.get("match_source", "")).strip().lower()
+    if quality == "generated":
+        return True
+    if match_source in {"manual_override", "collection_id_catalog_exact", "index_text_key_exact", "fresh_generation"}:
+        return True
+    return True
+
+
 def update_music_association(
     restore_payload: dict[str, Any],
     *,
@@ -2175,6 +2210,11 @@ def update_music_association(
     content_id: str,
     verified: Optional[bool] = None,
     source_quality: Optional[str] = None,
+    match_source: Optional[str] = None,
+    match_confidence: Optional[float] = None,
+    second_match_confidence: Optional[float] = None,
+    cache_reuse_confidence: Optional[float] = None,
+    cache_reuse_recommended: Optional[bool] = None,
 ) -> None:
     catalog = load_frame_art_catalog(MUSIC_ASSOCIATIONS_PATH)
     entries = catalog.setdefault("entries", {})
@@ -2201,6 +2241,19 @@ def update_music_association(
         "collection_id": collection_id if isinstance(collection_id, int) else None,
         "verified": verified_flag,
         "source_quality": quality,
+        "match_source": str(match_source or "").strip(),
+        "match_confidence": float(match_confidence) if match_confidence is not None else (1.0 if quality == "generated" else 0.0),
+        "second_match_confidence": float(second_match_confidence) if second_match_confidence is not None else 0.0,
+        "cache_reuse_confidence": (
+            float(cache_reuse_confidence)
+            if cache_reuse_confidence is not None
+            else (float(match_confidence) if match_confidence is not None else (1.0 if quality == "generated" else 0.0))
+        ),
+        "cache_reuse_recommended": (
+            bool(cache_reuse_recommended)
+            if cache_reuse_recommended is not None
+            else (quality == "generated" or verified_flag)
+        ),
         "updated_at": datetime.now(timezone.utc).isoformat(),
     }
 
@@ -3016,6 +3069,9 @@ def main() -> None:
                 match_source_for_status: Optional[str] = None
                 match_confidence_for_status: Optional[float] = None
                 second_match_confidence_for_status: Optional[float] = None
+                cache_reuse_confidence_for_status: Optional[float] = None
+                cache_reuse_recommended_for_status: Optional[bool] = None
+                cache_reuse_reason_for_status: Optional[str] = None
                 pending_pick_last_applied: Optional[str] = None
 
                 if kind == "content_id":
@@ -3223,10 +3279,16 @@ def main() -> None:
                         match_source_for_status = str(association_record.get("match_source", "exact"))
                         match_confidence_for_status = _maybe_float(association_record.get("match_confidence"))
                         second_match_confidence_for_status = _maybe_float(association_record.get("second_match_confidence"))
+                        cache_reuse_confidence_for_status = _maybe_float(association_record.get("cache_reuse_confidence"))
+                        if "cache_reuse_recommended" in association_record:
+                            cache_reuse_recommended_for_status = bool(association_record.get("cache_reuse_recommended"))
+                        cache_reuse_reason_for_status = str(association_record.get("cache_reuse_reason", "")).strip() or None
                         log_event(
                             "music_association_hit",
                             match_source=str(association_record.get("match_source", "exact")),
                             match_confidence=association_record.get("match_confidence"),
+                            cache_reuse_confidence=association_record.get("cache_reuse_confidence"),
+                            cache_reuse_recommended=association_record.get("cache_reuse_recommended"),
                             catalog_key=association_record.get("catalog_key"),
                             cache_key=association_record.get("cache_key"),
                             content_id=association_record.get("content_id"),
@@ -3239,7 +3301,7 @@ def main() -> None:
                             log_event(
                                 "music_match_candidates",
                                 candidates=match_candidates,
-                                blocked=bool(association_record.get("generation_blocked", False)),
+                                cache_reuse_recommended=bool(association_record.get("cache_reuse_recommended", False)),
                             )
                     collection_id_raw = restore_payload.get("collection_id")
                     collection_id: Optional[int] = None
@@ -3311,7 +3373,13 @@ def main() -> None:
                         music_retry_upload_path = None
                         wide_path = Path("__force_regen__")
 
-                    if wide_path.exists():
+                    reuse_cached_association = (
+                        not force_regen
+                        and isinstance(association_record, dict)
+                        and should_reuse_music_association(association_record)
+                    )
+
+                    if wide_path.exists() and reuse_cached_association:
                         catalog_key = music_catalog_key_for_path(wide_path)
                         music_retry_catalog_key = catalog_key
                         cached_content_id = lookup_catalog_content_id(MUSIC_CATALOG_PATH, catalog_key)
@@ -3331,6 +3399,11 @@ def main() -> None:
                                 content_id=target_cid,
                                 verified=True,
                                 source_quality="trusted_cache",
+                                match_source=str(association_record.get("match_source", "catalog_cache_reuse")) if isinstance(association_record, dict) else "catalog_cache_reuse",
+                                match_confidence=match_confidence_for_status,
+                                second_match_confidence=second_match_confidence_for_status,
+                                cache_reuse_confidence=cache_reuse_confidence_for_status,
+                                cache_reuse_recommended=True,
                             )
                             update_music_index_entry(
                                 artist=artist,
@@ -3356,6 +3429,11 @@ def main() -> None:
                                 content_id=target_cid,
                                 verified=True,
                                 source_quality="trusted_cache",
+                                match_source=str(association_record.get("match_source", "catalog_cache_reuse")) if isinstance(association_record, dict) else "catalog_cache_reuse",
+                                match_confidence=match_confidence_for_status,
+                                second_match_confidence=second_match_confidence_for_status,
+                                cache_reuse_confidence=cache_reuse_confidence_for_status,
+                                cache_reuse_recommended=True,
                             )
                             update_music_index_entry(
                                 artist=artist,
@@ -3384,6 +3462,11 @@ def main() -> None:
                                 content_id=target_cid,
                                 verified=True,
                                 source_quality="trusted_cache",
+                                match_source=str(association_record.get("match_source", "catalog_cache_reuse")) if isinstance(association_record, dict) else "catalog_cache_reuse",
+                                match_confidence=match_confidence_for_status,
+                                second_match_confidence=second_match_confidence_for_status,
+                                cache_reuse_confidence=cache_reuse_confidence_for_status,
+                                cache_reuse_recommended=True,
                             )
                             update_music_index_entry(
                                 artist=artist,
@@ -3425,23 +3508,24 @@ def main() -> None:
                             source_url_provided=bool(source_url),
                         )
                         try:
-                            if isinstance(association_record, dict) and bool(association_record.get("generation_blocked", False)):
+                            if isinstance(association_record, dict) and not should_reuse_music_association(association_record):
                                 log_event(
-                                    "music_generation_blocked",
-                                    reason="ambiguous_match",
+                                    "music_cache_reuse_skipped",
+                                    reason=str(association_record.get("cache_reuse_reason", "")).strip() or "low_confidence",
                                     match_source=association_record.get("match_source"),
                                     match_confidence=association_record.get("match_confidence"),
                                     second_match_confidence=association_record.get("second_match_confidence"),
+                                    cache_reuse_confidence=association_record.get("cache_reuse_confidence"),
                                     candidates=association_record.get("match_candidates"),
                                 )
                                 log_music_generation_step(
-                                    "blocked",
-                                    reason="ambiguous_match",
+                                    "cache_reuse_skipped",
+                                    reason=str(association_record.get("cache_reuse_reason", "")).strip() or "low_confidence",
                                     match_source=association_record.get("match_source"),
                                     match_confidence=association_record.get("match_confidence"),
                                     second_match_confidence=association_record.get("second_match_confidence"),
+                                    cache_reuse_confidence=association_record.get("cache_reuse_confidence"),
                                 )
-                                raise ValueError("Ambiguous music match; generation blocked to prevent duplicate cache entries")
 
                             if not src_path.exists():
                                 stage_started_at = time.perf_counter()
@@ -3659,6 +3743,11 @@ def main() -> None:
                                 content_id=target_cid,
                                 verified=False,
                                 source_quality="generated",
+                                match_source="fresh_generation",
+                                match_confidence=1.0,
+                                second_match_confidence=0.0,
+                                cache_reuse_confidence=1.0,
+                                cache_reuse_recommended=True,
                             )
                             update_music_index_entry(
                                 artist=artist,
@@ -3820,6 +3909,11 @@ def main() -> None:
                                     content_id=replacement_cid,
                                     verified=True,
                                     source_quality="trusted_cache",
+                                    match_source=match_source_for_status or "catalog_cache_reuse",
+                                    match_confidence=match_confidence_for_status,
+                                    second_match_confidence=second_match_confidence_for_status,
+                                    cache_reuse_confidence=cache_reuse_confidence_for_status,
+                                    cache_reuse_recommended=True,
                                 )
                                 update_music_index_entry(
                                     artist=artist,
@@ -3928,6 +4022,9 @@ def main() -> None:
                         "match_source": match_source_for_status,
                         "match_confidence": match_confidence_for_status,
                         "second_match_confidence": second_match_confidence_for_status,
+                        "cache_reuse_confidence": cache_reuse_confidence_for_status,
+                        "cache_reuse_recommended": cache_reuse_recommended_for_status,
+                        "cache_reuse_reason": cache_reuse_reason_for_status,
                         "match_candidates": match_candidates_for_status,
                     }
                 )
@@ -3943,6 +4040,9 @@ def main() -> None:
                         "match_source": locals().get("match_source_for_status"),
                         "match_confidence": locals().get("match_confidence_for_status"),
                         "second_match_confidence": locals().get("second_match_confidence_for_status"),
+                        "cache_reuse_confidence": locals().get("cache_reuse_confidence_for_status"),
+                        "cache_reuse_recommended": locals().get("cache_reuse_recommended_for_status"),
+                        "cache_reuse_reason": locals().get("cache_reuse_reason_for_status"),
                         "match_candidates": locals().get("match_candidates_for_status", []),
                     }
                 )
