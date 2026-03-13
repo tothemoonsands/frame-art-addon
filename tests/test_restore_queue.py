@@ -1188,7 +1188,10 @@ class MusicAssociationLookupTests(unittest.TestCase):
         self.assertTrue(request["force_new_background"])
         self.assertFalse(request["force_regen"])
         self.assertIsNone(request["collection_id"])
-        self.assertEqual("", request["artwork_url"])
+        self.assertEqual(
+            "https://a5.mzstatic.com/us/r1000/0/Music211/v4/f1/3c/d7/f13cd7ab-7319-028a-8807-5991d0b308d4/0044003187658_Cover.jpg",
+            request["artwork_url"],
+        )
 
     def test_fuzzy_ambiguous_returns_regenerate_recommendation(self):
         uploader.atomic_write_json(
@@ -1393,6 +1396,33 @@ class MusicAssociationLookupTests(unittest.TestCase):
         self.assertIn("session::What Kinda Music", entries)
         self.assertNotIn("album::Tom Misch & Yussef Dayes — What Kinda Music", entries)
         self.assertNotIn("album_loose::tom misch yussef dayes what kinda music", entries)
+
+    def test_update_music_association_persists_manual_artwork_url(self):
+        uploader.update_music_association(
+            {
+                "music_session_key": "manual-session",
+                "artist": "Childish Gambino",
+                "album": '"Awaken, My Love!"',
+                "key_source": "sonos",
+                "artwork_url": "https://a5.mzstatic.com/us/r1000/0/Music221/v4/example/cover.jpg",
+            },
+            cache_key="aa_childish-gambino-awaken_254d4073",
+            catalog_key="aa_childish-gambino-awaken_254d4073__3840x2160.jpg",
+            content_id="MY_F4004",
+            verified=False,
+            source_quality="generated",
+            match_source="fresh_generation",
+            match_confidence=1.0,
+            cache_reuse_confidence=1.0,
+            cache_reuse_recommended=True,
+        )
+
+        assoc = json.loads(self.assoc.read_text(encoding="utf-8"))
+        record = assoc["entries"]["album_norm::childish gambino awaken my love"]
+        self.assertEqual(
+            "https://a5.mzstatic.com/us/r1000/0/Music221/v4/example/cover.jpg",
+            record.get("artwork_url"),
+        )
 
     def test_generated_music_association_is_preferred_for_future_reuse(self):
         uploader.update_music_association(

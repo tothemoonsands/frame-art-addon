@@ -2372,6 +2372,7 @@ def update_music_association(
     artist = str(restore_payload.get("artist", "")).strip()
     album = str(restore_payload.get("album", "")).strip()
     collection_id = parse_collection_id_value(restore_payload.get("collection_id"))
+    artwork_url = normalize_remote_artwork_url(restore_payload.get("artwork_url"))
     verified_flag = bool(is_numeric_catalog_key(catalog_key)) if verified is None else bool(verified)
     quality = source_quality or ("trusted_cache" if verified_flag else "generated")
 
@@ -2400,6 +2401,8 @@ def update_music_association(
         ),
         "updated_at": datetime.now(timezone.utc).isoformat(),
     }
+    if artwork_url:
+        record["artwork_url"] = artwork_url
 
     if music_session_key:
         entries[f"session::{music_session_key}"] = record
@@ -2668,7 +2671,7 @@ def build_music_request_from_feedback(payload: dict[str, Any], *, show: bool, fo
         "key_source": str(payload.get("key_source", "")).strip().lower(),
         "shazam_key": str(payload.get("shazam_key", "")).strip(),
         "collection_id": None if (artwork_url or force_new_background) else parse_collection_id_value(payload.get("collection_id")),
-        "artwork_url": "" if force_new_background else artwork_url,
+        "artwork_url": artwork_url,
         "source_preference": "itunes",
         "force_regen": force_regen,
         "force_new_background": force_new_background,
