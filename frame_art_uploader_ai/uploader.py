@@ -1929,6 +1929,14 @@ def music_index_entry_key(*, collection_id: Optional[int], catalog_key: str, cac
     return stem or cache_key
 
 
+def music_generation_stem(*, collection_id: Optional[int], artist: str, album: str, source_url: str = "") -> str:
+    # Manual artwork URLs should not reuse the collection-id stem, otherwise stale source/output
+    # files for a prior match can bleed into a "fresh" regeneration for the same collection id.
+    if str(source_url or "").strip():
+        return normalize_key(None, artist, album)
+    return str(collection_id) if isinstance(collection_id, int) else normalize_key(collection_id, artist, album)
+
+
 def select_music_index_write_path() -> Path:
     for path in MUSIC_INDEX_PATHS:
         parent = path.parent
@@ -3309,6 +3317,8 @@ def main() -> None:
                         association_record = lookup_music_association(restore_payload)
                         assoc_collection_id = None
                         assoc_cache_key = ""
+                        stale_catalog_key = ""
+                        stale_content_id = ""
                         if isinstance(association_record, dict):
                             stale_catalog_key = str(association_record.get("catalog_key", "")).strip()
                             stale_content_id = str(association_record.get("content_id", "")).strip()
@@ -3322,6 +3332,19 @@ def main() -> None:
                             collection_id=parse_collection_id_value(restore_payload.get("collection_id")) or assoc_collection_id,
                             cache_key=str(restore_payload.get("cache_key", "")).strip() or assoc_cache_key,
                         )
+                        cleanup_catalog_key = stale_catalog_key
+                        if not cleanup_catalog_key:
+                            cleanup_collection_id = parse_collection_id_value(restore_payload.get("collection_id")) or assoc_collection_id
+                            cleanup_cache_key = str(restore_payload.get("cache_key", "")).strip() or assoc_cache_key
+                            if isinstance(cleanup_collection_id, int):
+                                cleanup_catalog_key = f"{cleanup_collection_id}__3840x2160.jpg"
+                            elif cleanup_cache_key:
+                                cleanup_catalog_key = f"{cleanup_cache_key}__3840x2160.jpg"
+                        if cleanup_catalog_key:
+                            cleanup_music_graph_for_deletion(
+                                cleanup_catalog_key,
+                                stale_content_id or str(restore_payload.get("current_content_id", "")).strip(),
+                            )
                         followup_payload = build_music_request_from_feedback(restore_payload, show=show_flag, force_regen=True)
                         enqueue_restore_payload(followup_payload)
                         followup_kind = "cover_art_reference_background"
@@ -3422,7 +3445,12 @@ def main() -> None:
                             collection_id = assoc_collection_id
 
                     cache_key = normalize_key(collection_id, artist, album)
-                    stem_key = str(collection_id) if isinstance(collection_id, int) else cache_key
+                    stem_key = music_generation_stem(
+                        collection_id=collection_id,
+                        artist=artist,
+                        album=album,
+                        source_url=source_url,
+                    )
                     association_cache_key = (
                         str(association_record.get("cache_key", "")).strip()
                         if isinstance(association_record, dict)
@@ -3637,7 +3665,7 @@ def main() -> None:
                                     cache_reuse_confidence=association_record.get("cache_reuse_confidence"),
                                 )
 
-                            refresh_source_art = should_refresh_music_source_art(
+                            refresh_source_art = bool(source_url) or should_refresh_music_source_art(
                                 force_regen=force_regen,
                                 source_preference=source_preference,
                             )
