@@ -83,7 +83,7 @@ MUSIC_RESTORE_KINDS = {"cover_art_reference_background", "cover_art_outpaint"}
 MUSIC_ASSOCIATION_SESSION_TTL_DAYS = 0
 
 RUNTIME_OPTIONS: dict[str, Any] = {}
-ADDON_VERSION = "1.20"
+ADDON_VERSION = "1.21"
 HOLIDAY_ALIASES = {
     "football": "huskers",
 }
@@ -727,7 +727,7 @@ def parse_restore_request_payload(payload: Any) -> tuple[Optional[dict], Optiona
         if requested_show is None:
             requested_show = True
         normalized["requested_at"] = str(payload.get("requested_at", "")).strip()
-        normalized["action"] = str(payload.get("action", "queue_only")).strip().lower() or "queue_only"
+        normalized["action"] = str(payload.get("action", "regen_now")).strip().lower() or "regen_now"
         normalized["issue_type"] = str(payload.get("issue_type", "")).strip().lower()
         normalized["artist"] = str(payload.get("artist", "")).strip()
         normalized["album"] = str(payload.get("album", "")).strip()
@@ -3306,7 +3306,7 @@ def main() -> None:
                     artist = str(restore_payload.get("artist", "")).strip()
                     album = str(restore_payload.get("album", "")).strip()
                     track = str(restore_payload.get("track", "")).strip()
-                    action = str(restore_payload.get("action", "queue_only")).strip().lower() or "queue_only"
+                    action = str(restore_payload.get("action", "regen_now")).strip().lower() or "regen_now"
                     issue_type = str(restore_payload.get("issue_type", "")).strip().lower()
                     notes = str(restore_payload.get("notes", "")).strip()
                     requested_at = str(restore_payload.get("requested_at", "")).strip()
@@ -3315,7 +3315,7 @@ def main() -> None:
                     cache_key = str(restore_payload.get("cache_key", "")).strip()
                     issue_id = append_music_triage_issue(
                         {
-                            "status": "open" if action == "queue_only" else "queued",
+                            "status": "queued",
                             "action": action,
                             "issue_type": issue_type,
                             "artist": artist,
