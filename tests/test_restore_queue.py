@@ -204,6 +204,20 @@ class RestoreQueueTests(unittest.TestCase):
         self.assertEqual("MY_F42", normalized["current_content_id"])
         self.assertEqual("https://example.com/cover.jpg", normalized["artwork_url"])
 
+    def test_parse_music_feedback_payload_accepts_selected_artwork_url(self):
+        payload = {
+            "kind": "music_feedback",
+            "requested_at": datetime.now(timezone.utc).isoformat(),
+            "action": "regen_now",
+            "artist": "Artist",
+            "album": "Album",
+            "selected_artwork_url": "https://example.com/selected-cover.jpg",
+        }
+        normalized, requested_show, err = uploader.parse_restore_request_payload(payload)
+        self.assertIsNone(err)
+        self.assertTrue(requested_show)
+        self.assertEqual("https://example.com/selected-cover.jpg", normalized["artwork_url"])
+
     def test_parse_cover_art_request_includes_force_new_background(self):
         payload = {
             "kind": "cover_art_reference_background",
@@ -1490,6 +1504,19 @@ class MusicAssociationLookupTests(unittest.TestCase):
             "https://a5.mzstatic.com/us/r1000/0/Music211/v4/87/05/04/87050482-1f16-8d12-9038-eb015dac5e46/196873464527.jpg",
             request["artwork_url"],
         )
+
+    def test_build_music_request_from_feedback_accepts_selected_artwork_url(self):
+        request = uploader.build_music_request_from_feedback(
+            {
+                "music_session_key": "session-1",
+                "artist": "Joey Bada$$",
+                "album": "Lonely At The Top",
+                "selected_artwork_url": "https://example.com/selected-cover.jpg",
+            },
+            show=True,
+            force_regen=True,
+        )
+        self.assertEqual("https://example.com/selected-cover.jpg", request["artwork_url"])
 
     def test_set_music_override_for_album_accepts_remote_artwork_url(self):
         changed = uploader.set_music_override_for_album(

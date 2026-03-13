@@ -670,7 +670,7 @@ def parse_restore_request_payload(payload: Any) -> tuple[Optional[dict], Optiona
         if requested_show is None:
             requested_show = True
         normalized["requested_at"] = str(payload.get("requested_at", "")).strip()
-        normalized["artwork_url"] = normalize_remote_artwork_url(payload.get("artwork_url"))
+        normalized["artwork_url"] = extract_remote_artwork_url(payload)
         artist = str(payload.get("artist", "")).strip()
         album = str(payload.get("album", "")).strip()
         track = str(payload.get("track", "")).strip()
@@ -740,7 +740,7 @@ def parse_restore_request_payload(payload: Any) -> tuple[Optional[dict], Optiona
         normalized["current_content_id"] = str(payload.get("current_content_id", "")).strip()
         normalized["candidate_catalog_key"] = str(payload.get("candidate_catalog_key", "")).strip()
         normalized["notes"] = str(payload.get("notes", "")).strip()
-        normalized["artwork_url"] = normalize_remote_artwork_url(payload.get("artwork_url"))
+        normalized["artwork_url"] = extract_remote_artwork_url(payload)
         collection_id_raw = payload.get("collection_id")
         if collection_id_raw in (None, ""):
             normalized["collection_id"] = None
@@ -1642,6 +1642,35 @@ def normalize_remote_artwork_url(value: Any) -> str:
     return raw
 
 
+def extract_remote_artwork_url(payload: Any) -> str:
+    if not isinstance(payload, dict):
+        return normalize_remote_artwork_url(payload)
+
+    candidate_keys = (
+        "artwork_url",
+        "manual_artwork_url",
+        "selected_artwork_url",
+        "artworkUrl",
+        "artworkUrl100",
+        "artworkUrl60",
+        "hires",
+        "url",
+    )
+    for key in candidate_keys:
+        normalized = normalize_remote_artwork_url(payload.get(key))
+        if normalized:
+            return normalized
+
+    selected = payload.get("selected_artwork")
+    if isinstance(selected, dict):
+        for key in candidate_keys:
+            normalized = normalize_remote_artwork_url(selected.get(key))
+            if normalized:
+                return normalized
+
+    return ""
+
+
 def music_candidate_adjusted_score(
     score: float,
     *,
@@ -2372,7 +2401,7 @@ def update_music_association(
     artist = str(restore_payload.get("artist", "")).strip()
     album = str(restore_payload.get("album", "")).strip()
     collection_id = parse_collection_id_value(restore_payload.get("collection_id"))
-    artwork_url = normalize_remote_artwork_url(restore_payload.get("artwork_url"))
+    artwork_url = extract_remote_artwork_url(restore_payload)
     verified_flag = bool(is_numeric_catalog_key(catalog_key)) if verified is None else bool(verified)
     quality = source_quality or ("trusted_cache" if verified_flag else "generated")
 
@@ -2656,7 +2685,7 @@ def resolve_music_catalog_path(catalog_key: str) -> Optional[Path]:
 
 
 def build_music_request_from_feedback(payload: dict[str, Any], *, show: bool, force_regen: bool = False) -> dict[str, Any]:
-    artwork_url = normalize_remote_artwork_url(payload.get("artwork_url"))
+    artwork_url = extract_remote_artwork_url(payload)
     action = str(payload.get("action", "")).strip().lower()
     force_new_background = action == "regen_background"
     return {
@@ -3345,6 +3374,7 @@ def main() -> None:
                             "notes": notes,
                         }
                     )
+                    queued_artwork_url = extract_remote_artwork_url(restore_payload)
                     enqueue_music_feedback_item(
                         {
                             "issue_id": issue_id,
@@ -3358,6 +3388,11 @@ def main() -> None:
                             "candidate_catalog_key": candidate_catalog_key,
                             "current_content_id": current_content_id,
                             "notes": notes,
+                            "collection_id": parse_collection_id_value(restore_payload.get("collection_id")),
+                            "music_session_key": str(restore_payload.get("music_session_key", "")).strip(),
+                            "key_source": str(restore_payload.get("key_source", "")).strip().lower(),
+                            "shazam_key": str(restore_payload.get("shazam_key", "")).strip(),
+                            "artwork_url": queued_artwork_url,
                         }
                     )
 
@@ -3394,7 +3429,7 @@ def main() -> None:
                                 cleanup_catalog_key,
                                 stale_content_id or str(restore_payload.get("current_content_id", "")).strip(),
                             )
-                        manual_artwork_url = normalize_remote_artwork_url(restore_payload.get("artwork_url"))
+                        manual_artwork_url = extract_remote_artwork_url(restore_payload)
                         if manual_artwork_url:
                             set_music_override_for_album(
                                 artist=artist,
@@ -3449,7 +3484,7 @@ def main() -> None:
                     continue
                 elif kind in {"cover_art_reference_background", "cover_art_outpaint"}:
                     ensure_dirs()
-                    source_url = normalize_remote_artwork_url(restore_payload.get("artwork_url"))
+                    source_url = extract_remote_artwork_url(restore_payload)
                     source_preference = str(restore_payload.get("source_preference", "")).strip().lower()
                     artist = str(restore_payload.get("artist", "")).strip()
                     album = str(restore_payload.get("album", "")).strip()
