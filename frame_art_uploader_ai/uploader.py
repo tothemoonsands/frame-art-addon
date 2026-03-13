@@ -83,7 +83,7 @@ MUSIC_RESTORE_KINDS = {"cover_art_reference_background", "cover_art_outpaint"}
 MUSIC_ASSOCIATION_SESSION_TTL_DAYS = 0
 
 RUNTIME_OPTIONS: dict[str, Any] = {}
-ADDON_VERSION = "1.22"
+ADDON_VERSION = "1.23"
 HOLIDAY_ALIASES = {
     "football": "huskers",
 }
@@ -1680,7 +1680,7 @@ def music_candidate_adjusted_score(
 ) -> float:
     adjusted = score
     if is_aa_catalog_key(catalog_key, cache_key):
-        adjusted -= 0.04
+        adjusted -= 0.08
     if is_numeric_catalog_key(catalog_key):
         adjusted += 0.02
     if verified:
@@ -2209,22 +2209,25 @@ def lookup_music_association_fuzzy(restore_payload: dict[str, Any]) -> Optional[
         )
 
     best_margin = best_score - second_best_score if second_best_score > 0.0 else best_score
-    cache_reuse_recommended = best_score >= 0.74 and (best_margin >= 0.03 or second_best_score == 0.0)
-    if best_score < 0.70:
-        return None
-
-    best_record["match_candidates"] = top_candidates
-    best_record["second_match_confidence"] = round(second_best_score, 4)
-    best_record["cache_reuse_confidence"] = round(best_score, 4)
-    best_record["cache_reuse_margin"] = round(best_margin, 4)
-    best_record["cache_reuse_recommended"] = cache_reuse_recommended
-    if cache_reuse_recommended:
+    if best_score >= 0.78 and (best_margin >= 0.05 or second_best_score == 0.0):
+        best_record["match_candidates"] = top_candidates
+        best_record["second_match_confidence"] = round(second_best_score, 4)
+        best_record["cache_reuse_confidence"] = round(best_score, 4)
+        best_record["cache_reuse_margin"] = round(best_margin, 4)
+        best_record["cache_reuse_recommended"] = True
         best_record["cache_reuse_reason"] = "fuzzy_confident"
-    elif second_best_score >= 0.70 and best_margin < 0.05:
+        return best_record
+
+    if best_score >= 0.74 and second_best_score >= 0.70 and best_margin < 0.05:
+        best_record["match_candidates"] = top_candidates
+        best_record["second_match_confidence"] = round(second_best_score, 4)
+        best_record["cache_reuse_confidence"] = round(best_score, 4)
+        best_record["cache_reuse_margin"] = round(best_margin, 4)
+        best_record["cache_reuse_recommended"] = False
         best_record["cache_reuse_reason"] = "fuzzy_ambiguous_regenerate"
-    else:
-        best_record["cache_reuse_reason"] = "fuzzy_low_confidence_regenerate"
-    return best_record
+        return best_record
+
+    return None
 
 
 def lookup_music_association(restore_payload: dict[str, Any]) -> Optional[dict[str, Any]]:
