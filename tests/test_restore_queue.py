@@ -1124,6 +1124,39 @@ class MusicAssociationLookupTests(unittest.TestCase):
         self.assertFalse(matched.get("cache_reuse_recommended"))
         self.assertGreaterEqual(float(matched.get("cache_reuse_confidence", 0.0)), 0.70)
 
+    def test_fuzzy_lookup_reuses_generated_aa_match_without_penalty(self):
+        uploader.atomic_write_json(
+            self.assoc,
+            {
+                "version": 1,
+                "updated_at": "",
+                "entries": {
+                    "album::Christian Sands Trio — Be Water": {
+                        "cache_key": "aa_christian-sands-trio-be-water_e18483f2",
+                        "catalog_key": "aa_christian-sands-trio-be-water_e18483f2__3840x2160.jpg",
+                        "content_id": "MY_F1993",
+                        "artist": "Christian Sands Trio",
+                        "album": "Be Water",
+                        "source_quality": "generated",
+                        "cache_reuse_recommended": True,
+                    },
+                },
+            },
+        )
+
+        matched = uploader.lookup_music_association_fuzzy(
+            {
+                "artist": "Christian Sands",
+                "album": "Be Water",
+            }
+        )
+
+        self.assertIsInstance(matched, dict)
+        self.assertTrue(matched.get("cache_reuse_recommended"))
+        self.assertEqual("association_fuzzy", matched.get("match_source"))
+        self.assertEqual("MY_F1993", matched.get("content_id"))
+        self.assertGreaterEqual(float(matched.get("cache_reuse_confidence", 0.0)), 0.78)
+
     def test_lookup_prefers_collection_id_numeric_catalog_match(self):
         uploader.atomic_write_json(
             self.catalog,

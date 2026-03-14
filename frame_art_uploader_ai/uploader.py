@@ -83,7 +83,7 @@ MUSIC_RESTORE_KINDS = {"cover_art_reference_background", "cover_art_outpaint"}
 MUSIC_ASSOCIATION_SESSION_TTL_DAYS = 0
 
 RUNTIME_OPTIONS: dict[str, Any] = {}
-ADDON_VERSION = "1.23"
+ADDON_VERSION = "1.24"
 HOLIDAY_ALIASES = {
     "football": "huskers",
 }
@@ -1679,8 +1679,6 @@ def music_candidate_adjusted_score(
     verified: bool = False,
 ) -> float:
     adjusted = score
-    if is_aa_catalog_key(catalog_key, cache_key):
-        adjusted -= 0.08
     if is_numeric_catalog_key(catalog_key):
         adjusted += 0.02
     if verified:
