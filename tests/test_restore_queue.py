@@ -1008,6 +1008,64 @@ class MusicAssociationLookupTests(unittest.TestCase):
         self.assertIsInstance(matched, dict)
         self.assertEqual("legacy__3840x2160.jpg", matched.get("catalog_key"))
 
+    def test_lookup_prefers_album_association_over_collection_id_match(self):
+        uploader.atomic_write_json(
+            self.catalog,
+            {
+                "version": 1,
+                "updated_at": "",
+                "entries": {
+                    "999__3840x2160.jpg": {
+                        "content_id": "MY_OLD",
+                        "updated_at": "",
+                    },
+                    "aa_joey-bada-pardon-me-single_586959bd__3840x2160.jpg": {
+                        "content_id": "MY_NEW",
+                        "updated_at": "",
+                    },
+                },
+            },
+        )
+        uploader.atomic_write_json(
+            self.index,
+            {
+                "version": 1,
+                "updated_at": "",
+                "entries": {
+                    "999": {
+                        "text_key": "wrong artist — wrong album",
+                        "compressed_output_path": "/tmp/out/widescreen-compressed/999__3840x2160.jpg",
+                        "content_id": "MY_OLD",
+                    }
+                },
+            },
+        )
+        uploader.update_music_association(
+            {
+                "artist": "Joey Bada$$",
+                "album": "Pardon Me - Single",
+                "key_source": "shortcut",
+            },
+            cache_key="aa_joey-bada-pardon-me-single_586959bd",
+            catalog_key="aa_joey-bada-pardon-me-single_586959bd__3840x2160.jpg",
+            content_id="MY_NEW",
+            source_quality="generated",
+            match_source="fresh_generation",
+        )
+
+        matched = uploader.lookup_music_association(
+            {
+                "artist": "Joey Bada$$",
+                "album": "Pardon Me - Single",
+                "collection_id": 999,
+            }
+        )
+
+        self.assertIsInstance(matched, dict)
+        self.assertEqual("aa_joey-bada-pardon-me-single_586959bd__3840x2160.jpg", matched.get("catalog_key"))
+        self.assertEqual("MY_NEW", matched.get("content_id"))
+        self.assertEqual("fresh_generation", matched.get("match_source"))
+
     def test_fuzzy_lookup_from_association_record(self):
         uploader.update_music_association(
             {

@@ -83,7 +83,7 @@ MUSIC_RESTORE_KINDS = {"cover_art_reference_background", "cover_art_outpaint"}
 MUSIC_ASSOCIATION_SESSION_TTL_DAYS = 0
 
 RUNTIME_OPTIONS: dict[str, Any] = {}
-ADDON_VERSION = "1.29"
+ADDON_VERSION = "1.30"
 HOLIDAY_ALIASES = {
     "football": "huskers",
 }
@@ -2393,11 +2393,6 @@ def lookup_music_association(restore_payload: dict[str, Any]) -> Optional[dict[s
         return override_match
 
     collection_id = parse_collection_id_value(restore_payload.get("collection_id"))
-    collection_match = find_music_match_by_collection_id(collection_id)
-    if isinstance(collection_match, dict):
-        collection_match["artist"] = artist
-        collection_match["album"] = album
-        return collection_match
 
     catalog = load_frame_art_catalog(MUSIC_ASSOCIATIONS_PATH)
     entries = catalog.get("entries") if isinstance(catalog.get("entries"), dict) else {}
@@ -2438,6 +2433,12 @@ def lookup_music_association(restore_payload: dict[str, Any]) -> Optional[dict[s
             raw_norm = normalized_album_association(*raw_album_key.split(" — ", 1)) if " — " in raw_album_key else ""
             if raw_norm == album_key_norm:
                 return record
+
+    collection_match = find_music_match_by_collection_id(collection_id)
+    if isinstance(collection_match, dict):
+        collection_match["artist"] = artist
+        collection_match["album"] = album
+        return collection_match
 
     return lookup_music_association_fuzzy(restore_payload)
 
