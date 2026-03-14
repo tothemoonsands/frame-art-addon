@@ -1,0 +1,166 @@
+configuration:
+  tv_ip:
+    name: TV IP address
+    description: IP address of the Samsung Frame TV that should receive uploaded art.
+  keep_count:
+    name: TV artwork limit
+    description: How many uploaded AI artworks to keep on the TV before older ones are removed.
+  keep_count_local:
+    name: Local file limit
+    description: How many generated image files to keep in the local inbox folder.
+  pick_samsung_pct:
+    name: Samsung art blend (%)
+    description: Chance of showing a built-in Samsung artwork instead of the newest AI-generated image.
+  samsung_pools:
+    name: Samsung Art Gallery Selections
+    description: Important section. Expand this to choose which built-in Samsung artwork collections are used for seasonal and ambient selections.
+    fields:
+      holidays:
+        name: Holiday collections
+        description: Built-in Samsung artworks grouped around holidays and special events.
+        fields:
+          halloween:
+            name: Halloween
+            description: Samsung artwork IDs to use around Halloween.
+            fields:
+              day:
+                name: Day
+                description: Art IDs favored during the day.
+              evening:
+                name: Evening
+                description: Art IDs favored in the evening.
+          christmas:
+            name: Christmas
+            description: Samsung artwork IDs to use around Christmas.
+            fields:
+              day:
+                name: Day
+                description: Art IDs favored during the day.
+              evening:
+                name: Evening
+                description: Art IDs favored in the evening.
+          thanksgiving:
+            name: Thanksgiving
+            description: Samsung artwork IDs to use around Thanksgiving.
+          independence:
+            name: Independence Day
+            description: Samsung artwork IDs to use around the Fourth of July.
+          newyear:
+            name: New Year
+            description: Samsung artwork IDs to use around New Year's.
+          easter:
+            name: Easter
+            description: Samsung artwork IDs to use around Easter.
+          huskers:
+            name: Huskers
+            description: Samsung artwork IDs to use for Huskers-themed moments.
+      ambient:
+        name: Ambient collections
+        description: Built-in Samsung artworks grouped by season and time of day.
+        fields:
+          winter:
+            name: Winter
+            description: Ambient art pools for winter.
+            fields:
+              pre_dawn:
+                name: Pre-dawn
+                description: Art IDs favored before sunrise.
+              midday:
+                name: Midday
+                description: Art IDs favored around the middle of the day.
+              evening:
+                name: Evening
+                description: Art IDs favored in the evening.
+              night:
+                name: Night
+                description: Art IDs favored overnight.
+          spring:
+            name: Spring
+            description: Ambient art pools for spring.
+            fields:
+              pre_dawn:
+                name: Pre-dawn
+                description: Art IDs favored before sunrise.
+              midday:
+                name: Midday
+                description: Art IDs favored around the middle of the day.
+              evening:
+                name: Evening
+                description: Art IDs favored in the evening.
+              night:
+                name: Night
+                description: Art IDs favored overnight.
+          summer:
+            name: Summer
+            description: Ambient art pools for summer.
+            fields:
+              pre_dawn:
+                name: Pre-dawn
+                description: Art IDs favored before sunrise.
+              midday:
+                name: Midday
+                description: Art IDs favored around the middle of the day.
+              evening:
+                name: Evening
+                description: Art IDs favored in the evening.
+              night:
+                name: Night
+                description: Art IDs favored overnight.
+          autumn:
+            name: Autumn
+            description: Ambient art pools for autumn.
+            fields:
+              pre_dawn:
+                name: Pre-dawn
+                description: Art IDs favored before sunrise.
+              midday:
+                name: Midday
+                description: Art IDs favored around the middle of the day.
+              evening:
+                name: Evening
+                description: Art IDs favored in the evening.
+              night:
+                name: Night
+                description: Art IDs favored overnight.
+  inbox_dir:
+    name: Artwork inbox folder
+    description: Folder the add-on watches for new AI-generated images to upload.
+  filename_prefix:
+    name: Filename prefix
+    description: Only files that start with this prefix are treated as upload candidates.
+  select_after_upload:
+    name: Show immediately after upload
+    description: Automatically switch the TV to the newly uploaded artwork as soon as the upload finishes.
+  openai_api_key:
+    name: OpenAI API key
+    description: API key used for image generation and other OpenAI requests.
+  openai_model:
+    name: OpenAI model
+    description: Which OpenAI model to use for image generation.
+  openai_timeout_s:
+    name: OpenAI timeout (seconds)
+    description: How long to wait for OpenAI before the request is treated as timed out.
+  art_socket_retries:
+    name: Samsung connection retries
+    description: Number of times to retry the Samsung Art Mode socket connection.
+  art_ws_open_timeout_s:
+    name: WebSocket open timeout (seconds)
+    description: How long to wait for the Samsung Art Mode WebSocket to open.
+  art_channel_timeout_s:
+    name: Samsung response timeout (seconds)
+    description: How long to wait for responses from the Samsung Art Mode channel.
+  art_retry_backoff_s:
+    name: Retry delay (seconds)
+    description: Delay between retry attempts after Samsung communication failures.
+  art_timeout_cooldown_after:
+    name: Cooldown after this many timeouts
+    description: Start applying a cooldown after this many timeout-related failures in a row.
+  art_timeout_cooldown_s:
+    name: Cooldown length (seconds)
+    description: How long to wait before retrying after repeated timeout failures.
+  legacy_masked_outpaint:
+    name: Use legacy masked outpaint
+    description: Use the older masked outpaint behavior for compatibility with earlier setups.
+  debug_logging:
+    name: Debug logging
+    description: Turn on extra logging to help with troubleshooting.
