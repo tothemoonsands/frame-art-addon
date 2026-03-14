@@ -295,9 +295,13 @@ class AmbientSeedTests(unittest.TestCase):
         self.root = Path(self.tmp.name)
         self.ambient = self.root / "ambient"
         self.catalog = self.root / "ambient_catalog.json"
+        self.status = self.root / "frame_art_uploader_last.json"
         self.ambient.mkdir(parents=True)
+        self.old_status_path = uploader.STATUS_PATH
+        uploader.STATUS_PATH = str(self.status)
 
     def tearDown(self) -> None:
+        uploader.STATUS_PATH = self.old_status_path
         self.tmp.cleanup()
 
     def test_parse_dispatch_ambient_seed(self):
@@ -463,6 +467,43 @@ class AmbientSeedTests(unittest.TestCase):
         self.assertEqual(0, status["skipped_count"])
         self.assertEqual(1, mocked_upload.call_count)
 
+    @mock.patch("frame_art_uploader_ai.uploader.write_status")
+    @mock.patch("frame_art_uploader_ai.uploader.upload_local_file_with_reconnect")
+    def test_seed_restore_emits_live_scan_and_upload_progress(self, mocked_upload, mocked_write_status):
+        (self.ambient / "a.jpg").write_bytes(b"a")
+        (self.ambient / "b.jpg").write_bytes(b"b")
+
+        def _uploader(tv_ip, art, file_path):
+            return art, f"CID-{file_path.name}"
+
+        mocked_upload.side_effect = _uploader
+
+        status = uploader.handle_ambient_seed_restore(
+            tv_ip="127.0.0.1",
+            art=object(),
+            restore_payload={
+                "kind": "ambient_seed",
+                "ambient_dir": str(self.ambient),
+                "catalog_path": str(self.catalog),
+                "force_reupload": False,
+            },
+            requested_at="2026-03-14T04:45:00Z",
+        )
+
+        self.assertTrue(status["ok"])
+        progress_updates = [call.args[0] for call in mocked_write_status.call_args_list]
+        self.assertTrue(any(p.get("phase") == "scan" for p in progress_updates))
+        self.assertTrue(any(p.get("phase") == "upload" and p.get("phase_status") == "uploading" for p in progress_updates))
+        self.assertTrue(any(p.get("phase") == "upload" and p.get("phase_status") == "uploaded" for p in progress_updates))
+        self.assertTrue(any(p.get("phase_action") == "starting_seed_sync" for p in progress_updates))
+        uploaded_update = next(
+            p for p in progress_updates if p.get("phase") == "upload" and p.get("phase_status") == "uploaded"
+        )
+        self.assertEqual(2, uploaded_update["phase_total"])
+        self.assertEqual("ambient_seed", uploaded_update["kind"])
+        self.assertEqual(2, status["phase_total"])
+        self.assertEqual("done", status["phase"])
+
     def test_non_ambient_kinds_unaffected(self):
         payload = {"kind": "pick", "phase": "night", "season": "winter"}
         normalized, requested_show, err = uploader.parse_restore_request_payload(payload)
@@ -473,7 +514,8 @@ class AmbientSeedTests(unittest.TestCase):
 
     @mock.patch("frame_art_uploader_ai.uploader.delete_art_content_id")
     @mock.patch("frame_art_uploader_ai.uploader.maybe_swap_current_art")
-    def test_pending_delete_is_processed_and_marked_deleted(self, mocked_swap, mocked_delete):
+    @mock.patch("frame_art_uploader_ai.uploader.write_status")
+    def test_pending_delete_is_processed_and_marked_deleted(self, mocked_write_status, mocked_swap, mocked_delete):
         (self.ambient / "keep.jpg").write_bytes(b"k")
         uploader.atomic_write_json(
             self.catalog,
@@ -505,6 +547,8 @@ class AmbientSeedTests(unittest.TestCase):
 
         self.assertEqual(1, status["deletion_candidates"])
         self.assertEqual(1, status["deletion_processed"])
+        progress_updates = [call.args[0] for call in mocked_write_status.call_args_list]
+        self.assertTrue(any(p.get("phase") == "delete" and p.get("phase_status") == "deleted" for p in progress_updates))
         data = json.loads(self.catalog.read_text(encoding="utf-8"))
         self.assertEqual("deleted", data["entries"]["old.jpg"]["state"])
 
@@ -731,6 +775,7 @@ class MusicSeedDeletionTests(unittest.TestCase):
         self.compressed = self.root / "compressed"
         self.background = self.root / "background"
         self.source = self.root / "source"
+        self.status = self.root / "frame_art_uploader_last.json"
         self.music_dir.mkdir(parents=True)
         self.widescreen.mkdir(parents=True)
         self.compressed.mkdir(parents=True)
@@ -745,6 +790,7 @@ class MusicSeedDeletionTests(unittest.TestCase):
         self.old_compressed = uploader.COMPRESSED_DIR
         self.old_background = uploader.BACKGROUND_DIR
         self.old_source = uploader.SOURCE_DIR
+        self.old_status_path = uploader.STATUS_PATH
         uploader.MUSIC_CATALOG_PATH = self.catalog
         uploader.MUSIC_ASSOCIATIONS_PATH = self.assoc
         uploader.MUSIC_INDEX_PATHS = [self.index]
@@ -752,6 +798,7 @@ class MusicSeedDeletionTests(unittest.TestCase):
         uploader.COMPRESSED_DIR = self.compressed
         uploader.BACKGROUND_DIR = self.background
         uploader.SOURCE_DIR = self.source
+        uploader.STATUS_PATH = str(self.status)
 
     def tearDown(self) -> None:
         uploader.MUSIC_CATALOG_PATH = self.old_music_catalog
@@ -761,6 +808,7 @@ class MusicSeedDeletionTests(unittest.TestCase):
         uploader.COMPRESSED_DIR = self.old_compressed
         uploader.BACKGROUND_DIR = self.old_background
         uploader.SOURCE_DIR = self.old_source
+        uploader.STATUS_PATH = self.old_status_path
         self.tmp.cleanup()
 
     @mock.patch("frame_art_uploader_ai.uploader.delete_art_content_id")

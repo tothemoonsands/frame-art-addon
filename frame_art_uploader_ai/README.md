@@ -18,7 +18,7 @@ The add-on now treats `/share/frame_art_restore_request.json` as an **inbox file
 
 ## Status contract (`/share/frame_art_uploader_last.json`)
 
-For each completed restore queue item, the add-on writes `frame_art_uploader_last.json` with at least:
+For each restore queue item, the add-on writes `frame_art_uploader_last.json` as work progresses and again on completion. The payload always includes at least:
 
 - `ts`: monotonic timestamp (`time.monotonic()`)
 - `kind`: normalized request kind (if available)
@@ -26,7 +26,19 @@ For each completed restore queue item, the add-on writes `frame_art_uploader_las
 - `error`: error string on failures
 - `requested_at`: request timestamp from payload (if provided)
 
-The file reflects the most recently completed request.
+Seed sync requests (`ambient_seed`, `holiday_seed`, `music_seed`) also stream live progress fields that are useful in Home Assistant dashboards:
+
+- `phase`: `scan`, `delete`, `upload`, or `done`
+- `phase_action`: short machine-friendly action label such as `checking_catalog_entry`, `delete_completed`, or `uploading_cached_item`
+- `phase_status`: short result label such as `queued_for_delete`, `deleted`, `already_synced`, `uploaded`, or `failed`
+- `phase_index` / `phase_total`: progress counters for the current phase
+- `phase_item`: current relative file or catalog key being processed
+- `total_files`, `scan_total`, `scan_checked_count`
+- `uploaded_count`, `skipped_count`, `failed_count`
+- `deletion_candidates`, `deletion_processed`, `deletion_failed`
+- `auto_queued_missing_count`
+
+The file reflects the most recently updated request state, which means dashboards can read it for live in-flight seed progress instead of waiting for completion.
 
 ## Logging
 

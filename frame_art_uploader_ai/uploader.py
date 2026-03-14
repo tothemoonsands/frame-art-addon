@@ -83,7 +83,7 @@ MUSIC_RESTORE_KINDS = {"cover_art_reference_background", "cover_art_outpaint"}
 MUSIC_ASSOCIATION_SESSION_TTL_DAYS = 0
 
 RUNTIME_OPTIONS: dict[str, Any] = {}
-ADDON_VERSION = "1.28"
+ADDON_VERSION = "1.29"
 HOLIDAY_ALIASES = {
     "football": "huskers",
 }
@@ -134,6 +134,24 @@ def compact_log_payload(payload: dict[str, Any]) -> dict[str, Any]:
             "ok",
             "mode",
             "requested_at",
+            "phase",
+            "phase_index",
+            "phase_total",
+            "phase_action",
+            "phase_item",
+            "phase_status",
+            "total_files",
+            "scan_total",
+            "scan_checked_count",
+            "uploaded_count",
+            "skipped_count",
+            "failed_count",
+            "deletion_candidates",
+            "deletion_processed",
+            "deletion_failed",
+            "deletion_skipped_currently_displayed",
+            "deletion_swap_fallback_used",
+            "auto_queued_missing_count",
             "selected_content_id",
             "pick_source",
             "verified",
@@ -268,6 +286,77 @@ def write_status(payload: dict) -> None:
     payload["ts"] = time.monotonic()
     atomic_write_json(Path(STATUS_PATH), payload)
     log_event("status", **payload)
+
+
+def emit_seed_status(
+    *,
+    tv_ip: str,
+    seed_kind: str,
+    requested_at: str,
+    seed_dir_key: str,
+    seed_dir: Path,
+    catalog_path: Path,
+    force_reupload: bool,
+    apply_deletions: bool,
+    auto_queue_missing: bool,
+    delete_limit: int,
+    total_files: int,
+    phase: str,
+    phase_action: str,
+    phase_index: int = 0,
+    phase_total: int = 0,
+    phase_item: str = "",
+    phase_status: str = "",
+    uploaded_count: int = 0,
+    skipped_count: int = 0,
+    failed_count: int = 0,
+    scan_total: int = 0,
+    scan_checked_count: int = 0,
+    auto_queued_missing_count: int = 0,
+    deletion_candidates: int = 0,
+    deletion_processed: int = 0,
+    deletion_failed: int = 0,
+    deletion_skipped_currently_displayed: int = 0,
+    deletion_swap_fallback_used: int = 0,
+    selected_content_id: Optional[str] = None,
+    error: Optional[str] = None,
+) -> None:
+    write_status(
+        {
+            "ok": phase not in {"error"} and failed_count == 0 and deletion_failed == 0,
+            "mode": "restore",
+            "tv_ip": tv_ip,
+            "kind": seed_kind,
+            "requested_at": requested_at,
+            seed_dir_key: str(seed_dir),
+            "catalog_path": str(catalog_path),
+            "force_reupload": force_reupload,
+            "apply_deletions": apply_deletions,
+            "auto_queue_missing": auto_queue_missing,
+            "delete_limit": delete_limit,
+            "total_files": total_files,
+            "phase": phase,
+            "phase_action": phase_action,
+            "phase_index": phase_index,
+            "phase_total": phase_total,
+            "phase_item": phase_item,
+            "phase_status": phase_status,
+            "scan_total": scan_total,
+            "scan_checked_count": scan_checked_count,
+            "uploaded_count": uploaded_count,
+            "skipped_count": skipped_count,
+            "failed_count": failed_count,
+            "auto_queued_missing_count": auto_queued_missing_count,
+            "deletion_candidates": deletion_candidates,
+            "deletion_processed": deletion_processed,
+            "deletion_failed": deletion_failed,
+            "deletion_skipped_currently_displayed": deletion_skipped_currently_displayed,
+            "deletion_swap_fallback_used": deletion_swap_fallback_used,
+            "selected_content_id": selected_content_id,
+            "error": error,
+            "addon_version": ADDON_VERSION,
+        }
+    )
 
 
 def atomic_write_json(path: Path, payload: Any) -> None:
@@ -1094,6 +1183,7 @@ def process_seed_pending_deletions(
     catalog_path: Path,
     catalog: dict[str, Any],
     delete_limit: int,
+    progress_callback: Optional[Any] = None,
 ) -> tuple[Any, dict[str, Any]]:
     entries = catalog.get("entries") if isinstance(catalog.get("entries"), dict) else {}
     if not isinstance(entries, dict):
@@ -1117,9 +1207,23 @@ def process_seed_pending_deletions(
     errors: list[str] = []
     changed = False
 
-    for key, _entry in candidates[: max(1, int(delete_limit))]:
+    limited_candidates = candidates[: max(1, int(delete_limit))]
+
+    for idx, (key, _entry) in enumerate(limited_candidates, start=1):
         entry = seed_catalog_entry(entries.get(key))
         target_cid = str(entry.get("content_id", "")).strip()
+        if callable(progress_callback):
+            progress_callback(
+                action="delete_candidate",
+                item=key,
+                index=idx,
+                total=len(limited_candidates),
+                deletion_candidates=len(candidates),
+                deletion_processed=processed,
+                deletion_failed=failed,
+                deletion_skipped_currently_displayed=skipped_current,
+                deletion_swap_fallback_used=swap_used,
+            )
 
         swap_ok, used_swap, swap_error = maybe_swap_current_art(art, target_cid, fallback_ids)
         if used_swap:
@@ -1129,12 +1233,38 @@ def process_seed_pending_deletions(
             failed += 1
             if swap_error:
                 errors.append(f"{key}:{swap_error}")
+            if callable(progress_callback):
+                progress_callback(
+                    action="delete_skipped",
+                    item=key,
+                    index=idx,
+                    total=len(limited_candidates),
+                    phase_status="swap_failed",
+                    deletion_candidates=len(candidates),
+                    deletion_processed=processed,
+                    deletion_failed=failed,
+                    deletion_skipped_currently_displayed=skipped_current,
+                    deletion_swap_fallback_used=swap_used,
+                )
             continue
 
         delete_result = delete_art_content_id(art, target_cid)
         if target_cid and not bool(delete_result.get("ok")):
             failed += 1
             errors.append(f"{key}:{delete_result.get('error')}")
+            if callable(progress_callback):
+                progress_callback(
+                    action="delete_failed",
+                    item=key,
+                    index=idx,
+                    total=len(limited_candidates),
+                    phase_status="delete_failed",
+                    deletion_candidates=len(candidates),
+                    deletion_processed=processed,
+                    deletion_failed=failed,
+                    deletion_skipped_currently_displayed=skipped_current,
+                    deletion_swap_fallback_used=swap_used,
+                )
             continue
 
         if seed_kind == "music_seed":
@@ -1142,11 +1272,37 @@ def process_seed_pending_deletions(
             if music_cleanup_errors:
                 failed += 1
                 errors.extend([f"{key}:{msg}" for msg in music_cleanup_errors])
+                if callable(progress_callback):
+                    progress_callback(
+                        action="delete_failed",
+                        item=key,
+                        index=idx,
+                        total=len(limited_candidates),
+                        phase_status="music_cleanup_failed",
+                        deletion_candidates=len(candidates),
+                        deletion_processed=processed,
+                        deletion_failed=failed,
+                        deletion_skipped_currently_displayed=skipped_current,
+                        deletion_swap_fallback_used=swap_used,
+                    )
                 continue
 
         mark_catalog_entry_deleted(entries, key)
         processed += 1
         changed = True
+        if callable(progress_callback):
+            progress_callback(
+                action="delete_completed",
+                item=key,
+                index=idx,
+                total=len(limited_candidates),
+                phase_status="deleted",
+                deletion_candidates=len(candidates),
+                deletion_processed=processed,
+                deletion_failed=failed,
+                deletion_skipped_currently_displayed=skipped_current,
+                deletion_swap_fallback_used=swap_used,
+            )
 
     if changed:
         persist_frame_art_catalog(catalog_path, catalog)
@@ -2500,11 +2656,30 @@ def handle_seed_restore(
         entries = {}
         catalog["entries"] = entries
 
+    scan_total = len(entries)
+    emit_seed_status(
+        tv_ip=tv_ip,
+        seed_kind=seed_kind,
+        requested_at=requested_at,
+        seed_dir_key=seed_dir_key,
+        seed_dir=seed_dir,
+        catalog_path=catalog_path,
+        force_reupload=force_reupload,
+        apply_deletions=apply_deletions,
+        auto_queue_missing=auto_queue_missing,
+        delete_limit=delete_limit,
+        total_files=len(files),
+        phase="scan",
+        phase_action="starting_seed_sync",
+        phase_total=scan_total,
+        scan_total=scan_total,
+    )
+
     existing_keys = {p.relative_to(seed_dir).as_posix() for p in files}
     existing_basenames = {p.name for p in files}
     auto_queued = 0
     if auto_queue_missing:
-        for key, raw_entry in list(entries.items()):
+        for idx, (key, raw_entry) in enumerate(list(entries.items()), start=1):
             entry = seed_catalog_entry(raw_entry)
             entries[key] = entry
             cid = str(entry.get("content_id", "")).strip()
@@ -2512,6 +2687,33 @@ def handle_seed_restore(
             if entry.get("state") == "active" and cid and key not in existing_keys and not is_legacy_basename_hit:
                 if mark_catalog_entry_pending_delete(entries, key, reason="missing_file_drift"):
                     auto_queued += 1
+                    phase_status = "queued_for_delete"
+                else:
+                    phase_status = "checked"
+            else:
+                phase_status = "checked"
+            emit_seed_status(
+                tv_ip=tv_ip,
+                seed_kind=seed_kind,
+                requested_at=requested_at,
+                seed_dir_key=seed_dir_key,
+                seed_dir=seed_dir,
+                catalog_path=catalog_path,
+                force_reupload=force_reupload,
+                apply_deletions=apply_deletions,
+                auto_queue_missing=auto_queue_missing,
+                delete_limit=delete_limit,
+                total_files=len(files),
+                phase="scan",
+                phase_action="checking_catalog_entry",
+                phase_index=idx,
+                phase_total=scan_total,
+                phase_item=str(key),
+                phase_status=phase_status,
+                scan_total=scan_total,
+                scan_checked_count=idx,
+                auto_queued_missing_count=auto_queued,
+            )
         if auto_queued:
             persist_frame_art_catalog(catalog_path, catalog)
 
@@ -2523,7 +2725,64 @@ def handle_seed_restore(
         "deletion_swap_fallback_used": 0,
         "deletion_errors": [],
     }
+    entries = catalog.get("entries") if isinstance(catalog.get("entries"), dict) else {}
+    deletion_candidates = 0
+    if isinstance(entries, dict):
+        deletion_candidates = sum(
+            1 for raw_entry in entries.values() if seed_catalog_entry(raw_entry).get("state") == "pending_delete"
+        )
+
+    emit_seed_status(
+        tv_ip=tv_ip,
+        seed_kind=seed_kind,
+        requested_at=requested_at,
+        seed_dir_key=seed_dir_key,
+        seed_dir=seed_dir,
+        catalog_path=catalog_path,
+        force_reupload=force_reupload,
+        apply_deletions=apply_deletions,
+        auto_queue_missing=auto_queue_missing,
+        delete_limit=delete_limit,
+        total_files=len(files),
+        phase="delete",
+        phase_action="processing_pending_deletions" if apply_deletions else "deletions_disabled",
+        phase_total=deletion_candidates,
+        scan_total=scan_total,
+        scan_checked_count=scan_total,
+        auto_queued_missing_count=auto_queued,
+        deletion_candidates=deletion_candidates,
+    )
+
     if apply_deletions:
+        def _emit_delete_progress(**fields: Any) -> None:
+            emit_seed_status(
+                tv_ip=tv_ip,
+                seed_kind=seed_kind,
+                requested_at=requested_at,
+                seed_dir_key=seed_dir_key,
+                seed_dir=seed_dir,
+                catalog_path=catalog_path,
+                force_reupload=force_reupload,
+                apply_deletions=apply_deletions,
+                auto_queue_missing=auto_queue_missing,
+                delete_limit=delete_limit,
+                total_files=len(files),
+                phase="delete",
+                phase_action=str(fields.get("action", "processing_pending_deletions")),
+                phase_index=int(fields.get("index", 0) or 0),
+                phase_total=int(fields.get("total", deletion_candidates) or 0),
+                phase_item=str(fields.get("item", "")),
+                phase_status=str(fields.get("phase_status", "")),
+                scan_total=scan_total,
+                scan_checked_count=scan_total,
+                auto_queued_missing_count=auto_queued,
+                deletion_candidates=int(fields.get("deletion_candidates", deletion_candidates) or 0),
+                deletion_processed=int(fields.get("deletion_processed", 0) or 0),
+                deletion_failed=int(fields.get("deletion_failed", 0) or 0),
+                deletion_skipped_currently_displayed=int(fields.get("deletion_skipped_currently_displayed", 0) or 0),
+                deletion_swap_fallback_used=int(fields.get("deletion_swap_fallback_used", 0) or 0),
+            )
+
         art, deletion_status = process_seed_pending_deletions(
             tv_ip,
             art,
@@ -2531,6 +2790,7 @@ def handle_seed_restore(
             catalog_path=catalog_path,
             catalog=catalog,
             delete_limit=delete_limit,
+            progress_callback=_emit_delete_progress,
         )
 
     uploaded_count = 0
@@ -2539,7 +2799,32 @@ def handle_seed_restore(
     failures: list[str] = []
     last_cid: Optional[str] = None
 
-    for image_path in files:
+    emit_seed_status(
+        tv_ip=tv_ip,
+        seed_kind=seed_kind,
+        requested_at=requested_at,
+        seed_dir_key=seed_dir_key,
+        seed_dir=seed_dir,
+        catalog_path=catalog_path,
+        force_reupload=force_reupload,
+        apply_deletions=apply_deletions,
+        auto_queue_missing=auto_queue_missing,
+        delete_limit=delete_limit,
+        total_files=len(files),
+        phase="upload",
+        phase_action="starting_upload_reconciliation",
+        phase_total=len(files),
+        scan_total=scan_total,
+        scan_checked_count=scan_total,
+        auto_queued_missing_count=auto_queued,
+        deletion_candidates=deletion_status.get("deletion_candidates", deletion_candidates),
+        deletion_processed=deletion_status.get("deletion_processed", 0),
+        deletion_failed=deletion_status.get("deletion_failed", 0),
+        deletion_skipped_currently_displayed=deletion_status.get("deletion_skipped_currently_displayed", 0),
+        deletion_swap_fallback_used=deletion_status.get("deletion_swap_fallback_used", 0),
+    )
+
+    for idx, image_path in enumerate(files, start=1):
         key = image_path.relative_to(seed_dir).as_posix()
         entry = seed_catalog_entry(entries.get(key))
         if entry.get("content_id", "") == "" and "/" in key:
@@ -2555,9 +2840,70 @@ def handle_seed_restore(
         if cached_id and not force_reupload:
             skipped_count += 1
             last_cid = cached_id
+            emit_seed_status(
+                tv_ip=tv_ip,
+                seed_kind=seed_kind,
+                requested_at=requested_at,
+                seed_dir_key=seed_dir_key,
+                seed_dir=seed_dir,
+                catalog_path=catalog_path,
+                force_reupload=force_reupload,
+                apply_deletions=apply_deletions,
+                auto_queue_missing=auto_queue_missing,
+                delete_limit=delete_limit,
+                total_files=len(files),
+                phase="upload",
+                phase_action="checking_cached_item",
+                phase_index=idx,
+                phase_total=len(files),
+                phase_item=key,
+                phase_status="already_synced",
+                uploaded_count=uploaded_count,
+                skipped_count=skipped_count,
+                failed_count=failed_count,
+                scan_total=scan_total,
+                scan_checked_count=scan_total,
+                auto_queued_missing_count=auto_queued,
+                deletion_candidates=deletion_status.get("deletion_candidates", deletion_candidates),
+                deletion_processed=deletion_status.get("deletion_processed", 0),
+                deletion_failed=deletion_status.get("deletion_failed", 0),
+                deletion_skipped_currently_displayed=deletion_status.get("deletion_skipped_currently_displayed", 0),
+                deletion_swap_fallback_used=deletion_status.get("deletion_swap_fallback_used", 0),
+                selected_content_id=last_cid,
+            )
             continue
 
         try:
+            emit_seed_status(
+                tv_ip=tv_ip,
+                seed_kind=seed_kind,
+                requested_at=requested_at,
+                seed_dir_key=seed_dir_key,
+                seed_dir=seed_dir,
+                catalog_path=catalog_path,
+                force_reupload=force_reupload,
+                apply_deletions=apply_deletions,
+                auto_queue_missing=auto_queue_missing,
+                delete_limit=delete_limit,
+                total_files=len(files),
+                phase="upload",
+                phase_action="uploading_cached_item",
+                phase_index=idx,
+                phase_total=len(files),
+                phase_item=key,
+                phase_status="uploading",
+                uploaded_count=uploaded_count,
+                skipped_count=skipped_count,
+                failed_count=failed_count,
+                scan_total=scan_total,
+                scan_checked_count=scan_total,
+                auto_queued_missing_count=auto_queued,
+                deletion_candidates=deletion_status.get("deletion_candidates", deletion_candidates),
+                deletion_processed=deletion_status.get("deletion_processed", 0),
+                deletion_failed=deletion_status.get("deletion_failed", 0),
+                deletion_skipped_currently_displayed=deletion_status.get("deletion_skipped_currently_displayed", 0),
+                deletion_swap_fallback_used=deletion_status.get("deletion_swap_fallback_used", 0),
+            )
             art, content_id = upload_local_file_with_reconnect(tv_ip, art, image_path)
             if not content_id:
                 raise ValueError("content_id missing after upload")
@@ -2565,9 +2911,72 @@ def handle_seed_restore(
             last_cid = content_id
             set_catalog_entry_active(entries, key, content_id)
             persist_frame_art_catalog(catalog_path, catalog)
+            emit_seed_status(
+                tv_ip=tv_ip,
+                seed_kind=seed_kind,
+                requested_at=requested_at,
+                seed_dir_key=seed_dir_key,
+                seed_dir=seed_dir,
+                catalog_path=catalog_path,
+                force_reupload=force_reupload,
+                apply_deletions=apply_deletions,
+                auto_queue_missing=auto_queue_missing,
+                delete_limit=delete_limit,
+                total_files=len(files),
+                phase="upload",
+                phase_action="uploading_cached_item",
+                phase_index=idx,
+                phase_total=len(files),
+                phase_item=key,
+                phase_status="uploaded",
+                uploaded_count=uploaded_count,
+                skipped_count=skipped_count,
+                failed_count=failed_count,
+                scan_total=scan_total,
+                scan_checked_count=scan_total,
+                auto_queued_missing_count=auto_queued,
+                deletion_candidates=deletion_status.get("deletion_candidates", deletion_candidates),
+                deletion_processed=deletion_status.get("deletion_processed", 0),
+                deletion_failed=deletion_status.get("deletion_failed", 0),
+                deletion_skipped_currently_displayed=deletion_status.get("deletion_skipped_currently_displayed", 0),
+                deletion_swap_fallback_used=deletion_status.get("deletion_swap_fallback_used", 0),
+                selected_content_id=last_cid,
+            )
         except Exception as exc:
             failed_count += 1
             failures.append(f"{key}: {repr(exc)}")
+            emit_seed_status(
+                tv_ip=tv_ip,
+                seed_kind=seed_kind,
+                requested_at=requested_at,
+                seed_dir_key=seed_dir_key,
+                seed_dir=seed_dir,
+                catalog_path=catalog_path,
+                force_reupload=force_reupload,
+                apply_deletions=apply_deletions,
+                auto_queue_missing=auto_queue_missing,
+                delete_limit=delete_limit,
+                total_files=len(files),
+                phase="upload",
+                phase_action="uploading_cached_item",
+                phase_index=idx,
+                phase_total=len(files),
+                phase_item=key,
+                phase_status="failed",
+                uploaded_count=uploaded_count,
+                skipped_count=skipped_count,
+                failed_count=failed_count,
+                scan_total=scan_total,
+                scan_checked_count=scan_total,
+                auto_queued_missing_count=auto_queued,
+                deletion_candidates=deletion_status.get("deletion_candidates", deletion_candidates),
+                deletion_processed=deletion_status.get("deletion_processed", 0),
+                deletion_failed=deletion_status.get("deletion_failed", 0),
+                deletion_skipped_currently_displayed=deletion_status.get("deletion_skipped_currently_displayed", 0),
+                deletion_swap_fallback_used=deletion_status.get("deletion_swap_fallback_used", 0),
+                selected_content_id=last_cid,
+                error=repr(exc),
+            )
 
     ok = failed_count == 0 and deletion_status.get("deletion_failed", 0) == 0 and (
         uploaded_count > 0 or skipped_count > 0 or deletion_status.get("deletion_processed", 0) > 0
@@ -2577,12 +2986,19 @@ def handle_seed_restore(
         "mode": "restore",
         "kind": seed_kind,
         "requested_at": requested_at,
+        "phase": "done",
+        "phase_action": "seed_sync_complete",
+        "phase_index": len(files),
+        "phase_total": len(files),
+        "phase_status": "completed" if ok else "completed_with_errors",
         seed_dir_key: str(seed_dir),
         "catalog_path": str(catalog_path),
         "force_reupload": force_reupload,
         "apply_deletions": apply_deletions,
         "auto_queue_missing": auto_queue_missing,
         "delete_limit": delete_limit,
+        "scan_total": scan_total,
+        "scan_checked_count": scan_total,
         "auto_queued_missing_count": auto_queued,
         "total_files": len(files),
         "uploaded_count": uploaded_count,
