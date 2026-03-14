@@ -3905,6 +3905,25 @@ def main() -> None:
                                         match_collection_name=track_info.get("collectionName") if isinstance(track_info, dict) else None,
                                         match_artist_name=track_info.get("artistName") if isinstance(track_info, dict) else None,
                                     )
+                                if not source_url and artist and album and album != track:
+                                    album_track_lookup_started_at = time.perf_counter()
+                                    log_music_generation_step("itunes_track_search_start", track_candidate=album, fallback_from="album")
+                                    track_info = itunes_track_search(artist, album, timeout_s=10)
+                                    source_url = resolve_artwork_url(track_info)
+                                    if collection_id is None and isinstance(track_info, dict):
+                                        resolved_collection = parse_collection_id_value(track_info.get("collectionId"))
+                                        if resolved_collection is not None:
+                                            collection_id = resolved_collection
+                                    log_music_generation_step(
+                                        "itunes_track_search_done",
+                                        track_candidate=album,
+                                        fallback_from="album",
+                                        duration_ms=int((time.perf_counter() - album_track_lookup_started_at) * 1000),
+                                        source_url_found=bool(source_url),
+                                        match_collection_id=track_info.get("collectionId") if isinstance(track_info, dict) else None,
+                                        match_collection_name=track_info.get("collectionName") if isinstance(track_info, dict) else None,
+                                        match_artist_name=track_info.get("artistName") if isinstance(track_info, dict) else None,
+                                    )
                                 if not source_url and not (artist and album) and collection_id is None:
                                     log_music_generation_step(
                                         "artwork_resolution_failed",

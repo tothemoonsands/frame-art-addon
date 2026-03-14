@@ -39,7 +39,12 @@ FRAME_FINAL_HEIGHT = 2160
 
 _slug_re = re.compile(r"[^a-z0-9]+")
 _artist_split_re = re.compile(r"\s*(?:,|&|\band\b|\bwith\b|\bfeat\.?\b|\bfeaturing\b|\bx\b)\s*", flags=re.IGNORECASE)
+_edition_noise_re = re.compile(
+    r"\b(?:deluxe|expanded|edition|version|remaster(?:ed)?|bonus|single|ep|live|demo|instrumentals?)\b",
+    flags=re.IGNORECASE,
+)
 ALLOWED_EXTENSIONS = {".jpg", ".jpeg", ".png"}
+DEFAULT_ITUNES_COUNTRY = "us"
 
 
 def _normalize_text(value: str) -> str:
@@ -48,6 +53,12 @@ def _normalize_text(value: str) -> str:
 
 def _tokens(value: str) -> set[str]:
     return {token for token in _normalize_text(value).split() if token}
+
+
+def _strip_editions(value: str) -> str:
+    cleaned = re.sub(r"\s*[\(\[].*?[\)\]]", " ", str(value or ""))
+    cleaned = _edition_noise_re.sub(" ", cleaned)
+    return _normalize_text(cleaned)
 
 
 def _artist_variants(artist: str) -> list[str]:
@@ -92,8 +103,10 @@ def _score_itunes_album_result(item: Any, *, wanted_artist: str, wanted_album: s
         return -1.0
 
     wanted_album_norm = _normalize_text(wanted_album)
+    wanted_album_core = _strip_editions(wanted_album)
     wanted_artist_norm = _normalize_text(wanted_artist)
     item_album_norm = _normalize_text(item_album_raw)
+    item_album_core = _strip_editions(item_album_raw)
     item_artist_norm = _normalize_text(item_artist_raw)
 
     score = 0.0
@@ -104,6 +117,11 @@ def _score_itunes_album_result(item: Any, *, wanted_artist: str, wanted_album: s
         elif wanted_album_norm in item_album_norm or item_album_norm in wanted_album_norm:
             score += 4.0
         score += SequenceMatcher(None, wanted_album_norm, item_album_norm).ratio() * 3.0
+    if wanted_album_core:
+        if item_album_core == wanted_album_core:
+            score += 4.0
+        elif wanted_album_core in item_album_core or item_album_core in wanted_album_core:
+            score += 2.0
 
     if wanted_artist_norm:
         if item_artist_norm == wanted_artist_norm:
@@ -115,16 +133,32 @@ def _score_itunes_album_result(item: Any, *, wanted_artist: str, wanted_album: s
         if wanted_tokens and item_tokens:
             overlap = len(wanted_tokens & item_tokens) / float(len(wanted_tokens | item_tokens))
             score += overlap * 2.0
+            if not (wanted_tokens & item_tokens):
+                score -= 6.0
+
+    wanted_album_tokens = _tokens(wanted_album_norm)
+    item_album_tokens = _tokens(item_album_norm)
+    if wanted_album_tokens and item_album_tokens:
+        overlap = len(wanted_album_tokens & item_album_tokens) / float(len(wanted_album_tokens | item_album_tokens))
+        score += overlap * 3.0
+        if overlap < 0.35:
+            score -= 4.0
+
+    # Avoid common edition mismatches unless the wanted album explicitly asks for one.
+    wanted_has_edition = bool(_edition_noise_re.search(wanted_album))
+    item_has_edition = bool(_edition_noise_re.search(item_album_raw))
+    if item_has_edition and not wanted_has_edition:
+        score -= 1.5
 
     if wanted_album_norm and wanted_artist_norm and item_album_norm and item_artist_norm:
         score += SequenceMatcher(None, f"{wanted_artist_norm} {wanted_album_norm}", f"{item_artist_norm} {item_album_norm}").ratio() * 1.5
     return score
 
 
-def _itunes_search_results(term: str, *, entity: str, limit: int, timeout_s: int) -> list[dict]:
+def _itunes_search_results(term: str, *, entity: str, limit: int, timeout_s: int, country: str = DEFAULT_ITUNES_COUNTRY) -> list[dict]:
     query = quote_plus(term.strip())
     resp = requests.get(
-        f"https://itunes.apple.com/search?term={query}&entity={entity}&limit={limit}",
+        f"https://itunes.apple.com/search?term={query}&entity={entity}&country={quote_plus(country)}&limit={limit}",
         timeout=timeout_s,
     )
     resp.raise_for_status()
@@ -161,28 +195,44 @@ def ensure_dirs() -> None:
     COMPRESSED_DIR.mkdir(parents=True, exist_ok=True)
 
 
-def itunes_lookup(collection_id: int, timeout_s: int = 10) -> dict:
+def itunes_lookup(collection_id: int, timeout_s: int = 10, country: str = DEFAULT_ITUNES_COUNTRY) -> dict:
     resp = requests.get(
-        f"https://itunes.apple.com/lookup?id={collection_id}&entity=album",
+        f"https://itunes.apple.com/lookup?id={collection_id}&entity=album&country={quote_plus(country)}",
         timeout=timeout_s,
     )
     resp.raise_for_status()
     return resp.json() if resp.text else {}
 
 
-def itunes_search(artist: str, album: str, timeout_s: int = 10) -> dict:
+def itunes_search(artist: str, album: str, timeout_s: int = 10, country: str = DEFAULT_ITUNES_COUNTRY) -> dict:
     artist_variants = _artist_variants(artist) or [str(artist or "").strip()]
     wanted_album = str(album or "").strip()
     collected: list[dict] = []
     seen_ids: set[str] = set()
 
+    # Prefer the exact artist phrasing first and mirror Ben Dodson's album-first search order.
+    search_terms: list[tuple[str, str]] = []
+    raw_artist = str(artist or "").strip()
+    if raw_artist and wanted_album:
+        search_terms.append(("exact", f"{wanted_album} {raw_artist}".strip()))
+        search_terms.append(("exact", f"{raw_artist} {wanted_album}".strip()))
+
     for artist_variant in artist_variants:
-        term = f"{artist_variant} {wanted_album}".strip()
-        for item in _itunes_search_results(term, entity="album", limit=10, timeout_s=timeout_s):
+        if _normalize_text(artist_variant) == _normalize_text(raw_artist):
+            continue
+        search_terms.append(("variant", f"{wanted_album} {artist_variant}".strip()))
+        search_terms.append(("variant", f"{artist_variant} {wanted_album}".strip()))
+
+    for query_kind, term in search_terms:
+        results = _itunes_search_results(term, entity="album", limit=10, timeout_s=timeout_s, country=country)
+        for index, item in enumerate(results):
             dedupe_key = str(item.get("collectionId") or item.get("collectionName") or item.get("artistName") or "")
             if dedupe_key in seen_ids:
                 continue
             seen_ids.add(dedupe_key)
+            item = dict(item)
+            item["_search_rank_bonus"] = (10 - index) / 20.0
+            item["_query_kind_bonus"] = 0.5 if query_kind == "exact" else 0.0
             collected.append(item)
 
     if not collected:
@@ -195,6 +245,8 @@ def itunes_search(artist: str, album: str, timeout_s: int = 10) -> dict:
             _score_itunes_album_result(item, wanted_artist=variant, wanted_album=wanted_album)
             for variant in artist_variants
         )
+        item_score += float(item.get("_search_rank_bonus") or 0.0)
+        item_score += float(item.get("_query_kind_bonus") or 0.0)
         if item_score > best_score:
             best_score = item_score
             best_item = item
@@ -203,7 +255,7 @@ def itunes_search(artist: str, album: str, timeout_s: int = 10) -> dict:
     return best_item if best_score >= 4.0 else {}
 
 
-def itunes_track_search(artist: str, track: str, timeout_s: int = 10) -> dict:
+def itunes_track_search(artist: str, track: str, timeout_s: int = 10, country: str = DEFAULT_ITUNES_COUNTRY) -> dict:
     artist_variants = _artist_variants(artist) or [str(artist or "").strip()]
     wanted_track = _normalize_text(track)
     if not wanted_track:
@@ -213,7 +265,7 @@ def itunes_track_search(artist: str, track: str, timeout_s: int = 10) -> dict:
     seen_ids: set[str] = set()
     for artist_variant in artist_variants:
         term = f"{artist_variant} {track}".strip()
-        for item in _itunes_search_results(term, entity="song", limit=10, timeout_s=timeout_s):
+        for item in _itunes_search_results(term, entity="song", limit=10, timeout_s=timeout_s, country=country):
             dedupe_key = str(item.get("trackId") or item.get("collectionId") or item.get("trackName") or "")
             if dedupe_key in seen_ids:
                 continue
