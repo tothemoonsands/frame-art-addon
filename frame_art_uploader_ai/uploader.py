@@ -83,7 +83,7 @@ MUSIC_RESTORE_KINDS = {"cover_art_reference_background", "cover_art_outpaint"}
 MUSIC_ASSOCIATION_SESSION_TTL_DAYS = 0
 
 RUNTIME_OPTIONS: dict[str, Any] = {}
-ADDON_VERSION = "1.27"
+ADDON_VERSION = "1.28"
 HOLIDAY_ALIASES = {
     "football": "huskers",
 }
@@ -4319,6 +4319,7 @@ def main() -> None:
                         "effective_show": show_flag,
                         "art_mode": is_art_mode,
                         "requested_music_session_key": str(restore_payload.get("music_session_key", "")).strip(),
+                        "restore_content_id": str(restore_payload.get("restore_content_id", "")).strip(),
                         "pick_source": pick_source,
                         "rng": rng,
                         "phase_roll": phase_roll,
@@ -4364,6 +4365,11 @@ def main() -> None:
                         "requested_at": requested_at,
                         "requested_music_session_key": (
                             str(restore_payload.get("music_session_key", "")).strip()
+                            if isinstance(locals().get("restore_payload"), dict)
+                            else ""
+                        ),
+                        "restore_content_id": (
+                            str(restore_payload.get("restore_content_id", "")).strip()
                             if isinstance(locals().get("restore_payload"), dict)
                             else ""
                         ),
