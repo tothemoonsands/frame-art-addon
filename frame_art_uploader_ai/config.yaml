@@ -1,10 +1,9 @@
 name: Frame Art Uploader AI
 slug: frame_art_uploader_ai
-version: "1.31"
+version: "2.0"
 description: >
-  Upload the newest AI-generated image to Samsung Frame Art Mode,
-  enforce true full-bleed display (16:9 crop + 4K upscale),
-  optionally select it immediately, and apply retention cleanup.
+  Upload AI artwork and music-inspired widescreen art to Samsung Frame TV,
+  mix in curated Samsung gallery selections, and keep uploads, queues, and cleanup in sync.
 startup: once
 boot: manual
 
