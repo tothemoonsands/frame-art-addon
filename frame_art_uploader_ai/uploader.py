@@ -83,7 +83,7 @@ MUSIC_RESTORE_KINDS = {"cover_art_reference_background", "cover_art_outpaint"}
 MUSIC_ASSOCIATION_SESSION_TTL_DAYS = 0
 
 RUNTIME_OPTIONS: dict[str, Any] = {}
-ADDON_VERSION = "1.25"
+ADDON_VERSION = "1.27"
 HOLIDAY_ALIASES = {
     "football": "huskers",
 }
@@ -711,6 +711,7 @@ def parse_restore_request_payload(payload: Any) -> tuple[Optional[dict], Optiona
         normalized["album"] = album
         normalized["track"] = track
         normalized["listening_mode"] = str(payload.get("listening_mode", "")).strip()
+        normalized["restore_content_id"] = str(payload.get("restore_content_id", "")).strip()
         normalized["source_preference"] = str(payload.get("source_preference", "")).strip().lower()
         collection_id_raw = payload.get("collection_id")
         if collection_id_raw in (None, ""):
@@ -2838,6 +2839,14 @@ def pick_cover_fallback(cache_key: str) -> Optional[Path]:
     return None
 
 
+def choose_music_failure_fallback(cache_key: str) -> tuple[Optional[Path], str, str, int, int]:
+    fallback_path = pick_cover_fallback(cache_key)
+    if fallback_path is not None:
+        return fallback_path, "music_fallback_file", str(fallback_path.parent), 1, 0
+
+    return None, "", "", 0, -1
+
+
 def upload_local_file(art: Any, file_path: Path) -> Optional[str]:
     raw_bytes = file_path.read_bytes()
     processed_bytes, file_type = prepare_for_frame(raw_bytes)
@@ -4084,22 +4093,54 @@ def main() -> None:
                                     "error": repr(e),
                                 }
                             )
-                            fallback_path = pick_cover_fallback(cache_key)
-                            if fallback_path is None:
-                                raise
-                            encoded_type = guess_file_type(fallback_path)
-                            encoded_bytes = fallback_path.stat().st_size
-                            art, target_cid = upload_local_file_with_reconnect(tv_ip, art, fallback_path)
-                            if not target_cid:
-                                raise ValueError("Fallback cover upload succeeded but content_id was not found")
-                            append_uploaded_id(state, "cover_uploaded_ids", target_cid)
-                            pick_source = "music_fallback_file"
-                            log_event("music_fallback_file", cache_key=cache_key, error=repr(cover_error), fallback=str(fallback_path))
-                            log_music_generation_step(
-                                "fallback_file_uploaded",
-                                fallback_path=str(fallback_path),
-                                selected_content_id=target_cid,
-                            )
+                            restore_content_id = str(restore_payload.get("restore_content_id", "")).strip()
+                            if restore_content_id:
+                                target_cid = restore_content_id
+                                resolved_folder = "pre_session_restore"
+                                file_count = 1
+                                chosen_index = 0
+                                selected_name = restore_content_id
+                                encoded_type = None
+                                encoded_bytes = None
+                                pick_source = "music_restore_content_id_fallback"
+                                log_event(
+                                    "music_restore_content_id_fallback",
+                                    cache_key=cache_key,
+                                    error=repr(cover_error),
+                                    restore_content_id=restore_content_id,
+                                )
+                                log_music_generation_step(
+                                    "restore_content_id_fallback_selected",
+                                    fallback_source=pick_source,
+                                    selected_content_id=target_cid,
+                                )
+                            else:
+                                fallback_path, fallback_source, fallback_folder, fallback_file_count, fallback_index = choose_music_failure_fallback(cache_key)
+                                if fallback_path is None:
+                                    raise
+                                resolved_folder = fallback_folder or resolved_folder
+                                file_count = fallback_file_count or file_count
+                                chosen_index = fallback_index if fallback_index >= 0 else chosen_index
+                                selected_name = fallback_path.name
+                                encoded_type = guess_file_type(fallback_path)
+                                encoded_bytes = fallback_path.stat().st_size
+                                art, target_cid = upload_local_file_with_reconnect(tv_ip, art, fallback_path)
+                                if not target_cid:
+                                    raise ValueError("Fallback cover upload succeeded but content_id was not found")
+                                append_uploaded_id(state, "cover_uploaded_ids", target_cid)
+                                pick_source = fallback_source or "music_fallback_file"
+                                log_event(
+                                    pick_source or "music_fallback_file",
+                                    cache_key=cache_key,
+                                    error=repr(cover_error),
+                                    fallback=str(fallback_path),
+                                )
+                                log_music_generation_step(
+                                    "fallback_file_uploaded",
+                                    fallback_path=str(fallback_path),
+                                    fallback_source=pick_source,
+                                    selected_content_id=target_cid,
+                                )
                 else:
                     raise ValueError(f"Unsupported restore kind: {kind!r}")
 

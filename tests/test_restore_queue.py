@@ -176,6 +176,32 @@ class RestoreQueueTests(unittest.TestCase):
 
         self.assertFalse(uploader.is_superseded_music_request(first, "cover_art_reference_background"))
 
+    def test_music_failure_fallback_uses_default_file_when_available(self):
+        fallback_file = self.root / "scene.jpg"
+        fallback_file.write_bytes(b"jpg")
+
+        with mock.patch.object(uploader, "pick_cover_fallback", return_value=fallback_file):
+            fallback_path, fallback_source, resolved_folder, file_count, chosen_index = uploader.choose_music_failure_fallback("aa_test_cache_key")
+
+        self.assertEqual(fallback_file, fallback_path)
+        self.assertEqual("music_fallback_file", fallback_source)
+        self.assertEqual(str(fallback_file.parent), resolved_folder)
+        self.assertEqual(1, file_count)
+        self.assertEqual(0, chosen_index)
+
+    def test_parse_cover_art_request_includes_restore_content_id(self):
+        payload = {
+            "kind": "cover_art_reference_background",
+            "requested_at": datetime.now(timezone.utc).isoformat(),
+            "artist": "Artist",
+            "album": "Album",
+            "restore_content_id": "MY_F42",
+        }
+        normalized, requested_show, err = uploader.parse_restore_request_payload(payload)
+        self.assertIsNone(err)
+        self.assertTrue(requested_show)
+        self.assertEqual("MY_F42", normalized["restore_content_id"])
+
     def test_parse_music_feedback_payload(self):
         payload = {
             "kind": "music_feedback",
