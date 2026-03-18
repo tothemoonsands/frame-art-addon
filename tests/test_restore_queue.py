@@ -904,6 +904,19 @@ class CoverArtPayloadNormalizationTests(unittest.TestCase):
         self.assertEqual("shazam", normalized["key_source"])
         self.assertEqual("album:yes|home-again", normalized["shazam_key"])
 
+    def test_vinyl_source_is_treated_as_shazam(self):
+        payload = {
+            "kind": "cover_art_reference",
+            "key_source": "vinyl",
+            "shazam_key": "album:yes|home-again",
+            "artist": "Michael Kiwanuka",
+            "album": "Home Again",
+        }
+        normalized, _, err = uploader.parse_restore_request_payload(payload)
+        self.assertIsNone(err)
+        self.assertEqual("shazam", normalized["key_source"])
+        self.assertEqual("album:yes|home-again", normalized["shazam_key"])
+
     def test_boolean_like_key_source_with_shazam_key_is_inferred_as_shazam(self):
         payload = {
             "kind": "cover_art_reference",

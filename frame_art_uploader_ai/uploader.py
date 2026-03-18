@@ -83,7 +83,7 @@ MUSIC_RESTORE_KINDS = {"cover_art_reference_background", "cover_art_outpaint"}
 MUSIC_ASSOCIATION_SESSION_TTL_DAYS = 0
 
 RUNTIME_OPTIONS: dict[str, Any] = {}
-ADDON_VERSION = "1.30"
+ADDON_VERSION = "2.2"
 HOLIDAY_ALIASES = {
     "football": "huskers",
 }
@@ -772,7 +772,7 @@ def parse_restore_request_payload(payload: Any) -> tuple[Optional[dict], Optiona
             for v in (shazam_key, music_session_key)
             if str(v).strip()
         )
-        inferred_shazam = key_source_raw == "shazam" or (
+        inferred_shazam = key_source_raw in {"shazam", "vinyl"} or (
             key_source_raw in {"true", "1", "yes", "on"} and shazam_like
         )
         key_source = "shazam" if inferred_shazam else key_source_raw
