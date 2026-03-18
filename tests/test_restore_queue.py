@@ -1079,6 +1079,48 @@ class MusicAssociationLookupTests(unittest.TestCase):
         self.assertEqual("MY_NEW", matched.get("content_id"))
         self.assertEqual("fresh_generation", matched.get("match_source"))
 
+    def test_lookup_prefers_shazam_alias_over_stale_session_alias_for_shazam_requests(self):
+        uploader.atomic_write_json(
+            self.assoc,
+            {
+                "version": 1,
+                "updated_at": "",
+                "entries": {
+                    "session::album:gregory porter|be good (deluxe edition)": {
+                        "cache_key": "gregory_cache",
+                        "catalog_key": "gregory__3840x2160.jpg",
+                        "content_id": "MY_OLD",
+                        "artist": "Gregory Porter",
+                        "album": "Be Good (Deluxe Edition)",
+                        "key_source": "sonos",
+                    },
+                    "shazam::album:tom misch|beat tape 2": {
+                        "cache_key": "tom_cache",
+                        "catalog_key": "tom__3840x2160.jpg",
+                        "content_id": "MY_NEW",
+                        "artist": "Tom Misch",
+                        "album": "Beat Tape 2",
+                        "key_source": "shazam",
+                    },
+                },
+            },
+        )
+
+        matched = uploader.lookup_music_association(
+            {
+                "artist": "Tom Misch",
+                "album": "Beat Tape 2",
+                "music_session_key": "album:gregory porter|be good (deluxe edition)",
+                "shazam_key": "album:tom misch|beat tape 2",
+                "key_source": "shazam",
+            }
+        )
+
+        self.assertIsInstance(matched, dict)
+        self.assertEqual("tom__3840x2160.jpg", matched.get("catalog_key"))
+        self.assertEqual("MY_NEW", matched.get("content_id"))
+        self.assertEqual("Tom Misch", matched.get("artist"))
+
     def test_fuzzy_lookup_from_association_record(self):
         uploader.update_music_association(
             {

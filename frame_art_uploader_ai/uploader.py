@@ -83,7 +83,7 @@ MUSIC_RESTORE_KINDS = {"cover_art_reference_background", "cover_art_outpaint"}
 MUSIC_ASSOCIATION_SESSION_TTL_DAYS = 0
 
 RUNTIME_OPTIONS: dict[str, Any] = {}
-ADDON_VERSION = "2.2"
+ADDON_VERSION = "2.3"
 HOLIDAY_ALIASES = {
     "football": "huskers",
 }
@@ -2405,11 +2405,20 @@ def lookup_music_association(restore_payload: dict[str, Any]) -> Optional[dict[s
     album_key_norm = normalized_album_association(artist, album)
     album_key_norm_legacy = normalized_album_association_legacy(artist, album)
 
+    key_source = str(restore_payload.get("key_source", "")).strip().lower()
+    prefer_shazam_key = key_source in {"shazam", "vinyl"}
+
     candidate_keys: list[str] = []
-    if music_session_key:
-        candidate_keys.append(f"session::{music_session_key}")
-    if shazam_key:
-        candidate_keys.append(f"shazam::{shazam_key}")
+    if prefer_shazam_key:
+        if shazam_key:
+            candidate_keys.append(f"shazam::{shazam_key}")
+        if music_session_key:
+            candidate_keys.append(f"session::{music_session_key}")
+    else:
+        if music_session_key:
+            candidate_keys.append(f"session::{music_session_key}")
+        if shazam_key:
+            candidate_keys.append(f"shazam::{shazam_key}")
     if album_key_raw:
         candidate_keys.append(f"album::{album_key_raw}")
     if album_key_norm:
