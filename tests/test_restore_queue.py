@@ -1683,6 +1683,42 @@ class MusicAssociationLookupTests(unittest.TestCase):
         self.assertEqual(1.0, record.get("cache_reuse_confidence"))
         self.assertTrue(uploader.should_reuse_music_association(record))
 
+    def test_exact_album_lookup_promotes_stale_low_confidence_record_for_reuse(self):
+        uploader.atomic_write_json(
+            self.assoc,
+            {
+                "version": 1,
+                "updated_at": "",
+                "entries": {
+                    "album_norm::death cab for cutie transatlanticism": {
+                        "cache_key": "aa_death-cab-for-cutie-transatlanticism_76a2e06f",
+                        "catalog_key": "aa_death-cab-for-cutie-transatlanticism_76a2e06f__3840x2160.jpg",
+                        "content_id": "MY_F5005",
+                        "artist": "Death Cab for Cutie",
+                        "album": "Transatlanticism",
+                        "match_source": "association_fuzzy",
+                        "match_confidence": 0.76,
+                        "cache_reuse_confidence": 0.76,
+                        "cache_reuse_recommended": False,
+                        "cache_reuse_reason": "low_confidence",
+                    }
+                },
+            },
+        )
+
+        matched = uploader.lookup_music_association(
+            {
+                "artist": "Death Cab for Cutie",
+                "album": "Transatlanticism",
+            }
+        )
+
+        self.assertIsInstance(matched, dict)
+        self.assertEqual("MY_F5005", matched.get("content_id"))
+        self.assertTrue(matched.get("cache_reuse_recommended"))
+        self.assertEqual("exact_metadata", matched.get("cache_reuse_reason"))
+        self.assertTrue(uploader.should_reuse_music_association(matched))
+
     def test_should_refresh_music_source_art_for_force_regen(self):
         self.assertTrue(
             uploader.should_refresh_music_source_art(

@@ -2408,6 +2408,29 @@ def lookup_music_association(restore_payload: dict[str, Any]) -> Optional[dict[s
     key_source = str(restore_payload.get("key_source", "")).strip().lower()
     prefer_shazam_key = key_source in {"shazam", "vinyl"}
 
+    def promote_exact_album_match(record: dict[str, Any], *, default_source: str = "exact") -> dict[str, Any]:
+        promoted = dict(record)
+        promoted.setdefault("match_source", default_source)
+        if bool(promoted.get("generation_blocked", False)):
+            return promoted
+
+        rec_artist = str(promoted.get("artist", "")).strip()
+        rec_album = str(promoted.get("album", "")).strip()
+        artist_matches = not artist or not rec_artist or music_text_equivalent(artist, rec_artist)
+        album_matches = not album or not rec_album or music_text_equivalent(album, rec_album)
+        if not (artist_matches and album_matches and (artist or album)):
+            return promoted
+
+        promoted["cache_reuse_recommended"] = True
+        promoted["cache_reuse_reason"] = "exact_metadata"
+        match_confidence = promoted.get("match_confidence")
+        if match_confidence in (None, ""):
+            promoted["match_confidence"] = 1.0
+        cache_reuse_confidence = promoted.get("cache_reuse_confidence")
+        if cache_reuse_confidence in (None, ""):
+            promoted["cache_reuse_confidence"] = float(promoted.get("match_confidence", 1.0) or 1.0)
+        return promoted
+
     candidate_keys: list[str] = []
     if prefer_shazam_key:
         if shazam_key:
@@ -2432,7 +2455,7 @@ def lookup_music_association(restore_payload: dict[str, Any]) -> Optional[dict[s
     for key in candidate_keys:
         record = entries.get(key)
         if isinstance(record, dict):
-            return record
+            return promote_exact_album_match(record)
 
     if album_key_norm:
         for key, record in entries.items():
@@ -2441,7 +2464,7 @@ def lookup_music_association(restore_payload: dict[str, Any]) -> Optional[dict[s
             raw_album_key = key.split("::", 1)[1]
             raw_norm = normalized_album_association(*raw_album_key.split(" — ", 1)) if " — " in raw_album_key else ""
             if raw_norm == album_key_norm:
-                return record
+                return promote_exact_album_match(record)
 
     collection_match = find_music_match_by_collection_id(collection_id)
     if isinstance(collection_match, dict):
