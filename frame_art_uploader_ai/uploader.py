@@ -82,11 +82,8 @@ MUSIC_RESTORE_KINDS = {"cover_art_reference_background", "cover_art_outpaint"}
 # Deprecated: session/shazam aliases no longer expire.
 MUSIC_ASSOCIATION_SESSION_TTL_DAYS = 0
 
-CONFIG_PATH_CANDIDATES = [
-    Path(__file__).with_name("config.yaml"),
-    Path("/app/config.yaml"),
-]
 RUNTIME_OPTIONS: dict[str, Any] = {}
+ADDON_VERSION = "2.81"
 HOLIDAY_ALIASES = {
     "football": "huskers",
 }
@@ -96,28 +93,6 @@ ACTIVE_TV_CONNECTIONS: list[Any] = []
 # ------------------------------------------------------------
 # Helpers
 # ------------------------------------------------------------
-
-def load_addon_version() -> str:
-    for env_key in ("FRAME_ART_ADDON_VERSION", "BUILD_VERSION", "ADDON_VERSION"):
-        env_value = str(os.getenv(env_key, "")).strip()
-        if env_value:
-            return env_value
-
-    for config_path in CONFIG_PATH_CANDIDATES:
-        try:
-            with open(config_path, "r", encoding="utf-8") as f:
-                for line in f:
-                    match = re.match(r'^\s*version:\s*["\']?([^"\']+)["\']?\s*$', line)
-                    if match:
-                        version = match.group(1).strip()
-                        if version:
-                            return version
-        except OSError:
-            continue
-    return "unknown"
-
-
-ADDON_VERSION = load_addon_version()
 
 
 def log_event(event: str, **fields: Any) -> None:
