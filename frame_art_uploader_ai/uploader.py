@@ -83,7 +83,7 @@ MUSIC_RESTORE_KINDS = {"cover_art_reference_background", "cover_art_outpaint"}
 MUSIC_ASSOCIATION_SESSION_TTL_DAYS = 0
 
 RUNTIME_OPTIONS: dict[str, Any] = {}
-ADDON_VERSION = "2.6"
+ADDON_VERSION = "2.7"
 HOLIDAY_ALIASES = {
     "football": "huskers",
 }
@@ -3200,6 +3200,37 @@ def dequeue_next_restore_work_item() -> Optional[Path]:
     return queued[0]
 
 
+def dequeue_next_restore_work_item_with_grace(
+    *,
+    grace_s: float = 0.0,
+    poll_interval_s: float = 0.1,
+    enqueue_inbox: bool = True,
+) -> Optional[Path]:
+    if enqueue_inbox:
+        enqueue_restore_inbox_if_present()
+    work_item = dequeue_next_restore_work_item()
+    if work_item is not None or grace_s <= 0:
+        return work_item
+
+    deadline = time.monotonic() + max(0.0, float(grace_s))
+    poll_interval = max(0.01, float(poll_interval_s))
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return None
+        time.sleep(min(poll_interval, remaining))
+        if enqueue_inbox:
+            enqueue_restore_inbox_if_present()
+        work_item = dequeue_next_restore_work_item()
+        if work_item is not None:
+            log_event(
+                "queue_drain_grace_hit",
+                waited_ms=int(max(0.0, grace_s - remaining) * 1000),
+                queue_file=work_item.name,
+            )
+            return work_item
+
+
 def is_music_restore_kind(kind: str) -> bool:
     return str(kind or "").strip().lower() in MUSIC_RESTORE_KINDS
 
@@ -3710,9 +3741,11 @@ def main() -> None:
             return
 
         handled_restore_work = False
+        queue_drain_grace_s = resolve_runtime_int_option("queue_drain_grace_s", 2, min_value=0, max_value=10)
         while True:
-            enqueue_restore_inbox_if_present()
-            work_item = dequeue_next_restore_work_item()
+            work_item = dequeue_next_restore_work_item_with_grace(
+                grace_s=queue_drain_grace_s if handled_restore_work else 0.0,
+            )
             if work_item is None:
                 break
             handled_restore_work = True

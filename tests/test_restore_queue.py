@@ -1,6 +1,7 @@
 import json
 import sys
 import tempfile
+import threading
 import types
 import unittest
 from datetime import datetime, timezone
@@ -87,6 +88,32 @@ class RestoreQueueTests(unittest.TestCase):
         self.assertEqual(3, len(queued))
         values = [json.loads(p.read_text(encoding="utf-8"))["value"] for p in queued]
         self.assertEqual(["R0", "R1", "R2"], values)
+
+    def test_dequeue_with_grace_picks_up_request_arriving_just_after_empty(self):
+        delayed_payload = {
+            "kind": "cover_art_reference",
+            "artist": "Delayed Artist",
+            "album": "Delayed Album",
+            "requested_at": datetime.now(timezone.utc).isoformat(),
+        }
+
+        def writer():
+            self._write_inbox(delayed_payload)
+
+        timer = threading.Timer(0.05, writer)
+        timer.start()
+        try:
+            queued = uploader.dequeue_next_restore_work_item_with_grace(grace_s=0.25, poll_interval_s=0.01)
+        finally:
+            timer.cancel()
+
+        self.assertIsNotNone(queued)
+        payload, requested_show, parse_error = uploader.load_restore_work_item(queued)
+        self.assertIsNone(parse_error)
+        self.assertIsNotNone(payload)
+        self.assertEqual("Delayed Artist", payload["artist"])
+        self.assertEqual("Delayed Album", payload["album"])
+        self.assertTrue(requested_show)
 
     def test_malformed_followed_by_valid(self):
         self.inbox.write_text("{not-json", encoding="utf-8")
