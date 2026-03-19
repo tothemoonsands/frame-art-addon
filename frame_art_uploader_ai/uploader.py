@@ -83,7 +83,7 @@ MUSIC_RESTORE_KINDS = {"cover_art_reference_background", "cover_art_outpaint"}
 MUSIC_ASSOCIATION_SESSION_TTL_DAYS = 0
 
 RUNTIME_OPTIONS: dict[str, Any] = {}
-ADDON_VERSION = "2.3"
+ADDON_VERSION = "2.6"
 HOLIDAY_ALIASES = {
     "football": "huskers",
 }
@@ -286,6 +286,40 @@ def write_status(payload: dict) -> None:
     payload["ts"] = time.monotonic()
     atomic_write_json(Path(STATUS_PATH), payload)
     log_event("status", **payload)
+
+
+def load_last_status_payload() -> dict[str, Any]:
+    try:
+        raw = json.loads(Path(STATUS_PATH).read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    return raw if isinstance(raw, dict) else {}
+
+
+def resolve_duplicate_music_request_content_id(payload: dict[str, Any], kind: str) -> Optional[str]:
+    if not is_music_restore_kind(kind):
+        return None
+    if bool(payload.get("force_regen", False)) or bool(payload.get("force_new_background", False)):
+        return None
+    if extract_remote_artwork_url(payload):
+        return None
+
+    requested_key = str(payload.get("music_session_key", "")).strip()
+    if not requested_key:
+        return None
+
+    last_status = load_last_status_payload()
+    if not last_status or last_status.get("ok") is not True:
+        return None
+    if not is_music_restore_kind(str(last_status.get("kind", "")).strip().lower()):
+        return None
+
+    last_key = str(last_status.get("requested_music_session_key", "")).strip()
+    selected_content_id = str(last_status.get("selected_content_id", "")).strip()
+    if requested_key != last_key or not selected_content_id:
+        return None
+
+    return selected_content_id
 
 
 def emit_seed_status(
@@ -3952,15 +3986,37 @@ def main() -> None:
                     )
                     continue
                 elif kind in {"cover_art_reference_background", "cover_art_outpaint"}:
-                    ensure_dirs()
-                    source_url = extract_remote_artwork_url(restore_payload)
-                    source_preference = str(restore_payload.get("source_preference", "")).strip().lower()
                     artist = str(restore_payload.get("artist", "")).strip()
                     album = str(restore_payload.get("album", "")).strip()
                     track = str(restore_payload.get("track", "")).strip()
+                    duplicate_content_id = resolve_duplicate_music_request_content_id(restore_payload, kind)
+                    if duplicate_content_id:
+                        target_cid = duplicate_content_id
+                        resolved_folder = "recent_music_status"
+                        file_count = 1
+                        chosen_index = 0
+                        selected_name = duplicate_content_id
+                        pick_source = "music_recent_duplicate"
+                        encoded_type = None
+                        encoded_bytes = None
+                        log_event(
+                            "music_duplicate_request_skipped",
+                            kind=kind,
+                            artist=artist,
+                            album=album,
+                            requested_music_session_key=str(restore_payload.get("music_session_key", "")).strip(),
+                            selected_content_id=target_cid,
+                        )
+                    else:
+                        ensure_dirs()
+                        source_url = extract_remote_artwork_url(restore_payload)
+                        source_preference = str(restore_payload.get("source_preference", "")).strip().lower()
                     force_regen = bool(restore_payload.get("force_regen", False))
                     force_new_background = bool(restore_payload.get("force_new_background", False))
-                    if source_url:
+                    if duplicate_content_id:
+                        source_url = ""
+                        source_preference = str(restore_payload.get("source_preference", "")).strip().lower()
+                    elif source_url:
                         parsed_source_url = urlparse(source_url)
                         log_event(
                             "music_request_source_url_present",
@@ -3991,7 +4047,7 @@ def main() -> None:
                         except Exception:
                             return None
 
-                    association_record = lookup_music_association(restore_payload)
+                    association_record = lookup_music_association(restore_payload) if not duplicate_content_id else None
                     if not source_url and isinstance(association_record, dict):
                         source_url = normalize_remote_artwork_url(association_record.get("artwork_url"))
                     manual_artwork_url_provided = bool(source_url)
@@ -4096,7 +4152,10 @@ def main() -> None:
                     music_retry_upload_path: Optional[Path] = wide_path if wide_path.exists() else None
                     music_retry_catalog_key: Optional[str] = None
 
-                    if force_regen:
+                    if duplicate_content_id:
+                        wide_path = Path("__recent_duplicate__")
+                        music_retry_upload_path = None
+                    elif force_regen:
                         selected_name = compressed_jpg_path.name
                         music_retry_upload_path = None
                         wide_path = Path("__force_regen__")
@@ -4111,7 +4170,9 @@ def main() -> None:
                         and should_reuse_music_association(association_record)
                     )
 
-                    if wide_path.exists() and reuse_cached_association:
+                    if duplicate_content_id:
+                        pick_source = "music_recent_duplicate"
+                    elif wide_path.exists() and reuse_cached_association:
                         catalog_key = music_catalog_key_for_path(wide_path)
                         music_retry_catalog_key = catalog_key
                         cached_content_id = lookup_catalog_content_id(MUSIC_CATALOG_PATH, catalog_key)

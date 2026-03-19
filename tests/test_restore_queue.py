@@ -45,9 +45,11 @@ class RestoreQueueTests(unittest.TestCase):
         self.inbox = self.root / "frame_art_restore_request.json"
         self.queue = self.root / "frame_art_restore_queue"
         self.lock = self.root / "frame_art_uploader_worker.lock"
+        self.status = self.root / "frame_art_uploader_last.json"
         self.music_overrides = self.root / "frame_art_music_overrides.json"
         self.music_catalog = self.root / "frame_art_music_catalog.json"
 
+        uploader.STATUS_PATH = str(self.status)
         uploader.RESTORE_REQUEST_PATH = str(self.inbox)
         uploader.RESTORE_QUEUE_DIR = self.queue
         uploader.WORKER_LOCK_PATH = self.lock
@@ -198,6 +200,55 @@ class RestoreQueueTests(unittest.TestCase):
         self.assertIsNotNone(second)
 
         self.assertFalse(uploader.is_superseded_music_request(first, "cover_art_reference_background"))
+
+    def test_duplicate_music_request_reuses_last_status_content_id(self):
+        self.status.write_text(
+            json.dumps(
+                {
+                    "ok": True,
+                    "kind": "cover_art_reference_background",
+                    "requested_music_session_key": "album:FKJ|Just Piano",
+                    "selected_content_id": "MY_F999",
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        content_id = uploader.resolve_duplicate_music_request_content_id(
+            {
+                "kind": "cover_art_reference_background",
+                "music_session_key": "album:FKJ|Just Piano",
+                "artist": "FKJ",
+                "album": "Just Piano",
+            },
+            "cover_art_reference_background",
+        )
+
+        self.assertEqual("MY_F999", content_id)
+
+    def test_duplicate_music_request_ignores_manual_artwork_override(self):
+        self.status.write_text(
+            json.dumps(
+                {
+                    "ok": True,
+                    "kind": "cover_art_reference_background",
+                    "requested_music_session_key": "album:FKJ|Just Piano",
+                    "selected_content_id": "MY_F999",
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        content_id = uploader.resolve_duplicate_music_request_content_id(
+            {
+                "kind": "cover_art_reference_background",
+                "music_session_key": "album:FKJ|Just Piano",
+                "artwork_url": "https://example.com/cover.jpg",
+            },
+            "cover_art_reference_background",
+        )
+
+        self.assertIsNone(content_id)
 
     def test_music_failure_fallback_uses_default_file_when_available(self):
         fallback_file = self.root / "scene.jpg"
