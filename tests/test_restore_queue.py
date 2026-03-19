@@ -228,6 +228,68 @@ class RestoreQueueTests(unittest.TestCase):
 
         self.assertFalse(uploader.is_superseded_music_request(first, "cover_art_reference_background"))
 
+    def test_superseded_visible_music_request_is_skipped_before_generation(self):
+        self._write_inbox(
+            {
+                "kind": "cover_art_reference",
+                "artist": "Old Artist",
+                "album": "Old Album",
+                "show": True,
+            }
+        )
+        first = uploader.enqueue_restore_inbox_if_present()
+        self.assertIsNotNone(first)
+
+        self._write_inbox(
+            {
+                "kind": "cover_art_outpaint",
+                "artist": "New Artist",
+                "album": "New Album",
+                "show": True,
+            }
+        )
+        second = uploader.enqueue_restore_inbox_if_present()
+        self.assertIsNotNone(second)
+
+        self.assertTrue(
+            uploader.should_skip_superseded_music_request(
+                first,
+                "cover_art_reference_background",
+                True,
+            )
+        )
+
+    def test_superseded_background_music_request_is_not_skipped(self):
+        self._write_inbox(
+            {
+                "kind": "cover_art_reference",
+                "artist": "Old Artist",
+                "album": "Old Album",
+                "show": False,
+            }
+        )
+        first = uploader.enqueue_restore_inbox_if_present()
+        self.assertIsNotNone(first)
+
+        self._write_inbox(
+            {
+                "kind": "cover_art_outpaint",
+                "artist": "New Artist",
+                "album": "New Album",
+                "show": True,
+            }
+        )
+        second = uploader.enqueue_restore_inbox_if_present()
+        self.assertIsNotNone(second)
+
+        self.assertFalse(
+            uploader.should_skip_superseded_music_request(
+                first,
+                "cover_art_reference_background",
+                False,
+            )
+        )
+
     def test_duplicate_music_request_reuses_last_status_content_id(self):
         self.status.write_text(
             json.dumps(

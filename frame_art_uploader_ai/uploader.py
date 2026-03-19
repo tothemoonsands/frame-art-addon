@@ -82,8 +82,8 @@ MUSIC_RESTORE_KINDS = {"cover_art_reference_background", "cover_art_outpaint"}
 # Deprecated: session/shazam aliases no longer expire.
 MUSIC_ASSOCIATION_SESSION_TTL_DAYS = 0
 
+CONFIG_PATH = Path(__file__).with_name("config.yaml")
 RUNTIME_OPTIONS: dict[str, Any] = {}
-ADDON_VERSION = "2.7"
 HOLIDAY_ALIASES = {
     "football": "huskers",
 }
@@ -93,6 +93,23 @@ ACTIVE_TV_CONNECTIONS: list[Any] = []
 # ------------------------------------------------------------
 # Helpers
 # ------------------------------------------------------------
+
+def load_addon_version() -> str:
+    try:
+        with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+            for line in f:
+                match = re.match(r'^\s*version:\s*["\']?([^"\']+)["\']?\s*$', line)
+                if match:
+                    version = match.group(1).strip()
+                    if version:
+                        return version
+    except OSError:
+        pass
+    return "unknown"
+
+
+ADDON_VERSION = load_addon_version()
+
 
 def log_event(event: str, **fields: Any) -> None:
     ts_wall = fields.get("ts_wall")
@@ -3271,6 +3288,18 @@ def is_superseded_music_request(work_item: Path, current_kind: str) -> bool:
     return False
 
 
+def should_skip_superseded_music_request(
+    work_item: Path,
+    current_kind: str,
+    requested_show: Optional[bool],
+) -> bool:
+    # Foreground music requests should yield to newer visible music/restore work.
+    # Background requests can continue because they no longer compete for display.
+    if requested_show is False:
+        return False
+    return is_superseded_music_request(work_item, current_kind)
+
+
 @contextmanager
 def worker_lock() -> Any:
     WORKER_LOCK_PATH.parent.mkdir(parents=True, exist_ok=True)
@@ -4022,6 +4051,41 @@ def main() -> None:
                     artist = str(restore_payload.get("artist", "")).strip()
                     album = str(restore_payload.get("album", "")).strip()
                     track = str(restore_payload.get("track", "")).strip()
+                    if should_skip_superseded_music_request(work_item, kind, requested_show):
+                        show_flag = False
+                        pick_source = "music_superseded_before_generation"
+                        log_event(
+                            "music_request_skipped",
+                            reason="superseded_before_generation",
+                            kind=kind,
+                            artist=artist,
+                            album=album,
+                            requested_at=requested_at,
+                            requested_music_session_key=str(restore_payload.get("music_session_key", "")).strip(),
+                        )
+                        write_status(
+                            {
+                                "ok": True,
+                                "mode": "restore",
+                                "tv_ip": tv_ip,
+                                "kind": kind,
+                                "value": request_value,
+                                "requested_at": requested_at,
+                                "requested_show": requested_show,
+                                "effective_show": False,
+                                "art_mode": is_art_mode,
+                                "requested_music_session_key": str(restore_payload.get("music_session_key", "")).strip(),
+                                "restore_content_id": str(restore_payload.get("restore_content_id", "")).strip(),
+                                "pick_source": pick_source,
+                                "addon_version": ADDON_VERSION,
+                                "selected_content_id": None,
+                                "chosen": None,
+                                "phase": "done",
+                                "phase_action": "skipped_superseded_music_request",
+                                "phase_status": "skipped",
+                            }
+                        )
+                        continue
                     duplicate_content_id = resolve_duplicate_music_request_content_id(restore_payload, kind)
                     if duplicate_content_id:
                         target_cid = duplicate_content_id
