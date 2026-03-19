@@ -152,6 +152,29 @@ class RestoreQueueTests(unittest.TestCase):
 
         self.assertFalse(uploader.is_superseded_music_request(first, "cover_art_reference_background"))
 
+    def test_music_request_is_superseded_by_newer_restore_with_suppress_flag(self):
+        self._write_inbox(
+            {
+                "kind": "cover_art_reference",
+                "artist": "Old Artist",
+                "album": "Old Album",
+            }
+        )
+        first = uploader.enqueue_restore_inbox_if_present()
+        self.assertIsNotNone(first)
+
+        self._write_inbox(
+            {
+                "content_id": "MY_F42",
+                "show": False,
+                "suppress_prior_music": True,
+            }
+        )
+        second = uploader.enqueue_restore_inbox_if_present()
+        self.assertIsNotNone(second)
+
+        self.assertTrue(uploader.is_superseded_music_request(first, "cover_art_reference_background"))
+
     def test_music_request_not_superseded_when_newer_music_show_false(self):
         self._write_inbox(
             {
@@ -256,6 +279,19 @@ class RestoreQueueTests(unittest.TestCase):
         self.assertIsNone(err)
         self.assertTrue(requested_show)
         self.assertTrue(normalized["force_new_background"])
+
+    def test_parse_restore_request_includes_suppress_prior_music(self):
+        payload = {
+            "content_id": "MY_F42",
+            "requested_at": datetime.now(timezone.utc).isoformat(),
+            "show": False,
+            "suppress_prior_music": True,
+        }
+        normalized, requested_show, err = uploader.parse_restore_request_payload(payload)
+        self.assertIsNone(err)
+        self.assertFalse(requested_show)
+        self.assertEqual("content_id", normalized["kind"])
+        self.assertTrue(normalized["suppress_prior_music"])
 
     def test_manual_override_preferred_for_lookup(self):
         ok = uploader.set_music_override_for_album(

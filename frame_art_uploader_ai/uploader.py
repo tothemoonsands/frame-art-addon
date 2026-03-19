@@ -740,6 +740,7 @@ def parse_restore_request_payload(payload: Any) -> tuple[Optional[dict], Optiona
             return None, requested_show, "Malformed restore timestamp"
 
     normalized = dict(payload)
+    normalized["suppress_prior_music"] = bool(payload.get("suppress_prior_music", False))
     kind = str(payload.get("kind", "")).strip().lower()
     if not kind:
         if payload.get("content_id"):
@@ -3169,6 +3170,16 @@ def is_music_restore_kind(kind: str) -> bool:
     return str(kind or "").strip().lower() in MUSIC_RESTORE_KINDS
 
 
+def request_suppresses_prior_music(payload: dict[str, Any], requested_show: Optional[bool]) -> bool:
+    if not isinstance(payload, dict):
+        return False
+    if bool(payload.get("suppress_prior_music", False)):
+        return True
+
+    kind = str(payload.get("kind", "")).strip().lower()
+    return is_music_restore_kind(kind) and requested_show is not False
+
+
 def is_superseded_music_request(work_item: Path, current_kind: str) -> bool:
     if not is_music_restore_kind(current_kind):
         return False
@@ -3189,8 +3200,7 @@ def is_superseded_music_request(work_item: Path, current_kind: str) -> bool:
         next_payload, next_requested_show, next_parse_error = load_restore_work_item(queued_item)
         if next_parse_error or not isinstance(next_payload, dict):
             continue
-        next_kind = str(next_payload.get("kind", "")).strip().lower()
-        if is_music_restore_kind(next_kind) and next_requested_show is not False:
+        if request_suppresses_prior_music(next_payload, next_requested_show):
             return True
 
     return False
