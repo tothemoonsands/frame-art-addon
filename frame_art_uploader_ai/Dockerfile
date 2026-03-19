@@ -25,6 +25,7 @@ RUN python3 -m pip install --no-cache-dir --break-system-packages \
 COPY run.sh /app/run.sh
 COPY uploader.py /app/uploader.py
 COPY cover_art.py /app/cover_art.py
+COPY config.yaml /app/config.yaml
 
 RUN chmod +x /app/run.sh
 
