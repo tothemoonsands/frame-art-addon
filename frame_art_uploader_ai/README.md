@@ -78,3 +78,16 @@ That makes the file useful both as a final status record and as a live progress 
 - `debug_logging: false` keeps logs compact and readable during normal operation.
 - `debug_logging: true` turns on verbose step-by-step logging for troubleshooting.
 - `FRAME_ART_LOG_JSON=1` can be added as an environment variable when you also want JSON log lines.
+
+## Local development on macOS
+
+To make local setup repeatable across Macs, this repo includes `make` targets that create a repo-local virtual environment and install the Python dependencies used for local runtime work.
+
+```bash
+cd /Users/jsands/Documents/Code/frame-art-addon
+make setup
+make test
+```
+
+- `make setup` creates `.venv` and installs `requests`, `pillow`, `rapidfuzz`, and `samsungtvws`.
+- `make test` runs `python -m unittest discover -s tests -v` using that local virtual environment, so you do not need to activate it first.
