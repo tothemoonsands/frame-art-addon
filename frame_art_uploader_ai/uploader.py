@@ -90,7 +90,7 @@ MUSIC_RESTORE_KINDS = {"cover_art_reference_background", "cover_art_outpaint"}
 MUSIC_ASSOCIATION_SESSION_TTL_DAYS = 0
 
 RUNTIME_OPTIONS: dict[str, Any] = {}
-ADDON_VERSION = "3.0"
+ADDON_VERSION = "3.01"
 HOLIDAY_ALIASES = {
     "football": "huskers",
 }
@@ -4054,9 +4054,16 @@ def main() -> None:
 
     # Fast path: do not open TV websocket when there is no queued restore work.
     enqueue_restore_inbox_if_present()
-    if dequeue_next_restore_work_item() is None:
+    initial_queue = list_queued_requests()
+    if not initial_queue:
+        log_event("idle_no_work", queue_depth=0)
         maybe_poll_current_display_state(tv_ip, state)
         return
+    log_event(
+        "queue_item_detected",
+        queue_depth=len(initial_queue),
+        queue_file=initial_queue[0].name,
+    )
 
     _ = resolve_runtime_int_option("art_ws_open_timeout_s", 15, min_value=3, max_value=60)
     _ = resolve_runtime_int_option("art_channel_timeout_s", 12, min_value=3, max_value=60)
@@ -4095,6 +4102,7 @@ def main() -> None:
             )
             if work_item is None:
                 break
+            log_event("queue_item_processing", queue_file=work_item.name)
             handled_restore_work = True
 
             requested_at = ""
