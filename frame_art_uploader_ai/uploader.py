@@ -2,6 +2,7 @@ import json
 import os
 import re
 import shutil
+import threading
 import time
 import uuid
 from difflib import SequenceMatcher
@@ -508,7 +509,16 @@ def update_current_display_state(
     if thumb_bytes is None:
         thumb_bytes = try_get_fallback_jpeg_bytes(local_path)
     if thumb_bytes is not None:
-        atomic_write_bytes(DISPLAY_CURRENT_IMAGE_PATH, thumb_bytes)
+        try:
+            atomic_write_bytes(DISPLAY_CURRENT_IMAGE_PATH, thumb_bytes)
+        except Exception as exc:
+            log_event(
+                "display_state_image_write_failed",
+                path=str(DISPLAY_CURRENT_IMAGE_PATH),
+                content_id=cid,
+                error=repr(exc),
+            )
+            thumb_bytes = None
 
     payload = {
         "content_id": cid,
@@ -529,7 +539,15 @@ def update_current_display_state(
     }
     if isinstance(current_info, dict):
         payload["art_label"] = str(current_info.get("matte_id", "")).strip()
-    atomic_write_json(DISPLAY_CURRENT_JSON_PATH, payload)
+    try:
+        atomic_write_json(DISPLAY_CURRENT_JSON_PATH, payload)
+    except Exception as exc:
+        log_event(
+            "display_state_json_write_failed",
+            path=str(DISPLAY_CURRENT_JSON_PATH),
+            content_id=cid,
+            error=repr(exc),
+        )
 
 
 def update_error_display_state(
@@ -565,7 +583,14 @@ def update_error_display_state(
         "image_available": False,
         "image_version": str(int(time.time())),
     }
-    atomic_write_json(DISPLAY_ERROR_JSON_PATH, payload)
+    try:
+        atomic_write_json(DISPLAY_ERROR_JSON_PATH, payload)
+    except Exception as exc:
+        log_event(
+            "display_error_json_write_failed",
+            path=str(DISPLAY_ERROR_JSON_PATH),
+            error=repr(exc),
+        )
 
 
 def maybe_poll_current_display_state(tv_ip: str, state: dict[str, Any]) -> None:
@@ -836,19 +861,30 @@ def extract_content_id(info: Any) -> Optional[str]:
 
 
 def get_current_info(art: Any) -> dict:
-    try:
-        current_state = art.get_current() or {}
-    except Exception:
+    result: dict[str, Any] = {}
+    finished = threading.Event()
+
+    def _worker() -> None:
+        nonlocal result
+        try:
+            current_state = art.get_current() or {}
+        except Exception:
+            current_state = {}
+
+        if isinstance(current_state, dict):
+            current_info = current_state.get("current") if isinstance(current_state.get("current"), dict) else {}
+            if not current_info:
+                current_info = current_state
+            if isinstance(current_info, dict):
+                result = current_info
+        finished.set()
+
+    threading.Thread(target=_worker, daemon=True).start()
+    timeout_s = resolve_runtime_int_option("art_get_current_timeout_s", 4, min_value=1, max_value=20)
+    if not finished.wait(timeout_s):
+        log_event("get_current_info_timeout", timeout_s=timeout_s)
         return {}
-
-    if not isinstance(current_state, dict):
-        return {}
-
-    current_info = current_state.get("current") if isinstance(current_state.get("current"), dict) else {}
-    if not current_info:
-        current_info = current_state
-
-    return current_info if isinstance(current_info, dict) else {}
+    return result
 
 
 def list_local_images(folder: Path) -> list[Path]:
