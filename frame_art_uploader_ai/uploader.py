@@ -71,6 +71,7 @@ ALLOWED_EXTENSIONS = {".jpg", ".jpeg", ".png"}
 AMBIENT_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp"}
 SEED_KINDS = {"ambient_seed", "holiday_seed", "music_seed"}
 DEFAULT_SEED_DELETE_LIMIT = 25
+SAMSUNG_PICK_STALE_PRUNE_AFTER = 3
 PHASE_SALT = {
     "pre_dawn": 101,
     "midday": 303,
@@ -83,7 +84,7 @@ MUSIC_RESTORE_KINDS = {"cover_art_reference_background", "cover_art_outpaint"}
 MUSIC_ASSOCIATION_SESSION_TTL_DAYS = 0
 
 RUNTIME_OPTIONS: dict[str, Any] = {}
-ADDON_VERSION = "2.81"
+ADDON_VERSION = "2.82"
 HOLIDAY_ALIASES = {
     "football": "huskers",
 }
@@ -408,6 +409,10 @@ def load_options() -> dict:
         return json.load(f)
 
 
+def save_options(options: dict[str, Any]) -> None:
+    atomic_write_json(Path(OPTIONS_PATH), options)
+
+
 def sanitize_local_uploaded_ids(value: Any) -> list[str]:
     if not isinstance(value, list):
         return []
@@ -445,6 +450,7 @@ def load_state() -> dict:
             "last_applied": None,
             "local_uploaded_ids": [],
             "cover_uploaded_ids": [],
+            "samsung_pick_failure_counts": {},
             "pending_keep_count_cleanup": False,
             "upload_timeout_streak": 0,
             "upload_timeout_cooldown_until": 0.0,
@@ -456,6 +462,7 @@ def load_state() -> dict:
             "last_applied": None,
             "local_uploaded_ids": [],
             "cover_uploaded_ids": [],
+            "samsung_pick_failure_counts": {},
             "pending_keep_count_cleanup": False,
             "upload_timeout_streak": 0,
             "upload_timeout_cooldown_until": 0.0,
@@ -465,6 +472,7 @@ def load_state() -> dict:
             "last_applied": None,
             "local_uploaded_ids": [],
             "cover_uploaded_ids": [],
+            "samsung_pick_failure_counts": {},
             "pending_keep_count_cleanup": False,
             "upload_timeout_streak": 0,
             "upload_timeout_cooldown_until": 0.0,
@@ -472,6 +480,25 @@ def load_state() -> dict:
     data.setdefault("last_applied", None)
     data["local_uploaded_ids"] = sanitize_local_uploaded_ids(data.get("local_uploaded_ids"))
     data["cover_uploaded_ids"] = sanitize_local_uploaded_ids(data.get("cover_uploaded_ids"))
+    raw_failure_counts = data.get("samsung_pick_failure_counts")
+    if not isinstance(raw_failure_counts, dict):
+        raw_failure_counts = {}
+    sanitized_failure_counts: dict[str, dict[str, Any]] = {}
+    for raw_cid, raw_info in raw_failure_counts.items():
+        cid = str(raw_cid or "").strip()
+        if not cid:
+            continue
+        info = raw_info if isinstance(raw_info, dict) else {}
+        try:
+            count = max(0, int(info.get("count", 0)))
+        except Exception:
+            count = 0
+        sanitized_failure_counts[cid] = {
+            "count": count,
+            "last_requested_at": str(info.get("last_requested_at", "")).strip(),
+            "last_error": str(info.get("last_error", "")).strip(),
+        }
+    data["samsung_pick_failure_counts"] = sanitized_failure_counts
     data["pending_keep_count_cleanup"] = bool(data.get("pending_keep_count_cleanup", False))
     try:
         data["upload_timeout_streak"] = max(0, int(data.get("upload_timeout_streak", 0)))
@@ -485,7 +512,7 @@ def load_state() -> dict:
 
 
 def save_state(state: dict) -> None:
-    Path(STATE_PATH).write_text(json.dumps(state, indent=2), encoding="utf-8")
+    atomic_write_json(Path(STATE_PATH), state)
 
 
 def register_tv_connection(tv: Any) -> Any:
@@ -692,8 +719,8 @@ def should_pick_samsung_bucket(rng: int, pick_samsung_pct: int) -> tuple[bool, i
     return prefer_samsung, bucket, samsung_buckets
 
 
-def choose_pick_samsung_id(payload: dict, rng: int, phase: str) -> Optional[str]:
-    options = RUNTIME_OPTIONS if isinstance(RUNTIME_OPTIONS, dict) else {}
+def get_pick_samsung_pool(payload: dict, phase: str, *, options: Optional[dict[str, Any]] = None) -> list[str]:
+    options = options if isinstance(options, dict) else (RUNTIME_OPTIONS if isinstance(RUNTIME_OPTIONS, dict) else {})
     samsung_pools = options.get("samsung_pools") if isinstance(options.get("samsung_pools"), dict) else {}
     holidays_pool = samsung_pools.get("holidays") if isinstance(samsung_pools.get("holidays"), dict) else {}
     ambient_pool = samsung_pools.get("ambient") if isinstance(samsung_pools.get("ambient"), dict) else {}
@@ -720,11 +747,108 @@ def choose_pick_samsung_id(payload: dict, rng: int, phase: str) -> Optional[str]
             if isinstance(maybe_list, list):
                 pool = [str(x).strip() for x in maybe_list if str(x).strip()]
 
+    return pool
+
+
+def choose_pick_samsung_id(
+    payload: dict,
+    rng: int,
+    phase: str,
+    *,
+    exclude_ids: Optional[set[str]] = None,
+) -> Optional[str]:
+    pool = get_pick_samsung_pool(payload, phase)
     if not pool:
         return None
 
+    excluded = exclude_ids or set()
     idx = (rng + PHASE_SALT.get(phase, PHASE_SALT[UNKNOWN_PHASE])) % len(pool)
-    return pool[idx]
+    for offset in range(len(pool)):
+        candidate = pool[(idx + offset) % len(pool)]
+        if candidate not in excluded:
+            return candidate
+    return None
+
+
+def record_samsung_pick_failure(
+    state: dict[str, Any],
+    content_id: str,
+    *,
+    requested_at: str = "",
+    error: str = "",
+) -> dict[str, Any]:
+    cid = str(content_id or "").strip()
+    if not cid:
+        return {"count": 0, "prune_after": SAMSUNG_PICK_STALE_PRUNE_AFTER, "should_prune": False}
+
+    entries = state.get("samsung_pick_failure_counts")
+    if not isinstance(entries, dict):
+        entries = {}
+        state["samsung_pick_failure_counts"] = entries
+
+    current = entries.get(cid) if isinstance(entries.get(cid), dict) else {}
+    try:
+        count = max(0, int(current.get("count", 0))) + 1
+    except Exception:
+        count = 1
+
+    entries[cid] = {
+        "count": count,
+        "last_requested_at": str(requested_at or "").strip(),
+        "last_error": str(error or "").strip(),
+    }
+    return {
+        "count": count,
+        "prune_after": SAMSUNG_PICK_STALE_PRUNE_AFTER,
+        "should_prune": count >= SAMSUNG_PICK_STALE_PRUNE_AFTER,
+    }
+
+
+def clear_samsung_pick_failure(state: dict[str, Any], content_id: str) -> None:
+    cid = str(content_id or "").strip()
+    if not cid:
+        return
+    entries = state.get("samsung_pick_failure_counts")
+    if not isinstance(entries, dict):
+        return
+    entries.pop(cid, None)
+
+
+def prune_samsung_content_id_from_options(content_id: str) -> dict[str, Any]:
+    cid = str(content_id or "").strip()
+    if not cid:
+        return {"removed_count": 0, "paths": []}
+
+    try:
+        options = load_options()
+    except Exception as exc:
+        return {"removed_count": 0, "paths": [], "error": repr(exc)}
+
+    removed_count = 0
+    paths: list[str] = []
+
+    def prune_node(node: Any, path_parts: list[str]) -> None:
+        nonlocal removed_count
+        if isinstance(node, list):
+            retained = [item for item in node if str(item).strip() != cid]
+            removed_here = len(node) - len(retained)
+            if removed_here:
+                node[:] = retained
+                removed_count += removed_here
+                paths.append(".".join(path_parts))
+            return
+        if isinstance(node, dict):
+            for key, value in node.items():
+                prune_node(value, [*path_parts, str(key)])
+
+    prune_node(options.get("samsung_pools"), ["samsung_pools"])
+    if removed_count:
+        save_options(options)
+        if isinstance(RUNTIME_OPTIONS, dict):
+            RUNTIME_OPTIONS.clear()
+            RUNTIME_OPTIONS.update(options)
+
+    return {"removed_count": removed_count, "paths": paths}
 
 
 def parse_shazam_album_match_key(raw_value: Any) -> tuple[str, str]:
@@ -3803,6 +3927,11 @@ def main() -> None:
                 cache_reuse_recommended_for_status: Optional[bool] = None
                 cache_reuse_reason_for_status: Optional[str] = None
                 pending_pick_last_applied: Optional[str] = None
+                attempted_content_ids: list[str] = []
+                stale_samsung_content_id: Optional[str] = None
+                stale_samsung_failure_count = 0
+                pruned_samsung_content_id: Optional[str] = None
+                pruned_samsung_pool_paths: list[str] = []
 
                 if kind == "content_id":
                     target_cid = request_value
@@ -3838,6 +3967,7 @@ def main() -> None:
                             pick_source = "samsung"
                             resolved_folder = "samsung_pool"
                             selected_name = target_cid
+                            attempted_content_ids.append(target_cid)
                         else:
                             pick_source = "local"
                     else:
@@ -4802,6 +4932,59 @@ def main() -> None:
                             sleep_s=1.0,
                         )
 
+                        if kind == "pick" and pick_source == "samsung" and target_cid:
+                            while not verified:
+                                stale_samsung_content_id = target_cid
+                                failure_info = record_samsung_pick_failure(
+                                    state,
+                                    target_cid,
+                                    requested_at=requested_at,
+                                    error=repr(select_attempt_error) if select_attempt_error else "select_unverified",
+                                )
+                                stale_samsung_failure_count = int(failure_info.get("count", 0))
+                                if failure_info.get("should_prune"):
+                                    prune_result = prune_samsung_content_id_from_options(target_cid)
+                                    if int(prune_result.get("removed_count", 0)) > 0:
+                                        pruned_samsung_content_id = target_cid
+                                        pruned_samsung_pool_paths = [
+                                            str(path)
+                                            for path in prune_result.get("paths", [])
+                                            if str(path).strip()
+                                        ]
+                                        clear_samsung_pick_failure(state, target_cid)
+                                        log_event(
+                                            "samsung_pick_content_id_pruned",
+                                            stale_content_id=target_cid,
+                                            paths=pruned_samsung_pool_paths,
+                                            failure_count=stale_samsung_failure_count,
+                                        )
+
+                                next_target_cid = choose_pick_samsung_id(
+                                    restore_payload,
+                                    rng,
+                                    phase,
+                                    exclude_ids={cid for cid in attempted_content_ids if cid},
+                                )
+                                if not next_target_cid:
+                                    break
+
+                                log_event(
+                                    "samsung_pick_retry_alternate_content_id",
+                                    stale_content_id=target_cid,
+                                    replacement_content_id=next_target_cid,
+                                    failure_count=stale_samsung_failure_count,
+                                )
+                                target_cid = next_target_cid
+                                selected_name = next_target_cid
+                                attempted_content_ids.append(next_target_cid)
+                                art, verified, select_attempt_error = select_and_verify_with_reconnect(
+                                    tv_ip,
+                                    art,
+                                    target_cid,
+                                    attempts=3,
+                                    sleep_s=1.0,
+                                )
+
                         retry_upload_file: Optional[Path] = pick_local_retry_file
                         retry_catalog_path: Optional[Path] = pick_local_retry_catalog_path
                         retry_catalog_key: Optional[str] = pick_local_retry_catalog_key
@@ -4884,6 +5067,9 @@ def main() -> None:
                 else:
                     verification_skipped = True
 
+                if kind == "pick" and pick_source == "samsung" and verified and target_cid:
+                    clear_samsung_pick_failure(state, target_cid)
+
                 if kind == "pick" and pending_pick_last_applied and verified:
                     state["last_applied"] = pending_pick_last_applied
 
@@ -4949,6 +5135,16 @@ def main() -> None:
                         "addon_version": ADDON_VERSION,
                         "selected_content_id": target_cid,
                         "chosen": selected_name or target_cid,
+                        "attempted_content_ids": attempted_content_ids,
+                        "stale_samsung_content_id": stale_samsung_content_id,
+                        "stale_samsung_failure_count": stale_samsung_failure_count,
+                        "pruned_samsung_content_id": pruned_samsung_content_id,
+                        "pruned_samsung_pool_paths": pruned_samsung_pool_paths,
+                        "error": (
+                            None
+                            if (not show_flag or verified)
+                            else (repr(locals().get("select_attempt_error")) if locals().get("select_attempt_error") else "select_unverified")
+                        ),
                         "deleted_local": deleted_local,
                         "cleanup_error": cleanup_error,
                         "keep_count_deleted": deleted_keep_count,
@@ -4988,6 +5184,16 @@ def main() -> None:
                             if isinstance(locals().get("restore_payload"), dict)
                             else ""
                         ),
+                        "requested_show": requested_show,
+                        "effective_show": show_flag if "show_flag" in locals() else None,
+                        "selected_content_id": locals().get("target_cid"),
+                        "chosen": locals().get("selected_name") or locals().get("target_cid"),
+                        "pick_source": locals().get("pick_source"),
+                        "attempted_content_ids": locals().get("attempted_content_ids", []),
+                        "stale_samsung_content_id": locals().get("stale_samsung_content_id"),
+                        "stale_samsung_failure_count": locals().get("stale_samsung_failure_count", 0),
+                        "pruned_samsung_content_id": locals().get("pruned_samsung_content_id"),
+                        "pruned_samsung_pool_paths": locals().get("pruned_samsung_pool_paths", []),
                         "restore_content_id": (
                             str(restore_payload.get("restore_content_id", "")).strip()
                             if isinstance(locals().get("restore_payload"), dict)

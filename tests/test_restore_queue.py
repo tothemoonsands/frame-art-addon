@@ -47,15 +47,30 @@ class RestoreQueueTests(unittest.TestCase):
         self.queue = self.root / "frame_art_restore_queue"
         self.lock = self.root / "frame_art_uploader_worker.lock"
         self.status = self.root / "frame_art_uploader_last.json"
+        self.state = self.root / "frame_art_uploader_state.json"
+        self.options = self.root / "options.json"
         self.music_overrides = self.root / "frame_art_music_overrides.json"
         self.music_catalog = self.root / "frame_art_music_catalog.json"
 
         uploader.STATUS_PATH = str(self.status)
+        uploader.STATE_PATH = str(self.state)
+        uploader.OPTIONS_PATH = str(self.options)
         uploader.RESTORE_REQUEST_PATH = str(self.inbox)
         uploader.RESTORE_QUEUE_DIR = self.queue
         uploader.WORKER_LOCK_PATH = self.lock
         uploader.MUSIC_OVERRIDES_PATH = self.music_overrides
         uploader.MUSIC_CATALOG_PATH = self.music_catalog
+        uploader.RUNTIME_OPTIONS = {
+            "samsung_pools": {
+                "ambient": {
+                    "spring": {
+                        "pre_dawn": ["SAM-A", "SAM-B", "SAM-C"],
+                    }
+                },
+                "holidays": {},
+            }
+        }
+        self.options.write_text(json.dumps(uploader.RUNTIME_OPTIONS), encoding="utf-8")
 
     def tearDown(self) -> None:
         self.tmp.cleanup()
@@ -180,6 +195,44 @@ class RestoreQueueTests(unittest.TestCase):
         self.assertIsNotNone(second)
 
         self.assertFalse(uploader.is_superseded_music_request(first, "cover_art_reference_background"))
+
+    def test_choose_pick_samsung_id_skips_excluded_ids(self):
+        picked = uploader.choose_pick_samsung_id(
+            {"season": "spring", "holiday": "none"},
+            rng=0,
+            phase="pre_dawn",
+            exclude_ids={"SAM-B"},
+        )
+        self.assertEqual("SAM-C", picked)
+
+    def test_record_samsung_pick_failure_prunes_after_threshold(self):
+        state = uploader.load_state()
+        first = uploader.record_samsung_pick_failure(state, "SAM-B", requested_at="2026-03-21T08:00:00-05:00")
+        second = uploader.record_samsung_pick_failure(state, "SAM-B", requested_at="2026-03-21T08:05:00-05:00")
+        third = uploader.record_samsung_pick_failure(state, "SAM-B", requested_at="2026-03-21T08:10:00-05:00")
+
+        self.assertEqual(1, first["count"])
+        self.assertFalse(first["should_prune"])
+        self.assertEqual(2, second["count"])
+        self.assertFalse(second["should_prune"])
+        self.assertEqual(3, third["count"])
+        self.assertTrue(third["should_prune"])
+
+    def test_prune_samsung_content_id_from_options_updates_runtime_options(self):
+        result = uploader.prune_samsung_content_id_from_options("SAM-B")
+
+        self.assertEqual(1, result["removed_count"])
+        self.assertEqual(["samsung_pools.ambient.spring.pre_dawn"], result["paths"])
+
+        saved = json.loads(self.options.read_text(encoding="utf-8"))
+        self.assertEqual(
+            ["SAM-A", "SAM-C"],
+            saved["samsung_pools"]["ambient"]["spring"]["pre_dawn"],
+        )
+        self.assertEqual(
+            ["SAM-A", "SAM-C"],
+            uploader.RUNTIME_OPTIONS["samsung_pools"]["ambient"]["spring"]["pre_dawn"],
+        )
 
     def test_music_request_is_superseded_by_newer_restore_with_suppress_flag(self):
         self._write_inbox(
