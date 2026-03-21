@@ -4109,6 +4109,12 @@ def main() -> None:
             payload_kind = None
             try:
                 restore_payload, requested_show, parse_error = load_restore_work_item(work_item)
+                log_event(
+                    "queue_item_loaded",
+                    queue_file=work_item.name,
+                    requested_show=requested_show,
+                    parse_error=parse_error,
+                )
                 if restore_payload:
                     payload_kind = str(restore_payload.get("kind", "")).strip().lower() or None
                     requested_at = str(restore_payload.get("requested_at", "")).strip()
@@ -4117,9 +4123,16 @@ def main() -> None:
                 if not restore_payload:
                     raise ValueError("Invalid restore payload")
 
-                current_info = get_current_info(art)
-                is_art_mode = bool(current_info) or extract_content_id(current_info) is not None
-                show_flag = requested_show if requested_show is not None else is_art_mode
+                current_info: dict[str, Any] = {}
+                is_art_mode = False
+                if requested_show is None:
+                    log_event("before_get_current_info", queue_file=work_item.name)
+                    current_info = get_current_info(art)
+                    log_event("after_get_current_info", queue_file=work_item.name)
+                    is_art_mode = bool(current_info) or extract_content_id(current_info) is not None
+                    show_flag = is_art_mode
+                else:
+                    show_flag = bool(requested_show)
 
                 kind = str(restore_payload.get("kind", "")).strip().lower()
                 request_value = str(restore_payload.get("value", "")).strip()
