@@ -42,12 +42,6 @@ from cover_art import (
 OPTIONS_PATH = "/data/options.json"
 STATUS_PATH = "/share/frame_art_uploader_last.json"
 STATE_PATH = "/data/frame_art_uploader_state.json"
-DISPLAY_DIR = Path("/share/frame_art_display")
-DISPLAY_CURRENT_JSON_PATH = DISPLAY_DIR / "current.json"
-DISPLAY_CURRENT_IMAGE_PATH = DISPLAY_DIR / "current.jpg"
-DISPLAY_ERROR_JSON_PATH = DISPLAY_DIR / "error.json"
-DISPLAY_ERROR_IMAGE_PATH = DISPLAY_DIR / "error.jpg"
-DISPLAY_POLL_INTERVAL_S = 3600
 
 # One-shot restore request written by Home Assistant.
 RESTORE_REQUEST_PATH = "/share/frame_art_restore_request.json"
@@ -411,227 +405,6 @@ def atomic_write_json(path: Path, payload: Any) -> None:
         json.dump(payload, f, indent=2)
     os.replace(tmp_path, path)
 
-
-def atomic_write_bytes(path: Path, payload: bytes) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp_name = f".{path.name}.{uuid.uuid4().hex}.tmp"
-    tmp_path = path.parent / tmp_name
-    with open(tmp_path, "wb") as f:
-        f.write(payload)
-    os.replace(tmp_path, path)
-
-
-def utc_now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
-
-
-def load_display_payload(path: Path) -> dict[str, Any]:
-    try:
-        raw = json.loads(path.read_text(encoding="utf-8"))
-    except Exception:
-        return {}
-    return raw if isinstance(raw, dict) else {}
-
-
-def clear_display_image(path: Path) -> None:
-    try:
-        path.unlink()
-    except FileNotFoundError:
-        pass
-    except Exception:
-        pass
-
-
-def image_bytes_from_path(path: Optional[Path]) -> Optional[bytes]:
-    if path is None:
-        return None
-    try:
-        return path.read_bytes()
-    except Exception:
-        return None
-
-
-def normalize_image_to_jpeg_bytes(raw_bytes: bytes) -> bytes:
-    with Image.open(BytesIO(raw_bytes)) as img:
-        out = BytesIO()
-        img.convert("RGB").save(out, format="JPEG", quality=92)
-        return out.getvalue()
-
-
-def try_get_thumbnail_bytes(art: Any, content_id: str) -> Optional[bytes]:
-    cid = str(content_id or "").strip()
-    if not cid:
-        return None
-    try:
-        thumb = art.get_thumbnail(cid)
-    except Exception:
-        return None
-    if not isinstance(thumb, (bytes, bytearray)):
-        return None
-    try:
-        return normalize_image_to_jpeg_bytes(bytes(thumb))
-    except Exception:
-        return None
-
-
-def try_get_fallback_jpeg_bytes(image_path: Optional[Path]) -> Optional[bytes]:
-    raw_bytes = image_bytes_from_path(image_path)
-    if raw_bytes is None:
-        return None
-    try:
-        return normalize_image_to_jpeg_bytes(raw_bytes)
-    except Exception:
-        return None
-
-
-def update_current_display_state(
-    *,
-    content_id: str,
-    source_kind: str,
-    observed_via: str,
-    art: Any,
-    pick_source: str = "",
-    requested_at: str = "",
-    season: str = "",
-    phase: str = "",
-    holiday: str = "",
-    selected_name: str = "",
-    catalog_path: Optional[Path] = None,
-    catalog_key: Optional[str] = None,
-    local_path: Optional[Path] = None,
-    current_info: Optional[dict[str, Any]] = None,
-) -> None:
-    cid = str(content_id or "").strip()
-    if not cid:
-        return
-
-    thumb_bytes = try_get_thumbnail_bytes(art, cid)
-    if thumb_bytes is None:
-        thumb_bytes = try_get_fallback_jpeg_bytes(local_path)
-    if thumb_bytes is not None:
-        try:
-            atomic_write_bytes(DISPLAY_CURRENT_IMAGE_PATH, thumb_bytes)
-        except Exception as exc:
-            log_event(
-                "display_state_image_write_failed",
-                path=str(DISPLAY_CURRENT_IMAGE_PATH),
-                content_id=cid,
-                error=repr(exc),
-            )
-            thumb_bytes = None
-
-    payload = {
-        "content_id": cid,
-        "source_kind": source_kind,
-        "observed_via": observed_via,
-        "pick_source": pick_source,
-        "requested_at": requested_at,
-        "season": season,
-        "phase": phase,
-        "holiday": holiday,
-        "selected_name": selected_name,
-        "catalog_path": str(catalog_path) if catalog_path else "",
-        "catalog_key": str(catalog_key or "").strip(),
-        "local_path": str(local_path) if local_path else "",
-        "updated_at": utc_now_iso(),
-        "image_available": bool(thumb_bytes is not None),
-        "image_version": str(int(time.time())),
-    }
-    if isinstance(current_info, dict):
-        payload["art_label"] = str(current_info.get("matte_id", "")).strip()
-    try:
-        atomic_write_json(DISPLAY_CURRENT_JSON_PATH, payload)
-    except Exception as exc:
-        log_event(
-            "display_state_json_write_failed",
-            path=str(DISPLAY_CURRENT_JSON_PATH),
-            content_id=cid,
-            error=repr(exc),
-        )
-
-
-def update_error_display_state(
-    *,
-    error: str,
-    requested_at: str = "",
-    pick_source: str = "",
-    attempted_content_id: str = "",
-    attempted_content_ids: Optional[list[str]] = None,
-    season: str = "",
-    phase: str = "",
-    holiday: str = "",
-    selected_name: str = "",
-    local_path: Optional[Path] = None,
-    catalog_path: Optional[Path] = None,
-    catalog_key: Optional[str] = None,
-) -> None:
-    clear_display_image(DISPLAY_ERROR_IMAGE_PATH)
-    payload = {
-        "error": str(error or "").strip(),
-        "requested_at": requested_at,
-        "pick_source": pick_source,
-        "attempted_content_id": str(attempted_content_id or "").strip(),
-        "attempted_content_ids": [str(item).strip() for item in (attempted_content_ids or []) if str(item).strip()],
-        "season": season,
-        "phase": phase,
-        "holiday": holiday,
-        "selected_name": selected_name,
-        "local_path": str(local_path) if local_path else "",
-        "catalog_path": str(catalog_path) if catalog_path else "",
-        "catalog_key": str(catalog_key or "").strip(),
-        "updated_at": utc_now_iso(),
-        "image_available": False,
-        "image_version": str(int(time.time())),
-    }
-    try:
-        atomic_write_json(DISPLAY_ERROR_JSON_PATH, payload)
-    except Exception as exc:
-        log_event(
-            "display_error_json_write_failed",
-            path=str(DISPLAY_ERROR_JSON_PATH),
-            error=repr(exc),
-        )
-
-
-def maybe_poll_current_display_state(tv_ip: str, state: dict[str, Any]) -> None:
-    now_ts = time.time()
-    last_poll_ts = float(state.get("display_poll_last_ts", 0.0) or 0.0)
-    if now_ts - last_poll_ts < DISPLAY_POLL_INTERVAL_S:
-        return
-
-    state["display_poll_last_ts"] = now_ts
-    save_state(state)
-
-    try:
-        tv = create_tv_client(tv_ip)
-        art = create_art_client(tv)
-        if not art.supported():
-            return
-        current_info = get_current_info(art)
-        current_id = extract_content_id(current_info)
-        if not current_id:
-            return
-
-        existing = load_display_payload(DISPLAY_CURRENT_JSON_PATH)
-        should_refresh = (
-            str(existing.get("content_id", "")).strip() != current_id
-            or not DISPLAY_CURRENT_IMAGE_PATH.exists()
-        )
-        if not should_refresh:
-            return
-
-        update_current_display_state(
-            content_id=current_id,
-            source_kind="poll_observed",
-            observed_via="hourly_poll",
-            art=art,
-            current_info=current_info,
-            selected_name=current_id,
-        )
-    except Exception as exc:
-        log_event("display_poll_failed", error=repr(exc))
-
-
 def load_options() -> dict:
     with open(OPTIONS_PATH, "r", encoding="utf-8") as f:
         return json.load(f)
@@ -682,7 +455,6 @@ def load_state() -> dict:
             "pending_keep_count_cleanup": False,
             "upload_timeout_streak": 0,
             "upload_timeout_cooldown_until": 0.0,
-            "display_poll_last_ts": 0.0,
         }
     try:
         data = json.loads(p.read_text(encoding="utf-8"))
@@ -695,7 +467,6 @@ def load_state() -> dict:
             "pending_keep_count_cleanup": False,
             "upload_timeout_streak": 0,
             "upload_timeout_cooldown_until": 0.0,
-            "display_poll_last_ts": 0.0,
         }
     if not isinstance(data, dict):
         return {
@@ -706,7 +477,6 @@ def load_state() -> dict:
             "pending_keep_count_cleanup": False,
             "upload_timeout_streak": 0,
             "upload_timeout_cooldown_until": 0.0,
-            "display_poll_last_ts": 0.0,
         }
     data.setdefault("last_applied", None)
     data["local_uploaded_ids"] = sanitize_local_uploaded_ids(data.get("local_uploaded_ids"))
@@ -739,10 +509,6 @@ def load_state() -> dict:
         data["upload_timeout_cooldown_until"] = float(data.get("upload_timeout_cooldown_until", 0.0))
     except Exception:
         data["upload_timeout_cooldown_until"] = 0.0
-    try:
-        data["display_poll_last_ts"] = float(data.get("display_poll_last_ts", 0.0))
-    except Exception:
-        data["display_poll_last_ts"] = 0.0
     return data
 
 
@@ -4110,7 +3876,6 @@ def main() -> None:
     initial_queue = list_queued_requests()
     if not initial_queue:
         log_event("idle_no_work", queue_depth=0)
-        maybe_poll_current_display_state(tv_ip, state)
         return
     log_event(
         "queue_item_detected",
@@ -4216,12 +3981,6 @@ def main() -> None:
                 stale_samsung_failure_count = 0
                 pruned_samsung_content_id: Optional[str] = None
                 pruned_samsung_pool_paths: list[str] = []
-                pick_phase = ""
-                pick_season = ""
-                pick_holiday = ""
-                pick_local_file: Optional[Path] = None
-                pick_local_catalog_path: Optional[Path] = None
-                pick_local_catalog_key: Optional[str] = None
 
                 if kind == "content_id":
                     target_cid = request_value
@@ -4249,10 +4008,6 @@ def main() -> None:
                     selected_name = local_path.name
                 elif kind == "pick":
                     rng, phase_roll, phase = compute_phase_roll(restore_payload)
-                    pick_phase = phase
-                    pick_season = str(restore_payload.get("season", "")).strip().lower()
-                    pick_holiday_raw = str(restore_payload.get("holiday", "none")).strip().lower()
-                    pick_holiday = HOLIDAY_ALIASES.get(pick_holiday_raw, pick_holiday_raw)
                     prefer_samsung, bucket, samsung_buckets = should_pick_samsung_bucket(rng, pick_samsung_pct)
 
                     if prefer_samsung:
@@ -4274,11 +4029,8 @@ def main() -> None:
                                 f"No candidate files found for pick request (kind={kind}, value={request_value!r}, resolved_folder={resolved_folder})"
                             )
 
-                        pick_local_file = pick_file
                         selected_name = pick_file.name
                         catalog_path, catalog_key = get_catalog_for_local_pick(pick_file)
-                        pick_local_catalog_path = catalog_path
-                        pick_local_catalog_key = catalog_key
                         catalog_hit = False
 
                         if catalog_path and catalog_key:
@@ -5370,43 +5122,6 @@ def main() -> None:
                 if kind == "pick" and pending_pick_last_applied and verified:
                     state["last_applied"] = pending_pick_last_applied
 
-                if kind == "pick" and show_flag and verified and target_cid:
-                    update_current_display_state(
-                        content_id=target_cid,
-                        source_kind="ambient_or_holiday",
-                        observed_via="event",
-                        art=art,
-                        pick_source=str(pick_source or ""),
-                        requested_at=requested_at,
-                        season=pick_season,
-                        phase=pick_phase,
-                        holiday=pick_holiday,
-                        selected_name=str(selected_name or target_cid),
-                        catalog_path=pick_local_catalog_path,
-                        catalog_key=pick_local_catalog_key,
-                        local_path=pick_local_file,
-                        current_info=get_current_info(art),
-                    )
-                elif kind == "pick" and show_flag and not verified:
-                    update_error_display_state(
-                        error=(
-                            repr(locals().get("select_attempt_error"))
-                            if locals().get("select_attempt_error")
-                            else "select_unverified"
-                        ),
-                        requested_at=requested_at,
-                        pick_source=str(pick_source or ""),
-                        attempted_content_id=str(target_cid or ""),
-                        attempted_content_ids=attempted_content_ids,
-                        season=pick_season,
-                        phase=pick_phase,
-                        holiday=pick_holiday,
-                        selected_name=str(selected_name or target_cid or ""),
-                        local_path=pick_local_file,
-                        catalog_path=pick_local_catalog_path,
-                        catalog_key=pick_local_catalog_key,
-                    )
-
                 deleted_local: list[str] = []
                 cleanup_error: Optional[str] = None
                 if kind == "pick" and pick_source == "local":
@@ -5506,21 +5221,6 @@ def main() -> None:
                     }
                 )
             except Exception as e:
-                if payload_kind == "pick":
-                    update_error_display_state(
-                        error=repr(e),
-                        requested_at=requested_at,
-                        pick_source=str(locals().get("pick_source") or ""),
-                        attempted_content_id=str(locals().get("target_cid") or ""),
-                        attempted_content_ids=locals().get("attempted_content_ids", []),
-                        season=str(locals().get("pick_season") or ""),
-                        phase=str(locals().get("pick_phase") or ""),
-                        holiday=str(locals().get("pick_holiday") or ""),
-                        selected_name=str(locals().get("selected_name") or locals().get("target_cid") or ""),
-                        local_path=locals().get("pick_local_file"),
-                        catalog_path=locals().get("pick_local_catalog_path"),
-                        catalog_key=locals().get("pick_local_catalog_key"),
-                    )
                 write_status(
                     {
                         "ok": False,
