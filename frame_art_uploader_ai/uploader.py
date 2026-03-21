@@ -51,7 +51,7 @@ DISPLAY_POLL_INTERVAL_S = 3600
 # One-shot restore request written by Home Assistant.
 RESTORE_REQUEST_PATH = "/share/frame_art_restore_request.json"
 RESTORE_QUEUE_DIR = Path("/share/frame_art_restore_queue")
-RESTORE_PROCESSING_DIR = Path("/data/frame_art_restore_processing")
+RESTORE_PROCESSING_DIR = Path("/share/frame_art_restore_processing")
 WORKER_LOCK_PATH = Path("/share/frame_art_uploader_worker.lock")
 FALLBACK_DIR = Path("/media/frame_ai/music/fallback")
 HOLIDAY_CATALOG_PATH = Path("/share/frame_art_holidays_catalog.json")
@@ -91,7 +91,7 @@ MUSIC_RESTORE_KINDS = {"cover_art_reference_background", "cover_art_outpaint"}
 MUSIC_ASSOCIATION_SESSION_TTL_DAYS = 0
 
 RUNTIME_OPTIONS: dict[str, Any] = {}
-ADDON_VERSION = "3.02"
+ADDON_VERSION = "3.03"
 HOLIDAY_ALIASES = {
     "football": "huskers",
 }
@@ -5529,6 +5529,22 @@ def main() -> None:
                     pass
 
         if handled_restore_work:
+            return
+
+        remaining_queue = list_queued_requests()
+        if remaining_queue:
+            write_status(
+                {
+                    "ok": False,
+                    "mode": "queue",
+                    "kind": "queue_claim_failed",
+                    "error": "Unable to claim queued restore work item",
+                    "queue_depth": len(remaining_queue),
+                    "queue_file": remaining_queue[0].name,
+                    "tv_ip": tv_ip,
+                    "addon_version": ADDON_VERSION,
+                }
+            )
             return
 
     img_path = newest_candidate(inbox_dir, prefix)
