@@ -45,7 +45,6 @@ class RestoreQueueTests(unittest.TestCase):
         self.root = Path(self.tmp.name)
         self.inbox = self.root / "frame_art_restore_request.json"
         self.queue = self.root / "frame_art_restore_queue"
-        self.processing = self.root / "frame_art_restore_processing"
         self.lock = self.root / "frame_art_uploader_worker.lock"
         self.status = self.root / "frame_art_uploader_last.json"
         self.state = self.root / "frame_art_uploader_state.json"
@@ -58,7 +57,6 @@ class RestoreQueueTests(unittest.TestCase):
         uploader.OPTIONS_PATH = str(self.options)
         uploader.RESTORE_REQUEST_PATH = str(self.inbox)
         uploader.RESTORE_QUEUE_DIR = self.queue
-        uploader.RESTORE_PROCESSING_DIR = self.processing
         uploader.WORKER_LOCK_PATH = self.lock
         uploader.MUSIC_OVERRIDES_PATH = self.music_overrides
         uploader.MUSIC_CATALOG_PATH = self.music_catalog
@@ -131,8 +129,6 @@ class RestoreQueueTests(unittest.TestCase):
         self.assertEqual("Delayed Artist", payload["artist"])
         self.assertEqual("Delayed Album", payload["album"])
         self.assertTrue(requested_show)
-        self.assertFalse(any(self.queue.glob("*.json")))
-        self.assertTrue(queued.exists())
 
     def test_malformed_followed_by_valid(self):
         self.inbox.write_text("{not-json", encoding="utf-8")

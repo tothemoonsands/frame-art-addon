@@ -2,7 +2,6 @@ import json
 import os
 import re
 import shutil
-import threading
 import time
 import uuid
 from difflib import SequenceMatcher
@@ -46,7 +45,6 @@ STATE_PATH = "/data/frame_art_uploader_state.json"
 # One-shot restore request written by Home Assistant.
 RESTORE_REQUEST_PATH = "/share/frame_art_restore_request.json"
 RESTORE_QUEUE_DIR = Path("/share/frame_art_restore_queue")
-RESTORE_PROCESSING_DIR = Path("/share/frame_art_restore_processing")
 WORKER_LOCK_PATH = Path("/share/frame_art_uploader_worker.lock")
 FALLBACK_DIR = Path("/media/frame_ai/music/fallback")
 HOLIDAY_CATALOG_PATH = Path("/share/frame_art_holidays_catalog.json")
@@ -86,7 +84,7 @@ MUSIC_RESTORE_KINDS = {"cover_art_reference_background", "cover_art_outpaint"}
 MUSIC_ASSOCIATION_SESSION_TTL_DAYS = 0
 
 RUNTIME_OPTIONS: dict[str, Any] = {}
-ADDON_VERSION = "3.03"
+ADDON_VERSION = "2.82"
 HOLIDAY_ALIASES = {
     "football": "huskers",
 }
@@ -405,6 +403,7 @@ def atomic_write_json(path: Path, payload: Any) -> None:
         json.dump(payload, f, indent=2)
     os.replace(tmp_path, path)
 
+
 def load_options() -> dict:
     with open(OPTIONS_PATH, "r", encoding="utf-8") as f:
         return json.load(f)
@@ -627,30 +626,19 @@ def extract_content_id(info: Any) -> Optional[str]:
 
 
 def get_current_info(art: Any) -> dict:
-    result: dict[str, Any] = {}
-    finished = threading.Event()
-
-    def _worker() -> None:
-        nonlocal result
-        try:
-            current_state = art.get_current() or {}
-        except Exception:
-            current_state = {}
-
-        if isinstance(current_state, dict):
-            current_info = current_state.get("current") if isinstance(current_state.get("current"), dict) else {}
-            if not current_info:
-                current_info = current_state
-            if isinstance(current_info, dict):
-                result = current_info
-        finished.set()
-
-    threading.Thread(target=_worker, daemon=True).start()
-    timeout_s = resolve_runtime_int_option("art_get_current_timeout_s", 4, min_value=1, max_value=20)
-    if not finished.wait(timeout_s):
-        log_event("get_current_info_timeout", timeout_s=timeout_s)
+    try:
+        current_state = art.get_current() or {}
+    except Exception:
         return {}
-    return result
+
+    if not isinstance(current_state, dict):
+        return {}
+
+    current_info = current_state.get("current") if isinstance(current_state.get("current"), dict) else {}
+    if not current_info:
+        current_info = current_state
+
+    return current_info if isinstance(current_info, dict) else {}
 
 
 def list_local_images(folder: Path) -> list[Path]:
@@ -3334,23 +3322,7 @@ def dequeue_next_restore_work_item() -> Optional[Path]:
     queued = list_queued_requests()
     if not queued:
         return None
-
-    RESTORE_PROCESSING_DIR.mkdir(parents=True, exist_ok=True)
-    for queued_item in queued:
-        processing_path = RESTORE_PROCESSING_DIR / queued_item.name
-        try:
-            os.replace(queued_item, processing_path)
-            return processing_path
-        except FileNotFoundError:
-            continue
-        except Exception as exc:
-            log_event(
-                "queue_item_claim_failed",
-                queue_file=queued_item.name,
-                reason=repr(exc),
-            )
-            continue
-    return None
+    return queued[0]
 
 
 def dequeue_next_restore_work_item_with_grace(
@@ -3873,15 +3845,8 @@ def main() -> None:
 
     # Fast path: do not open TV websocket when there is no queued restore work.
     enqueue_restore_inbox_if_present()
-    initial_queue = list_queued_requests()
-    if not initial_queue:
-        log_event("idle_no_work", queue_depth=0)
+    if dequeue_next_restore_work_item() is None:
         return
-    log_event(
-        "queue_item_detected",
-        queue_depth=len(initial_queue),
-        queue_file=initial_queue[0].name,
-    )
 
     _ = resolve_runtime_int_option("art_ws_open_timeout_s", 15, min_value=3, max_value=60)
     _ = resolve_runtime_int_option("art_channel_timeout_s", 12, min_value=3, max_value=60)
@@ -3920,19 +3885,12 @@ def main() -> None:
             )
             if work_item is None:
                 break
-            log_event("queue_item_processing", queue_file=work_item.name)
             handled_restore_work = True
 
             requested_at = ""
             payload_kind = None
             try:
                 restore_payload, requested_show, parse_error = load_restore_work_item(work_item)
-                log_event(
-                    "queue_item_loaded",
-                    queue_file=work_item.name,
-                    requested_show=requested_show,
-                    parse_error=parse_error,
-                )
                 if restore_payload:
                     payload_kind = str(restore_payload.get("kind", "")).strip().lower() or None
                     requested_at = str(restore_payload.get("requested_at", "")).strip()
@@ -3941,16 +3899,9 @@ def main() -> None:
                 if not restore_payload:
                     raise ValueError("Invalid restore payload")
 
-                current_info: dict[str, Any] = {}
-                is_art_mode = False
-                if requested_show is None:
-                    log_event("before_get_current_info", queue_file=work_item.name)
-                    current_info = get_current_info(art)
-                    log_event("after_get_current_info", queue_file=work_item.name)
-                    is_art_mode = bool(current_info) or extract_content_id(current_info) is not None
-                    show_flag = is_art_mode
-                else:
-                    show_flag = bool(requested_show)
+                current_info = get_current_info(art)
+                is_art_mode = bool(current_info) or extract_content_id(current_info) is not None
+                show_flag = requested_show if requested_show is not None else is_art_mode
 
                 kind = str(restore_payload.get("kind", "")).strip().lower()
                 request_value = str(restore_payload.get("value", "")).strip()
@@ -5265,22 +5216,6 @@ def main() -> None:
                     pass
 
         if handled_restore_work:
-            return
-
-        remaining_queue = list_queued_requests()
-        if remaining_queue:
-            write_status(
-                {
-                    "ok": False,
-                    "mode": "queue",
-                    "kind": "queue_claim_failed",
-                    "error": "Unable to claim queued restore work item",
-                    "queue_depth": len(remaining_queue),
-                    "queue_file": remaining_queue[0].name,
-                    "tv_ip": tv_ip,
-                    "addon_version": ADDON_VERSION,
-                }
-            )
             return
 
     img_path = newest_candidate(inbox_dir, prefix)
