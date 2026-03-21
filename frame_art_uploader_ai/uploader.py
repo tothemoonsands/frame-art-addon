@@ -51,6 +51,7 @@ DISPLAY_POLL_INTERVAL_S = 3600
 # One-shot restore request written by Home Assistant.
 RESTORE_REQUEST_PATH = "/share/frame_art_restore_request.json"
 RESTORE_QUEUE_DIR = Path("/share/frame_art_restore_queue")
+RESTORE_PROCESSING_DIR = Path("/data/frame_art_restore_processing")
 WORKER_LOCK_PATH = Path("/share/frame_art_uploader_worker.lock")
 FALLBACK_DIR = Path("/media/frame_ai/music/fallback")
 HOLIDAY_CATALOG_PATH = Path("/share/frame_art_holidays_catalog.json")
@@ -3531,7 +3532,23 @@ def dequeue_next_restore_work_item() -> Optional[Path]:
     queued = list_queued_requests()
     if not queued:
         return None
-    return queued[0]
+
+    RESTORE_PROCESSING_DIR.mkdir(parents=True, exist_ok=True)
+    for queued_item in queued:
+        processing_path = RESTORE_PROCESSING_DIR / queued_item.name
+        try:
+            os.replace(queued_item, processing_path)
+            return processing_path
+        except FileNotFoundError:
+            continue
+        except Exception as exc:
+            log_event(
+                "queue_item_claim_failed",
+                queue_file=queued_item.name,
+                reason=repr(exc),
+            )
+            continue
+    return None
 
 
 def dequeue_next_restore_work_item_with_grace(
