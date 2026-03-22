@@ -41,6 +41,9 @@ from cover_art import (
 OPTIONS_PATH = "/data/options.json"
 STATUS_PATH = "/share/frame_art_uploader_last.json"
 STATE_PATH = "/data/frame_art_uploader_state.json"
+DISPLAY_DIR = Path("/share/frame_art_display")
+DISPLAY_CURRENT_JSON_PATH = DISPLAY_DIR / "current.json"
+DISPLAY_ERROR_JSON_PATH = DISPLAY_DIR / "error.json"
 
 # One-shot restore request written by Home Assistant.
 RESTORE_REQUEST_PATH = "/share/frame_art_restore_request.json"
@@ -84,7 +87,7 @@ MUSIC_RESTORE_KINDS = {"cover_art_reference_background", "cover_art_outpaint"}
 MUSIC_ASSOCIATION_SESSION_TTL_DAYS = 0
 
 RUNTIME_OPTIONS: dict[str, Any] = {}
-ADDON_VERSION = "2.82"
+ADDON_VERSION = "3.04"
 HOLIDAY_ALIASES = {
     "football": "huskers",
 }
@@ -402,6 +405,99 @@ def atomic_write_json(path: Path, payload: Any) -> None:
     with open(tmp_path, "w", encoding="utf-8") as f:
         json.dump(payload, f, indent=2)
     os.replace(tmp_path, path)
+
+
+def utc_now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
+
+
+def update_current_display_state(
+    *,
+    content_id: str,
+    source_kind: str,
+    observed_via: str,
+    pick_source: str = "",
+    requested_at: str = "",
+    season: str = "",
+    phase: str = "",
+    holiday: str = "",
+    selected_name: str = "",
+    catalog_path: Optional[Path] = None,
+    catalog_key: Optional[str] = None,
+    local_path: Optional[Path] = None,
+) -> None:
+    cid = str(content_id or "").strip()
+    if not cid:
+        return
+
+    payload = {
+        "content_id": cid,
+        "source_kind": str(source_kind or "").strip(),
+        "observed_via": str(observed_via or "").strip(),
+        "pick_source": str(pick_source or "").strip(),
+        "requested_at": str(requested_at or "").strip(),
+        "season": str(season or "").strip(),
+        "phase": str(phase or "").strip(),
+        "holiday": str(holiday or "").strip(),
+        "selected_name": str(selected_name or cid).strip(),
+        "catalog_path": str(catalog_path) if catalog_path else "",
+        "catalog_key": str(catalog_key or "").strip(),
+        "local_path": str(local_path) if local_path else "",
+        "updated_at": utc_now_iso(),
+        "image_available": True,
+        "image_version": str(int(time.time())),
+    }
+    try:
+        atomic_write_json(DISPLAY_CURRENT_JSON_PATH, payload)
+    except Exception as exc:
+        log_event(
+            "display_current_json_write_failed",
+            path=str(DISPLAY_CURRENT_JSON_PATH),
+            content_id=cid,
+            error=repr(exc),
+        )
+
+
+def update_error_display_state(
+    *,
+    error: str,
+    requested_at: str = "",
+    pick_source: str = "",
+    attempted_content_id: str = "",
+    attempted_content_ids: Optional[list[str]] = None,
+    season: str = "",
+    phase: str = "",
+    holiday: str = "",
+    selected_name: str = "",
+    local_path: Optional[Path] = None,
+    catalog_path: Optional[Path] = None,
+    catalog_key: Optional[str] = None,
+) -> None:
+    payload = {
+        "error": str(error or "").strip(),
+        "requested_at": str(requested_at or "").strip(),
+        "pick_source": str(pick_source or "").strip(),
+        "attempted_content_id": str(attempted_content_id or "").strip(),
+        "attempted_content_ids": [str(item).strip() for item in (attempted_content_ids or []) if str(item).strip()],
+        "season": str(season or "").strip(),
+        "phase": str(phase or "").strip(),
+        "holiday": str(holiday or "").strip(),
+        "selected_name": str(selected_name or "").strip(),
+        "local_path": str(local_path) if local_path else "",
+        "catalog_path": str(catalog_path) if catalog_path else "",
+        "catalog_key": str(catalog_key or "").strip(),
+        "updated_at": utc_now_iso(),
+        "image_available": bool(attempted_content_id or local_path),
+        "image_version": str(int(time.time())),
+    }
+    try:
+        atomic_write_json(DISPLAY_ERROR_JSON_PATH, payload)
+    except Exception as exc:
+        log_event(
+            "display_error_json_write_failed",
+            path=str(DISPLAY_ERROR_JSON_PATH),
+            error=repr(exc),
+        )
 
 
 def load_options() -> dict:
@@ -3932,6 +4028,13 @@ def main() -> None:
                 stale_samsung_failure_count = 0
                 pruned_samsung_content_id: Optional[str] = None
                 pruned_samsung_pool_paths: list[str] = []
+                display_source_kind = kind
+                display_local_path: Optional[Path] = None
+                display_catalog_path: Optional[Path] = None
+                display_catalog_key: Optional[str] = None
+                display_phase = ""
+                display_season = ""
+                display_holiday = ""
 
                 if kind == "content_id":
                     target_cid = request_value
@@ -3957,8 +4060,14 @@ def main() -> None:
                     file_count = 1
                     chosen_index = 0
                     selected_name = local_path.name
+                    display_local_path = local_path
                 elif kind == "pick":
                     rng, phase_roll, phase = compute_phase_roll(restore_payload)
+                    display_source_kind = "ambient_or_holiday"
+                    display_phase = phase
+                    display_season = str(restore_payload.get("season", "")).strip().lower()
+                    pick_holiday_raw = str(restore_payload.get("holiday", "none")).strip().lower()
+                    display_holiday = HOLIDAY_ALIASES.get(pick_holiday_raw, pick_holiday_raw)
                     prefer_samsung, bucket, samsung_buckets = should_pick_samsung_bucket(rng, pick_samsung_pct)
 
                     if prefer_samsung:
@@ -3982,6 +4091,9 @@ def main() -> None:
 
                         selected_name = pick_file.name
                         catalog_path, catalog_key = get_catalog_for_local_pick(pick_file)
+                        display_local_path = pick_file
+                        display_catalog_path = catalog_path
+                        display_catalog_key = catalog_key
                         catalog_hit = False
 
                         if catalog_path and catalog_key:
@@ -4162,6 +4274,7 @@ def main() -> None:
                     )
                     continue
                 elif kind in {"cover_art_reference_background", "cover_art_outpaint"}:
+                    display_source_kind = "music"
                     artist = str(restore_payload.get("artist", "")).strip()
                     album = str(restore_payload.get("album", "")).strip()
                     track = str(restore_payload.get("track", "")).strip()
@@ -5171,6 +5284,80 @@ def main() -> None:
                         "match_candidates": match_candidates_for_status,
                     }
                 )
+
+                if show_flag and verified and target_cid:
+                    final_local_path = (
+                        display_local_path
+                        or locals().get("music_retry_upload_path")
+                        or locals().get("wide_path")
+                        or locals().get("fallback_path")
+                        or locals().get("local_path")
+                    )
+                    final_catalog_path = (
+                        display_catalog_path
+                        or locals().get("catalog_path")
+                        or (MUSIC_CATALOG_PATH if kind in {"cover_art_reference_background", "cover_art_outpaint"} else None)
+                    )
+                    final_catalog_key = (
+                        display_catalog_key
+                        or locals().get("catalog_key")
+                        or locals().get("music_catalog_key")
+                        or locals().get("music_retry_catalog_key")
+                    )
+                    update_current_display_state(
+                        content_id=target_cid,
+                        source_kind=display_source_kind,
+                        observed_via="event",
+                        pick_source=str(pick_source or ""),
+                        requested_at=requested_at,
+                        season=display_season,
+                        phase=display_phase,
+                        holiday=display_holiday,
+                        selected_name=str(selected_name or target_cid),
+                        catalog_path=final_catalog_path,
+                        catalog_key=final_catalog_key,
+                        local_path=final_local_path,
+                    )
+                elif show_flag and not verified:
+                    attempted_content_id = str(target_cid or restore_payload.get("restore_content_id", "")).strip()
+                    if not attempted_content_id:
+                        attempted_content_id = str(restore_payload.get("current_content_id", "")).strip()
+                    error_local_path = (
+                        display_local_path
+                        or locals().get("music_retry_upload_path")
+                        or locals().get("wide_path")
+                        or locals().get("fallback_path")
+                        or locals().get("local_path")
+                    )
+                    error_catalog_path = (
+                        display_catalog_path
+                        or locals().get("catalog_path")
+                        or (MUSIC_CATALOG_PATH if kind in {"cover_art_reference_background", "cover_art_outpaint"} else None)
+                    )
+                    error_catalog_key = (
+                        display_catalog_key
+                        or locals().get("catalog_key")
+                        or locals().get("music_catalog_key")
+                        or locals().get("music_retry_catalog_key")
+                    )
+                    update_error_display_state(
+                        error=(
+                            repr(locals().get("select_attempt_error"))
+                            if locals().get("select_attempt_error")
+                            else "select_unverified"
+                        ),
+                        requested_at=requested_at,
+                        pick_source=str(pick_source or ""),
+                        attempted_content_id=attempted_content_id,
+                        attempted_content_ids=attempted_content_ids,
+                        season=display_season,
+                        phase=display_phase,
+                        holiday=display_holiday,
+                        selected_name=str(selected_name or attempted_content_id),
+                        local_path=error_local_path,
+                        catalog_path=error_catalog_path,
+                        catalog_key=error_catalog_key,
+                    )
             except Exception as e:
                 write_status(
                     {
@@ -5208,6 +5395,40 @@ def main() -> None:
                         "cache_reuse_reason": locals().get("cache_reuse_reason_for_status"),
                         "match_candidates": locals().get("match_candidates_for_status", []),
                     }
+                )
+                attempted_content_id = str(locals().get("target_cid") or "").strip()
+                if not attempted_content_id and isinstance(locals().get("restore_payload"), dict):
+                    attempted_content_id = str(locals()["restore_payload"].get("restore_content_id", "")).strip()
+                if not attempted_content_id and isinstance(locals().get("restore_payload"), dict):
+                    attempted_content_id = str(locals()["restore_payload"].get("current_content_id", "")).strip()
+                update_error_display_state(
+                    error=repr(e),
+                    requested_at=requested_at,
+                    pick_source=str(locals().get("pick_source") or ""),
+                    attempted_content_id=attempted_content_id,
+                    attempted_content_ids=locals().get("attempted_content_ids", []),
+                    season=str(locals().get("display_season") or ""),
+                    phase=str(locals().get("display_phase") or ""),
+                    holiday=str(locals().get("display_holiday") or ""),
+                    selected_name=str(locals().get("selected_name") or attempted_content_id or ""),
+                    local_path=(
+                        locals().get("display_local_path")
+                        or locals().get("music_retry_upload_path")
+                        or locals().get("wide_path")
+                        or locals().get("fallback_path")
+                        or locals().get("local_path")
+                    ),
+                    catalog_path=(
+                        locals().get("display_catalog_path")
+                        or locals().get("catalog_path")
+                        or (MUSIC_CATALOG_PATH if locals().get("payload_kind") in {"cover_art_reference_background", "cover_art_outpaint"} else None)
+                    ),
+                    catalog_key=(
+                        locals().get("display_catalog_key")
+                        or locals().get("catalog_key")
+                        or locals().get("music_catalog_key")
+                        or locals().get("music_retry_catalog_key")
+                    ),
                 )
             finally:
                 try:
