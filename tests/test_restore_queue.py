@@ -565,6 +565,8 @@ class AmbientSeedTests(unittest.TestCase):
         self.assertTrue(normalized["force_reupload"])
         self.assertTrue(normalized["apply_deletions"])
         self.assertTrue(normalized["auto_queue_missing"])
+        self.assertTrue(normalized["dedupe_by_hash"])
+        self.assertTrue(normalized["prune_replaced_duplicates"])
         self.assertEqual(25, normalized["delete_limit"])
 
     def test_parse_dispatch_holiday_and_music_seed_defaults(self):
@@ -578,6 +580,8 @@ class AmbientSeedTests(unittest.TestCase):
         self.assertTrue(music["auto_queue_missing"])
         self.assertEqual(25, holiday["delete_limit"])
         self.assertEqual(25, music["delete_limit"])
+        self.assertTrue(holiday["dedupe_by_hash"])
+        self.assertTrue(music["prune_replaced_duplicates"])
 
     def test_empty_dir_errors_clearly(self):
         with self.assertRaisesRegex(ValueError, "no supported images"):
@@ -747,6 +751,74 @@ class AmbientSeedTests(unittest.TestCase):
         self.assertEqual("ambient_seed", uploaded_update["kind"])
         self.assertEqual(2, status["phase_total"])
         self.assertEqual("done", status["phase"])
+
+    @mock.patch("frame_art_uploader_ai.uploader.upload_local_file_with_reconnect")
+    def test_duplicate_hash_reuses_uploaded_content_id_same_run(self, mocked_upload):
+        (self.ambient / "a.jpg").write_bytes(b"same-bytes")
+        (self.ambient / "b.jpg").write_bytes(b"same-bytes")
+        mocked_upload.return_value = (mock.Mock(), "CID-SHARED")
+
+        status = uploader.handle_ambient_seed_restore(
+            tv_ip="127.0.0.1",
+            art=mock.Mock(available=mock.Mock(return_value=[])),
+            restore_payload={
+                "kind": "ambient_seed",
+                "ambient_dir": str(self.ambient),
+                "catalog_path": str(self.catalog),
+                "force_reupload": False,
+            },
+            requested_at="",
+        )
+
+        self.assertTrue(status["ok"])
+        self.assertEqual(1, status["uploaded_count"])
+        self.assertEqual(1, status["dedupe_reused_count"])
+        self.assertEqual(1, mocked_upload.call_count)
+        catalog = json.loads(self.catalog.read_text(encoding="utf-8"))
+        self.assertEqual("CID-SHARED", catalog["entries"]["a.jpg"]["content_id"])
+        self.assertEqual("CID-SHARED", catalog["entries"]["b.jpg"]["content_id"])
+
+    @mock.patch("frame_art_uploader_ai.uploader.delete_art_content_id")
+    @mock.patch("frame_art_uploader_ai.uploader.maybe_swap_current_art")
+    def test_replaced_duplicate_id_is_deleted_same_run(self, mocked_swap, mocked_delete):
+        (self.ambient / "a.jpg").write_bytes(b"same-bytes")
+        (self.ambient / "b.jpg").write_bytes(b"same-bytes")
+        uploader.atomic_write_json(
+            self.catalog,
+            {
+                "version": 1,
+                "updated_at": "",
+                "entries": {
+                    "a.jpg": {"content_id": "MY_F111", "updated_at": "", "source_hash": "", "canonical_key": ""},
+                    "b.jpg": {"content_id": "MY_F222", "updated_at": "", "source_hash": "", "canonical_key": ""},
+                },
+            },
+        )
+        art = mock.Mock()
+        art.available.return_value = [{"content_id": "MY_F111"}, {"content_id": "MY_F222"}]
+        mocked_swap.return_value = (True, False, None)
+        mocked_delete.return_value = {"ok": True, "verified": True, "error": None}
+
+        status = uploader.handle_ambient_seed_restore(
+            tv_ip="127.0.0.1",
+            art=art,
+            restore_payload={
+                "kind": "ambient_seed",
+                "ambient_dir": str(self.ambient),
+                "catalog_path": str(self.catalog),
+                "force_reupload": False,
+            },
+            requested_at="",
+        )
+
+        self.assertTrue(status["ok"])
+        self.assertEqual(2, status["skipped_count"])
+        self.assertEqual(1, status["dedupe_reused_count"])
+        self.assertEqual(1, status["deletion_processed"])
+        mocked_delete.assert_called_once_with(art, "MY_F222")
+        catalog = json.loads(self.catalog.read_text(encoding="utf-8"))
+        self.assertEqual("MY_F111", catalog["entries"]["a.jpg"]["content_id"])
+        self.assertEqual("MY_F111", catalog["entries"]["b.jpg"]["content_id"])
 
     def test_non_ambient_kinds_unaffected(self):
         payload = {"kind": "pick", "phase": "night", "season": "winter"}
