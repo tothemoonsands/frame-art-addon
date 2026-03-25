@@ -39,6 +39,21 @@ if "cover_art" not in sys.modules:
 import frame_art_uploader_ai.uploader as uploader
 
 
+class _FakeArtClient:
+    def __init__(self, fail_first: bool = False) -> None:
+        self.fail_first = fail_first
+        self.calls = []
+
+    def select_image(self, content_id, show=True):
+        self.calls.append((content_id, show))
+        if self.fail_first:
+            self.fail_first = False
+            raise BrokenPipeError("socket closed")
+
+    def supported(self):
+        return True
+
+
 class RestoreQueueTests(unittest.TestCase):
     def setUp(self) -> None:
         self.tmp = tempfile.TemporaryDirectory()
@@ -2019,6 +2034,53 @@ class MusicAssociationLookupTests(unittest.TestCase):
         )
         self.assertEqual("manual_override", override["match_source"])
         self.assertFalse(override["cache_reuse_recommended"])
+
+
+class HiddenSelectTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+        self.catalog = self.root / "frame_art_music_catalog.json"
+        self.overrides = self.root / "frame_art_music_overrides.json"
+        uploader.MUSIC_CATALOG_PATH = self.catalog
+        uploader.MUSIC_OVERRIDES_PATH = self.overrides
+
+    def tearDown(self) -> None:
+        self.tmp.cleanup()
+
+    def test_select_hidden_with_reconnect_uses_show_false(self):
+        art = _FakeArtClient()
+
+        current_art, ok, err = uploader.select_hidden_with_reconnect("1.2.3.4", art, "MY_F42")
+
+        self.assertTrue(ok)
+        self.assertIsNone(err)
+        self.assertIs(current_art, art)
+        self.assertEqual([("MY_F42", False)], art.calls)
+
+    @mock.patch("frame_art_uploader_ai.uploader.time.sleep", return_value=None)
+    @mock.patch("frame_art_uploader_ai.uploader.create_art_client")
+    @mock.patch("frame_art_uploader_ai.uploader.create_tv_client")
+    @mock.patch("frame_art_uploader_ai.uploader.is_art_socket_retryable_error", return_value=True)
+    def test_select_hidden_with_reconnect_retries_with_show_false(
+        self,
+        _mock_retryable,
+        mock_create_tv,
+        mock_create_art,
+        _mock_sleep,
+    ):
+        first_art = _FakeArtClient(fail_first=True)
+        second_art = _FakeArtClient()
+        mock_create_tv.return_value = object()
+        mock_create_art.return_value = second_art
+
+        current_art, ok, err = uploader.select_hidden_with_reconnect("1.2.3.4", first_art, "MY_F99")
+
+        self.assertTrue(ok)
+        self.assertIsNone(err)
+        self.assertIs(current_art, second_art)
+        self.assertEqual([("MY_F99", False)], first_art.calls)
+        self.assertEqual([("MY_F99", False)], second_art.calls)
 
     def test_lookup_music_association_uses_remote_artwork_url_override(self):
         uploader.set_music_override_for_album(

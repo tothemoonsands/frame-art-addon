@@ -87,7 +87,7 @@ MUSIC_RESTORE_KINDS = {"cover_art_reference_background", "cover_art_outpaint"}
 MUSIC_ASSOCIATION_SESSION_TTL_DAYS = 0
 
 RUNTIME_OPTIONS: dict[str, Any] = {}
-ADDON_VERSION = "3.04"
+ADDON_VERSION = "3.05"
 HOLIDAY_ALIASES = {
     "football": "huskers",
 }
@@ -3784,6 +3784,56 @@ def select_and_verify_with_reconnect(
     return current_art, False, select_error
 
 
+def select_hidden_with_reconnect(
+    tv_ip: str,
+    art: Any,
+    target_cid: str,
+) -> tuple[Any, bool, Optional[Exception]]:
+    select_error: Optional[Exception] = None
+    current_art = art
+    socket_attempts = resolve_runtime_int_option("art_socket_retries", 5, min_value=1, max_value=10)
+
+    for socket_attempt in range(socket_attempts):
+        try:
+            current_art.select_image(target_cid, show=False)
+            return current_art, True, None
+        except Exception as exc:
+            select_error = exc
+            if socket_attempt < socket_attempts - 1 and is_art_socket_retryable_error(exc):
+                log_event(
+                    "hidden_select_retry",
+                    reason=repr(exc),
+                    selected_content_id=target_cid,
+                    action="reconnect_art_socket",
+                    attempt=socket_attempt + 1,
+                    max_attempts=socket_attempts,
+                )
+                time.sleep(retry_backoff_seconds(socket_attempt))
+                try:
+                    retry_tv = create_tv_client(tv_ip)
+                    retry_art = create_art_client(retry_tv)
+                    if not retry_art.supported():
+                        select_error = RuntimeError("Art mode not supported / unreachable")
+                        break
+                    current_art = retry_art
+                    continue
+                except Exception as reconnect_exc:
+                    select_error = reconnect_exc
+                    log_event(
+                        "hidden_select_retry_reconnect_failed",
+                        reason=repr(reconnect_exc),
+                        selected_content_id=target_cid,
+                        attempt=socket_attempt + 1,
+                        max_attempts=socket_attempts,
+                    )
+                    if is_art_socket_retryable_error(reconnect_exc):
+                        continue
+                    break
+            break
+
+    return current_art, False, select_error
+
+
 def invalidate_music_cached_content_id(catalog_key: str, content_id: str) -> None:
     key_name = Path(str(catalog_key or "")).name
     target_cid = str(content_id or "").strip()
@@ -5177,6 +5227,16 @@ def main() -> None:
                             )
                             if retry_select_error is not None and not verified:
                                 select_attempt_error = retry_select_error
+                elif target_cid:
+                    hidden_select_error: Optional[Exception] = None
+                    art, hidden_selected, hidden_select_error = select_hidden_with_reconnect(
+                        tv_ip,
+                        art,
+                        target_cid,
+                    )
+                    verification_skipped = hidden_selected
+                    if not hidden_selected:
+                        raise hidden_select_error or RuntimeError("hidden_select_failed")
                 else:
                     verification_skipped = True
 
