@@ -89,7 +89,7 @@ MUSIC_RESTORE_KINDS = {"cover_art_reference_background", "cover_art_outpaint"}
 MUSIC_ASSOCIATION_SESSION_TTL_DAYS = 0
 
 RUNTIME_OPTIONS: dict[str, Any] = {}
-ADDON_VERSION = "3.5"
+ADDON_VERSION = "3.5.1"
 HOLIDAY_ALIASES = {
     "football": "huskers",
 }
@@ -787,8 +787,6 @@ def choose_pick_file(payload: dict, state: dict) -> tuple[Optional[Path], str, i
 
     salt = PHASE_SALT.get(phase, 0)
     idx = (rng + salt) % file_count
-    if file_count > 1 and str(files[idx]) == str(state.get("last_applied") or ""):
-        idx = (idx + 1) % file_count
     return files[idx], str(folder), file_count, idx
 
 

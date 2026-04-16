@@ -220,6 +220,23 @@ class RestoreQueueTests(unittest.TestCase):
         )
         self.assertEqual("SAM-C", picked)
 
+    def test_choose_pick_file_can_repeat_last_applied(self):
+        files = [
+            Path("/media/frame_ai/ambient/spring/night/a.jpg"),
+            Path("/media/frame_ai/ambient/spring/night/b.jpg"),
+        ]
+
+        with mock.patch.object(uploader, "list_local_images", return_value=files):
+            picked, resolved_folder, file_count, chosen_index = uploader.choose_pick_file(
+                {"season": "spring", "phase": "night", "holiday": "none", "rng": 1},
+                {"last_applied": str(files[0])},
+            )
+
+        self.assertEqual(files[0], picked)
+        self.assertEqual("/media/frame_ai/ambient/spring/night", resolved_folder)
+        self.assertEqual(2, file_count)
+        self.assertEqual(0, chosen_index)
+
     def test_record_samsung_pick_failure_prunes_after_threshold(self):
         state = uploader.load_state()
         first = uploader.record_samsung_pick_failure(state, "SAM-B", requested_at="2026-03-21T08:00:00-05:00")
