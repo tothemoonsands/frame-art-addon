@@ -89,7 +89,7 @@ MUSIC_RESTORE_KINDS = {"cover_art_reference_background", "cover_art_outpaint"}
 MUSIC_ASSOCIATION_SESSION_TTL_DAYS = 0
 
 RUNTIME_OPTIONS: dict[str, Any] = {}
-ADDON_VERSION = "3.5.1"
+ADDON_VERSION = "3.5.2"
 HOLIDAY_ALIASES = {
     "football": "huskers",
 }
@@ -4419,7 +4419,7 @@ def main() -> None:
     prefix = str(opts.get("filename_prefix", "ai_"))
     select_after = bool(opts.get("select_after_upload", True))
     openai_api_key = str(opts.get("openai_api_key", "")).strip()
-    openai_model = str(opts.get("openai_model", "gpt-image-1.5")).strip() or "gpt-image-1.5"
+    openai_model = str(opts.get("openai_model", "gpt-image-2")).strip() or "gpt-image-2"
     openai_timeout_s = resolve_runtime_int_option("openai_timeout_s", 120, min_value=30, max_value=600)
     _ = resolve_runtime_int_option("art_socket_retries", 5, min_value=1, max_value=10)
     _ = resolve_runtime_int_option("art_retry_backoff_s", 2, min_value=1, max_value=30)
