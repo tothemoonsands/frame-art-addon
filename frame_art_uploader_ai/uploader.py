@@ -34,6 +34,7 @@ from cover_art import (
     itunes_lookup,
     itunes_search,
     itunes_track_search,
+    is_openai_org_verification_error,
     normalize_key,
     generate_reference_frame_from_album,
     resolve_artwork_url,
@@ -89,7 +90,7 @@ MUSIC_RESTORE_KINDS = {"cover_art_reference_background", "cover_art_outpaint"}
 MUSIC_ASSOCIATION_SESSION_TTL_DAYS = 0
 
 RUNTIME_OPTIONS: dict[str, Any] = {}
-ADDON_VERSION = "3.5.2"
+ADDON_VERSION = "3.5.3"
 HOLIDAY_ALIASES = {
     "football": "huskers",
 }
@@ -5316,7 +5317,9 @@ def main() -> None:
                                 request_id = None
                                 model_used = "local-fallback"
                                 gen_msg = repr(gen_exc).lower()
-                                if "moderation_blocked" in gen_msg or "safety system" in gen_msg:
+                                if is_openai_org_verification_error(gen_exc):
+                                    generation_mode = "local_fallback_openai_verification"
+                                elif "moderation_blocked" in gen_msg or "safety system" in gen_msg:
                                     generation_mode = "local_fallback_blocked"
                                 else:
                                     generation_mode = "local_fallback_openai_error"

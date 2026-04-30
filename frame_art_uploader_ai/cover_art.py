@@ -36,6 +36,7 @@ HA_EDIT_SIZE = f"{HA_EDIT_WIDTH}x{HA_EDIT_HEIGHT}"
 
 FRAME_FINAL_WIDTH = 3840
 FRAME_FINAL_HEIGHT = 2160
+OPENAI_VERIFICATION_FALLBACK_MODEL = "gpt-image-1.5"
 
 _slug_re = re.compile(r"[^a-z0-9]+")
 _artist_split_re = re.compile(r"\s*(?:,|&|\band\b|\bwith\b|\bfeat\.?\b|\bfeaturing\b|\bx\b)\s*", flags=re.IGNORECASE)
@@ -350,6 +351,28 @@ def _validate_openai_multipart_payload(
         raise ValueError(f"OpenAI edits form data must not include image fields: {sorted(forbidden)}")
 
 
+def is_openai_org_verification_error(error: Any) -> bool:
+    message = str(error or "").lower()
+    verification_markers = (
+        "organization must be verified",
+        "api organization verification",
+        "complete the api organization verification",
+    )
+    return any(marker in message for marker in verification_markers) and "gpt-image" in message
+
+
+def should_retry_openai_with_verification_fallback(
+    error: Any,
+    requested_model: str,
+    fallback_model: str = OPENAI_VERIFICATION_FALLBACK_MODEL,
+) -> bool:
+    requested = str(requested_model or "").strip().lower()
+    fallback = str(fallback_model or "").strip().lower()
+    if not requested or not fallback or requested == fallback:
+        return False
+    return is_openai_org_verification_error(error)
+
+
 def _request_openai_reference_background_once(
     input_canvas_png: bytes,
     openai_api_key: str,
@@ -530,13 +553,56 @@ def generate_reference_frame_from_album(
     )
     t0 = time.perf_counter()
     emit("openai_request_start", model=openai_model, timeout_s=timeout_s, seed=seed)
-    generated_bytes, request_id, model_used = _request_openai_reference_background(
-        input_canvas_png=reference_canvas_png,
-        openai_api_key=openai_api_key,
-        openai_model=openai_model,
-        seed=seed,
-        timeout_s=timeout_s,
-    )
+    try:
+        generated_bytes, request_id, model_used = _request_openai_reference_background(
+            input_canvas_png=reference_canvas_png,
+            openai_api_key=openai_api_key,
+            openai_model=openai_model,
+            seed=seed,
+            timeout_s=timeout_s,
+        )
+    except Exception as request_error:
+        if not should_retry_openai_with_verification_fallback(request_error, openai_model):
+            raise
+        retry_model = OPENAI_VERIFICATION_FALLBACK_MODEL
+        emit(
+            "openai_request_retry",
+            from_model=openai_model,
+            to_model=retry_model,
+            reason="organization_verification",
+        )
+        retry_started_at = time.perf_counter()
+        try:
+            generated_bytes, request_id, model_used = _request_openai_reference_background(
+                input_canvas_png=reference_canvas_png,
+                openai_api_key=openai_api_key,
+                openai_model=retry_model,
+                seed=seed,
+                timeout_s=timeout_s,
+            )
+        except Exception as retry_error:
+            emit(
+                "openai_request_retry_failed",
+                duration_ms=int((time.perf_counter() - retry_started_at) * 1000),
+                from_model=openai_model,
+                to_model=retry_model,
+                reason="organization_verification",
+                error=repr(retry_error),
+            )
+            raise ValueError(
+                "OpenAI verification fallback failed: "
+                f"requested_model={openai_model!r} "
+                f"fallback_model={retry_model!r} "
+                f"first_error={request_error!r} "
+                f"fallback_error={retry_error!r}"
+            ) from retry_error
+        emit(
+            "openai_request_retry_done",
+            duration_ms=int((time.perf_counter() - retry_started_at) * 1000),
+            request_id=request_id,
+            model_used=model_used,
+            generated_bytes=len(generated_bytes),
+        )
     emit(
         "openai_request_done",
         duration_ms=int((time.perf_counter() - t0) * 1000),

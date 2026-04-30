@@ -2,6 +2,7 @@ import unittest
 from unittest import mock
 import sys
 import types
+from pathlib import Path
 
 if "requests" not in sys.modules:
     requests_stub = types.ModuleType("requests")
@@ -32,7 +33,83 @@ class _FakeResponse:
         return self._payload
 
 
+class _FakeImage:
+    def __init__(self, width=3840, height=2160):
+        self.width = width
+        self.height = height
+
+    def save(self, out, format=None, optimize=None, compress_level=None):
+        del format, optimize, compress_level
+        out.write(b"img")
+
+
 class CoverArtItunesTests(unittest.TestCase):
+    def test_detects_openai_org_verification_error(self):
+        err = ValueError(
+            "OpenAI edits failed: 403 request_id=req_123 body={\"error\":{\"message\":\"Your organization must "
+            "be verified to use the model `gpt-image-2`. Please complete API Organization Verification.\"}}"
+        )
+
+        self.assertTrue(cover_art.is_openai_org_verification_error(err))
+
+    def test_ignores_non_verification_openai_error(self):
+        err = ValueError("OpenAI edits failed: 500 request_id=req_123 body={\"error\":{\"message\":\"server error\"}}")
+
+        self.assertFalse(cover_art.is_openai_org_verification_error(err))
+
+    def test_verification_fallback_retries_with_gpt_image_1_5(self):
+        verify_err = ValueError(
+            "OpenAI edits failed: 403 request_id=req_123 body={\"error\":{\"message\":\"Your organization must "
+            "be verified to use the model `gpt-image-2`. Please complete API Organization Verification.\"}}"
+        )
+        request_models = []
+
+        def fake_request(**kwargs):
+            request_models.append(kwargs["openai_model"])
+            if len(request_models) == 1:
+                raise verify_err
+            return b"generated", "req_retry", "gpt-image-1.5"
+
+        with (
+            mock.patch("frame_art_uploader_ai.cover_art.build_reference_canvas_from_album", return_value=b"canvas"),
+            mock.patch("frame_art_uploader_ai.cover_art._request_openai_reference_background", side_effect=fake_request),
+            mock.patch("frame_art_uploader_ai.cover_art.ha_edit_to_frame", return_value=_FakeImage()),
+            mock.patch("frame_art_uploader_ai.cover_art.composite_album", return_value=_FakeImage()),
+        ):
+            _, _, request_id, model_used = cover_art.generate_reference_frame_from_album(
+                source_album_path=Path("album.png"),
+                openai_api_key="key",
+                openai_model="gpt-image-2",
+                timeout_s=1,
+            )
+
+        self.assertEqual(["gpt-image-2", "gpt-image-1.5"], request_models)
+        self.assertEqual("req_retry", request_id)
+        self.assertEqual("gpt-image-1.5", model_used)
+
+    def test_verification_fallback_does_not_retry_when_model_already_1_5(self):
+        verify_err = ValueError(
+            "OpenAI edits failed: 403 request_id=req_123 body={\"error\":{\"message\":\"Your organization must "
+            "be verified to use the model `gpt-image-1.5`. Please complete API Organization Verification.\"}}"
+        )
+
+        with (
+            mock.patch("frame_art_uploader_ai.cover_art.build_reference_canvas_from_album", return_value=b"canvas"),
+            mock.patch(
+                "frame_art_uploader_ai.cover_art._request_openai_reference_background",
+                side_effect=verify_err,
+            ) as mock_request,
+        ):
+            with self.assertRaises(ValueError):
+                cover_art.generate_reference_frame_from_album(
+                    source_album_path=Path("album.png"),
+                    openai_api_key="key",
+                    openai_model="gpt-image-1.5",
+                    timeout_s=1,
+                )
+
+        self.assertEqual(1, mock_request.call_count)
+
     def test_normalize_key_collab_variants_share_cache_key(self):
         a = cover_art.normalize_key(None, "Loyle Carner", "Yesterday's Gone")
         b = cover_art.normalize_key(None, "Loyle Carner & Tom Misch", "Yesterday's Gone")
