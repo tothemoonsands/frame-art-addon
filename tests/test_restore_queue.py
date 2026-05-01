@@ -316,6 +316,7 @@ class RestoreQueueTests(unittest.TestCase):
             "SAM-A",
             attempts=2,
             sleep_s=0.5,
+            socket_attempts_override=None,
         )
 
     def test_apply_music_wait_fallback_skips_when_missing_or_already_current(self):

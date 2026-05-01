@@ -95,7 +95,7 @@ MUSIC_RESTORE_KINDS = {"cover_art_reference_background", "cover_art_outpaint"}
 MUSIC_ASSOCIATION_SESSION_TTL_DAYS = 0
 
 RUNTIME_OPTIONS: dict[str, Any] = {}
-ADDON_VERSION = "4.0.0"
+ADDON_VERSION = "4.0.1"
 HOLIDAY_ALIASES = {
     "football": "huskers",
 }
@@ -4759,6 +4759,7 @@ def run_cancellable_reference_generation(
     openai_model: str,
     openai_timeout_s: int,
     superseded_check: Callable[[], Optional[dict[str, Any]]],
+    poll_hook: Optional[Callable[[], None]] = None,
     poll_interval_s: float = 0.25,
 ) -> dict[str, Any]:
     job_id = uuid.uuid4().hex
@@ -4796,6 +4797,15 @@ def run_cancellable_reference_generation(
                     "job_dir": str(job_dir),
                     "superseding_request": superseding_request,
                 }
+            if poll_hook is not None:
+                try:
+                    poll_hook()
+                except Exception as poll_exc:
+                    log_event(
+                        "music_reference_poll_hook_failed",
+                        cache_key=cache_key,
+                        error=repr(poll_exc),
+                    )
             return_code = process.poll()
             if return_code is not None:
                 break
@@ -4943,10 +4953,15 @@ def select_and_verify_with_reconnect(
     target_cid: str,
     attempts: int = 3,
     sleep_s: float = 1.0,
+    socket_attempts_override: Optional[int] = None,
 ) -> tuple[Any, bool, Optional[Exception]]:
     select_error: Optional[Exception] = None
     current_art = art
-    socket_attempts = resolve_runtime_int_option("art_socket_retries", 5, min_value=1, max_value=10)
+    socket_attempts = (
+        max(1, int(socket_attempts_override))
+        if socket_attempts_override is not None
+        else resolve_runtime_int_option("art_socket_retries", 5, min_value=1, max_value=10)
+    )
 
     for socket_attempt in range(socket_attempts):
         try:
@@ -5056,6 +5071,9 @@ def apply_music_wait_fallback_if_available(
     artist: str,
     album: str,
     cache_key: str,
+    attempts: int = 2,
+    sleep_s: float = 0.5,
+    socket_attempts_override: Optional[int] = None,
 ) -> tuple[Any, bool, Optional[str]]:
     fallback_cid = str(state.get("last_ambient_content_id", "") or "").strip()
     if not fallback_cid:
@@ -5086,8 +5104,9 @@ def apply_music_wait_fallback_if_available(
         tv_ip,
         art,
         fallback_cid,
-        attempts=2,
-        sleep_s=0.5,
+        attempts=attempts,
+        sleep_s=sleep_s,
+        socket_attempts_override=socket_attempts_override,
     )
     if verified:
         log_event(
@@ -6054,7 +6073,13 @@ def main() -> None:
                             source_exists=src_path.exists(),
                             source_url_provided=bool(source_url),
                         )
-                        if show_flag:
+                        music_wait_fallback_attempted = False
+
+                        def maybe_try_music_wait_fallback() -> None:
+                            nonlocal art, music_wait_fallback_applied, music_wait_fallback_content_id, music_wait_fallback_attempted
+                            if music_wait_fallback_attempted or not show_flag:
+                                return
+                            music_wait_fallback_attempted = True
                             art, music_wait_fallback_applied, music_wait_fallback_content_id = apply_music_wait_fallback_if_available(
                                 tv_ip,
                                 art,
@@ -6064,6 +6089,9 @@ def main() -> None:
                                 artist=artist,
                                 album=album,
                                 cache_key=cache_key,
+                                attempts=1,
+                                sleep_s=0.1,
+                                socket_attempts_override=1,
                             )
                         try:
                             if isinstance(association_record, dict) and not should_reuse_music_association(association_record):
@@ -6257,6 +6285,7 @@ def main() -> None:
                                     openai_model=openai_model,
                                     openai_timeout_s=openai_timeout_s,
                                     superseded_check=lambda: find_superseding_music_request(work_item, kind, restore_payload),
+                                    poll_hook=maybe_try_music_wait_fallback,
                                 )
                                 if reference_generation_result.get("canceled"):
                                     if skip_if_superseded_music_request(
