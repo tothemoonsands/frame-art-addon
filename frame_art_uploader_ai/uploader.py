@@ -95,7 +95,7 @@ MUSIC_RESTORE_KINDS = {"cover_art_reference_background", "cover_art_outpaint"}
 MUSIC_ASSOCIATION_SESSION_TTL_DAYS = 0
 
 RUNTIME_OPTIONS: dict[str, Any] = {}
-ADDON_VERSION = "4.0.1"
+ADDON_VERSION = "4.0.2"
 HOLIDAY_ALIASES = {
     "football": "huskers",
 }
@@ -4947,6 +4947,25 @@ def create_art_client(tv: Any) -> Any:
         return tv.art()
 
 
+def maybe_preconnect_art_client(
+    tv_ip: str,
+    current_art: Any,
+    *,
+    option_name: str,
+    enabled_default: bool = True,
+) -> Any:
+    if not bool(RUNTIME_OPTIONS.get(option_name, enabled_default)):
+        return current_art
+    try:
+        retry_tv = create_tv_client(tv_ip)
+        retry_art = create_art_client(retry_tv)
+        if retry_art.supported():
+            return retry_art
+    except Exception:
+        pass
+    return current_art
+
+
 def select_and_verify_with_reconnect(
     tv_ip: str,
     art: Any,
@@ -4956,7 +4975,11 @@ def select_and_verify_with_reconnect(
     socket_attempts_override: Optional[int] = None,
 ) -> tuple[Any, bool, Optional[Exception]]:
     select_error: Optional[Exception] = None
-    current_art = art
+    current_art = maybe_preconnect_art_client(
+        tv_ip,
+        art,
+        option_name="art_preconnect_before_select",
+    )
     socket_attempts = (
         max(1, int(socket_attempts_override))
         if socket_attempts_override is not None
@@ -5017,7 +5040,11 @@ def select_hidden_with_reconnect(
     target_cid: str,
 ) -> tuple[Any, bool, Optional[Exception]]:
     select_error: Optional[Exception] = None
-    current_art = art
+    current_art = maybe_preconnect_art_client(
+        tv_ip,
+        art,
+        option_name="art_preconnect_before_select",
+    )
     socket_attempts = resolve_runtime_int_option("art_socket_retries", 5, min_value=1, max_value=10)
 
     for socket_attempt in range(socket_attempts):

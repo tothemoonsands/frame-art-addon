@@ -55,6 +55,14 @@ class _FakeArtClient:
         return True
 
 
+class _ExplodingArtClient:
+    def select_image(self, content_id, show=True):
+        raise AssertionError("stale art client should not be used")
+
+    def supported(self):
+        return True
+
+
 class RestoreQueueTests(unittest.TestCase):
     def setUp(self) -> None:
         self.tmp = tempfile.TemporaryDirectory()
@@ -355,6 +363,59 @@ class RestoreQueueTests(unittest.TestCase):
             self.assertFalse(applied)
             self.assertEqual("SAM-A", selected_cid)
             mock_select.assert_not_called()
+
+    def test_select_and_verify_with_reconnect_preconnects_before_select(self):
+        stale_art = _ExplodingArtClient()
+        fresh_art = _FakeArtClient()
+        uploader.RUNTIME_OPTIONS["art_preconnect_before_select"] = True
+
+        with (
+            mock.patch.object(uploader, "create_tv_client", return_value=object()) as mock_create_tv,
+            mock.patch.object(uploader, "create_art_client", return_value=fresh_art) as mock_create_art,
+            mock.patch.object(uploader.time, "sleep", return_value=None),
+            mock.patch.object(
+                uploader,
+                "get_current_info",
+                return_value={"content_id": "MY_FRESH"},
+            ),
+        ):
+            current_art, verified, select_error = uploader.select_and_verify_with_reconnect(
+                "1.2.3.4",
+                stale_art,
+                "MY_FRESH",
+                attempts=1,
+                sleep_s=0.0,
+                socket_attempts_override=1,
+            )
+
+        self.assertIs(current_art, fresh_art)
+        self.assertTrue(verified)
+        self.assertIsNone(select_error)
+        self.assertEqual([("MY_FRESH", True)], fresh_art.calls)
+        mock_create_tv.assert_called_once_with("1.2.3.4")
+        mock_create_art.assert_called_once()
+
+    def test_select_hidden_with_reconnect_preconnects_before_select(self):
+        stale_art = _ExplodingArtClient()
+        fresh_art = _FakeArtClient()
+        uploader.RUNTIME_OPTIONS["art_preconnect_before_select"] = True
+
+        with (
+            mock.patch.object(uploader, "create_tv_client", return_value=object()) as mock_create_tv,
+            mock.patch.object(uploader, "create_art_client", return_value=fresh_art) as mock_create_art,
+        ):
+            current_art, verified, select_error = uploader.select_hidden_with_reconnect(
+                "1.2.3.4",
+                stale_art,
+                "MY_HIDDEN",
+            )
+
+        self.assertIs(current_art, fresh_art)
+        self.assertTrue(verified)
+        self.assertIsNone(select_error)
+        self.assertEqual([("MY_HIDDEN", False)], fresh_art.calls)
+        mock_create_tv.assert_called_once_with("1.2.3.4")
+        mock_create_art.assert_called_once()
 
     def test_choose_pick_samsung_id_skips_excluded_ids(self):
         picked = uploader.choose_pick_samsung_id(
@@ -2305,6 +2366,7 @@ class HiddenSelectTests(unittest.TestCase):
     ):
         first_art = _FakeArtClient(fail_first=True)
         second_art = _FakeArtClient()
+        uploader.RUNTIME_OPTIONS["art_preconnect_before_select"] = False
         mock_create_tv.return_value = object()
         mock_create_art.return_value = second_art
 
