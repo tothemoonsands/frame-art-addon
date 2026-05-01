@@ -90,7 +90,7 @@ MUSIC_RESTORE_KINDS = {"cover_art_reference_background", "cover_art_outpaint"}
 MUSIC_ASSOCIATION_SESSION_TTL_DAYS = 0
 
 RUNTIME_OPTIONS: dict[str, Any] = {}
-ADDON_VERSION = "3.5.3"
+ADDON_VERSION = "3.5.4"
 HOLIDAY_ALIASES = {
     "football": "huskers",
 }
@@ -548,41 +548,35 @@ def append_uploaded_id(state: dict, state_key: str, target_cid: Any) -> None:
             state[state_key].append(cid)
 
 
+def default_state() -> dict[str, Any]:
+    return {
+        "last_applied": None,
+        "last_ambient_content_id": "",
+        "last_ambient_source_kind": "",
+        "last_ambient_updated_at": "",
+        "local_uploaded_ids": [],
+        "cover_uploaded_ids": [],
+        "samsung_pick_failure_counts": {},
+        "pending_keep_count_cleanup": False,
+        "upload_timeout_streak": 0,
+        "upload_timeout_cooldown_until": 0.0,
+    }
+
+
 def load_state() -> dict:
     p = Path(STATE_PATH)
     if not p.exists():
-        return {
-            "last_applied": None,
-            "local_uploaded_ids": [],
-            "cover_uploaded_ids": [],
-            "samsung_pick_failure_counts": {},
-            "pending_keep_count_cleanup": False,
-            "upload_timeout_streak": 0,
-            "upload_timeout_cooldown_until": 0.0,
-        }
+        return default_state()
     try:
         data = json.loads(p.read_text(encoding="utf-8"))
     except Exception:
-        return {
-            "last_applied": None,
-            "local_uploaded_ids": [],
-            "cover_uploaded_ids": [],
-            "samsung_pick_failure_counts": {},
-            "pending_keep_count_cleanup": False,
-            "upload_timeout_streak": 0,
-            "upload_timeout_cooldown_until": 0.0,
-        }
+        return default_state()
     if not isinstance(data, dict):
-        return {
-            "last_applied": None,
-            "local_uploaded_ids": [],
-            "cover_uploaded_ids": [],
-            "samsung_pick_failure_counts": {},
-            "pending_keep_count_cleanup": False,
-            "upload_timeout_streak": 0,
-            "upload_timeout_cooldown_until": 0.0,
-        }
+        return default_state()
     data.setdefault("last_applied", None)
+    data["last_ambient_content_id"] = str(data.get("last_ambient_content_id", "") or "").strip()
+    data["last_ambient_source_kind"] = str(data.get("last_ambient_source_kind", "") or "").strip()
+    data["last_ambient_updated_at"] = str(data.get("last_ambient_updated_at", "") or "").strip()
     data["local_uploaded_ids"] = sanitize_local_uploaded_ids(data.get("local_uploaded_ids"))
     data["cover_uploaded_ids"] = sanitize_local_uploaded_ids(data.get("cover_uploaded_ids"))
     raw_failure_counts = data.get("samsung_pick_failure_counts")
@@ -4274,6 +4268,76 @@ def select_hidden_with_reconnect(
     return current_art, False, select_error
 
 
+def apply_music_wait_fallback_if_available(
+    tv_ip: str,
+    art: Any,
+    state: dict[str, Any],
+    *,
+    current_info: Any,
+    requested_at: str,
+    artist: str,
+    album: str,
+    cache_key: str,
+) -> tuple[Any, bool, Optional[str]]:
+    fallback_cid = str(state.get("last_ambient_content_id", "") or "").strip()
+    if not fallback_cid:
+        log_event(
+            "music_wait_fallback_skipped",
+            reason="missing_last_ambient_content_id",
+            cache_key=cache_key,
+            artist=artist,
+            album=album,
+            requested_at=requested_at,
+        )
+        return art, False, None
+
+    current_id = extract_content_id(current_info)
+    if current_id == fallback_cid:
+        log_event(
+            "music_wait_fallback_skipped",
+            reason="already_showing_last_ambient",
+            cache_key=cache_key,
+            artist=artist,
+            album=album,
+            requested_at=requested_at,
+            selected_content_id=fallback_cid,
+        )
+        return art, False, fallback_cid
+
+    current_art, verified, select_error = select_and_verify_with_reconnect(
+        tv_ip,
+        art,
+        fallback_cid,
+        attempts=2,
+        sleep_s=0.5,
+    )
+    if verified:
+        log_event(
+            "music_wait_fallback_applied",
+            cache_key=cache_key,
+            artist=artist,
+            album=album,
+            requested_at=requested_at,
+            previous_content_id=current_id,
+            selected_content_id=fallback_cid,
+            source_kind=str(state.get("last_ambient_source_kind", "") or "").strip(),
+        )
+        return current_art, True, fallback_cid
+
+    log_event(
+        "music_wait_fallback_failed",
+        cache_key=cache_key,
+        artist=artist,
+        album=album,
+        requested_at=requested_at,
+        previous_content_id=current_id,
+        selected_content_id=fallback_cid,
+        error=repr(select_error) if select_error is not None else "select_unverified",
+        source_kind=str(state.get("last_ambient_source_kind", "") or "").strip(),
+    )
+    return current_art, False, None
+
+
 def invalidate_music_cached_content_id(catalog_key: str, content_id: str) -> None:
     key_name = Path(str(catalog_key or "")).name
     target_cid = str(content_id or "").strip()
@@ -5091,6 +5155,8 @@ def main() -> None:
                         FALLBACK_DIR.mkdir(parents=True, exist_ok=True)
                         cover_error: Optional[Exception] = None
                         fallback_path: Optional[Path] = None
+                        music_wait_fallback_applied = False
+                        music_wait_fallback_content_id: Optional[str] = None
                         generation_started_at = time.perf_counter()
 
                         def log_music_generation_step(stage: str, **fields: Any) -> None:
@@ -5116,6 +5182,17 @@ def main() -> None:
                             source_exists=src_path.exists(),
                             source_url_provided=bool(source_url),
                         )
+                        if show_flag:
+                            art, music_wait_fallback_applied, music_wait_fallback_content_id = apply_music_wait_fallback_if_available(
+                                tv_ip,
+                                art,
+                                state,
+                                current_info=current_info,
+                                requested_at=requested_at,
+                                artist=artist,
+                                album=album,
+                                cache_key=cache_key,
+                            )
                         try:
                             if isinstance(association_record, dict) and not should_reuse_music_association(association_record):
                                 log_event(
@@ -5688,6 +5765,11 @@ def main() -> None:
                 if kind == "pick" and pending_pick_last_applied and verified:
                     state["last_applied"] = pending_pick_last_applied
 
+                if kind == "pick" and target_cid and (verified or verification_skipped):
+                    state["last_ambient_content_id"] = str(target_cid).strip()
+                    state["last_ambient_source_kind"] = str(display_source_kind or "").strip()
+                    state["last_ambient_updated_at"] = utc_now_iso()
+
                 deleted_local: list[str] = []
                 cleanup_error: Optional[str] = None
                 if kind == "pick" and pick_source == "local":
@@ -5784,6 +5866,8 @@ def main() -> None:
                         "cache_reuse_recommended": cache_reuse_recommended_for_status,
                         "cache_reuse_reason": cache_reuse_reason_for_status,
                         "match_candidates": match_candidates_for_status,
+                        "music_wait_fallback_applied": locals().get("music_wait_fallback_applied"),
+                        "music_wait_fallback_content_id": locals().get("music_wait_fallback_content_id"),
                     }
                 )
 

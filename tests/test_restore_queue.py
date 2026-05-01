@@ -212,6 +212,83 @@ class RestoreQueueTests(unittest.TestCase):
 
         self.assertFalse(uploader.is_superseded_music_request(first, "cover_art_reference_background"))
 
+    def test_default_state_includes_last_ambient_fallback_fields(self):
+        state = uploader.default_state()
+
+        self.assertEqual("", state["last_ambient_content_id"])
+        self.assertEqual("", state["last_ambient_source_kind"])
+        self.assertEqual("", state["last_ambient_updated_at"])
+
+    def test_apply_music_wait_fallback_uses_last_ambient_content_id(self):
+        state = uploader.default_state()
+        state["last_ambient_content_id"] = "SAM-A"
+        state["last_ambient_source_kind"] = "ambient_or_holiday"
+        art = object()
+
+        with mock.patch.object(
+            uploader,
+            "select_and_verify_with_reconnect",
+            return_value=(art, True, None),
+        ) as mock_select:
+            current_art, applied, selected_cid = uploader.apply_music_wait_fallback_if_available(
+                "1.2.3.4",
+                art,
+                state,
+                current_info={"content_id": "MY_OLD"},
+                requested_at="2026-04-30T20:00:00Z",
+                artist="Artist",
+                album="Album",
+                cache_key="cache-key",
+            )
+
+        self.assertIs(current_art, art)
+        self.assertTrue(applied)
+        self.assertEqual("SAM-A", selected_cid)
+        mock_select.assert_called_once_with(
+            "1.2.3.4",
+            art,
+            "SAM-A",
+            attempts=2,
+            sleep_s=0.5,
+        )
+
+    def test_apply_music_wait_fallback_skips_when_missing_or_already_current(self):
+        art = object()
+
+        with mock.patch.object(uploader, "select_and_verify_with_reconnect") as mock_select:
+            current_art, applied, selected_cid = uploader.apply_music_wait_fallback_if_available(
+                "1.2.3.4",
+                art,
+                uploader.default_state(),
+                current_info={"content_id": "MY_OLD"},
+                requested_at="2026-04-30T20:00:00Z",
+                artist="Artist",
+                album="Album",
+                cache_key="cache-key",
+            )
+            self.assertIs(current_art, art)
+            self.assertFalse(applied)
+            self.assertIsNone(selected_cid)
+            mock_select.assert_not_called()
+
+        state = uploader.default_state()
+        state["last_ambient_content_id"] = "SAM-A"
+        with mock.patch.object(uploader, "select_and_verify_with_reconnect") as mock_select:
+            current_art, applied, selected_cid = uploader.apply_music_wait_fallback_if_available(
+                "1.2.3.4",
+                art,
+                state,
+                current_info={"content_id": "SAM-A"},
+                requested_at="2026-04-30T20:00:00Z",
+                artist="Artist",
+                album="Album",
+                cache_key="cache-key",
+            )
+            self.assertIs(current_art, art)
+            self.assertFalse(applied)
+            self.assertEqual("SAM-A", selected_cid)
+            mock_select.assert_not_called()
+
     def test_choose_pick_samsung_id_skips_excluded_ids(self):
         picked = uploader.choose_pick_samsung_id(
             {"season": "spring", "holiday": "none"},
