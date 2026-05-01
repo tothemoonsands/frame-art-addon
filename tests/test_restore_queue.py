@@ -195,6 +195,72 @@ class RestoreQueueTests(unittest.TestCase):
 
         self.assertTrue(uploader.is_superseded_music_request(first, "cover_art_reference_background"))
 
+    def test_music_request_not_superseded_when_newer_music_shares_normalized_album_identity(self):
+        self._write_inbox(
+            {
+                "kind": "cover_art_reference",
+                "artist": "Loyle Carner",
+                "album": "Yesterday's Gone",
+                "show": True,
+            }
+        )
+        first = uploader.enqueue_restore_inbox_if_present()
+        self.assertIsNotNone(first)
+
+        self._write_inbox(
+            {
+                "kind": "cover_art_outpaint",
+                "artist": "Loyle Carner & Tom Misch",
+                "album": "Yesterday's Gone",
+                "show": True,
+            }
+        )
+        second = uploader.enqueue_restore_inbox_if_present()
+        self.assertIsNotNone(second)
+
+        self.assertFalse(uploader.is_superseded_music_request(first, "cover_art_reference_background"))
+        self.assertFalse(
+            uploader.should_skip_superseded_music_request(
+                first,
+                "cover_art_reference_background",
+                True,
+            )
+        )
+
+    def test_music_request_not_superseded_when_newer_music_shares_collection_id(self):
+        self._write_inbox(
+            {
+                "kind": "cover_art_reference",
+                "artist": "Old Artist",
+                "album": "Old Album",
+                "collection_id": 12345,
+                "show": True,
+            }
+        )
+        first = uploader.enqueue_restore_inbox_if_present()
+        self.assertIsNotNone(first)
+
+        self._write_inbox(
+            {
+                "kind": "cover_art_outpaint",
+                "artist": "New Artist",
+                "album": "New Album",
+                "collection_id": 12345,
+                "show": True,
+            }
+        )
+        second = uploader.enqueue_restore_inbox_if_present()
+        self.assertIsNotNone(second)
+
+        self.assertFalse(uploader.is_superseded_music_request(first, "cover_art_reference_background"))
+        self.assertFalse(
+            uploader.should_skip_superseded_music_request(
+                first,
+                "cover_art_reference_background",
+                True,
+            )
+        )
+
     def test_music_request_not_superseded_by_newer_pick(self):
         self._write_inbox(
             {

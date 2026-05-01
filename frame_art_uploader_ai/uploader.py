@@ -2,6 +2,9 @@ import json
 import os
 import re
 import shutil
+import subprocess
+import sys
+import tempfile
 import time
 import uuid
 import hashlib
@@ -11,7 +14,7 @@ from contextlib import contextmanager
 import fcntl
 from io import BytesIO
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 from urllib.parse import urlparse
 
 from PIL import Image
@@ -46,12 +49,14 @@ STATE_PATH = "/data/frame_art_uploader_state.json"
 DISPLAY_DIR = Path("/share/frame_art_display")
 DISPLAY_CURRENT_JSON_PATH = DISPLAY_DIR / "current.json"
 DISPLAY_ERROR_JSON_PATH = DISPLAY_DIR / "error.json"
+ACTIVE_MUSIC_JOB_PATH = Path("/share/frame_art_active_music_job.json")
 
 # One-shot restore request written by Home Assistant.
 RESTORE_REQUEST_PATH = "/share/frame_art_restore_request.json"
 RESTORE_QUEUE_DIR = Path("/share/frame_art_restore_queue")
 WORKER_LOCK_PATH = Path("/share/frame_art_uploader_worker.lock")
 FALLBACK_DIR = Path("/media/frame_ai/music/fallback")
+MUSIC_JOB_DIR = Path("/tmp/frame_art_music_jobs")
 HOLIDAY_CATALOG_PATH = Path("/share/frame_art_holidays_catalog.json")
 AMBIENT_CATALOG_PATH = Path("/share/frame_art_ambient_catalog.json")
 MUSIC_CATALOG_PATH = Path("/share/frame_art_music_catalog.json")
@@ -90,7 +95,7 @@ MUSIC_RESTORE_KINDS = {"cover_art_reference_background", "cover_art_outpaint"}
 MUSIC_ASSOCIATION_SESSION_TTL_DAYS = 0
 
 RUNTIME_OPTIONS: dict[str, Any] = {}
-ADDON_VERSION = "3.5.4"
+ADDON_VERSION = "4.0.0"
 HOLIDAY_ALIASES = {
     "football": "huskers",
 }
@@ -414,6 +419,23 @@ def atomic_write_json(path: Path, payload: Any) -> None:
     with open(tmp_path, "w", encoding="utf-8") as f:
         json.dump(payload, f, indent=2)
     os.replace(tmp_path, path)
+
+
+def remove_file_if_exists(path: Path) -> None:
+    try:
+        path.unlink()
+    except FileNotFoundError:
+        pass
+
+
+def write_active_music_job(payload: dict[str, Any]) -> None:
+    if not isinstance(payload, dict):
+        return
+    atomic_write_json(ACTIVE_MUSIC_JOB_PATH, payload)
+
+
+def clear_active_music_job() -> None:
+    remove_file_if_exists(ACTIVE_MUSIC_JOB_PATH)
 
 
 def utc_now_iso() -> str:
@@ -3900,13 +3922,58 @@ def request_suppresses_prior_music(payload: dict[str, Any], requested_show: Opti
     return is_music_restore_kind(kind) and requested_show is not False
 
 
-def is_superseded_music_request(work_item: Path, current_kind: str) -> bool:
+def stable_music_identity(payload: dict[str, Any]) -> str:
+    if not isinstance(payload, dict):
+        return ""
+
+    collection_id = parse_collection_id_value(payload.get("collection_id"))
+    if isinstance(collection_id, int):
+        return f"collection::{collection_id}"
+
+    artist = str(payload.get("artist", "")).strip()
+    album = str(payload.get("album", "")).strip()
+    album_norm = normalized_album_association(artist, album)
+    if album_norm:
+        return f"album_norm::{album_norm}"
+
+    return ""
+
+
+def stable_music_identity_aliases(payload: dict[str, Any]) -> set[str]:
+    if not isinstance(payload, dict):
+        return set()
+
+    aliases: set[str] = set()
+    collection_id = parse_collection_id_value(payload.get("collection_id"))
+    if isinstance(collection_id, int):
+        aliases.add(f"collection::{collection_id}")
+
+    artist = str(payload.get("artist", "")).strip()
+    album = str(payload.get("album", "")).strip()
+    album_norm = normalized_album_association(artist, album)
+    if album_norm:
+        aliases.add(f"album_norm::{album_norm}")
+
+    return aliases
+
+
+def music_requests_share_stable_identity(current_payload: dict[str, Any], next_payload: dict[str, Any]) -> bool:
+    current_aliases = stable_music_identity_aliases(current_payload)
+    next_aliases = stable_music_identity_aliases(next_payload)
+    return bool(current_aliases and next_aliases and (current_aliases & next_aliases))
+
+
+def find_superseding_music_request(
+    work_item: Path,
+    current_kind: str,
+    current_payload: Optional[dict[str, Any]] = None,
+) -> Optional[dict[str, Any]]:
     if not is_music_restore_kind(current_kind):
-        return False
+        return None
 
     queued = list_queued_requests()
     if not queued:
-        return False
+        return None
 
     current_index = -1
     for idx, queued_item in enumerate(queued):
@@ -3914,28 +3981,95 @@ def is_superseded_music_request(work_item: Path, current_kind: str) -> bool:
             current_index = idx
             break
     if current_index < 0:
-        return False
+        return None
+
+    if current_payload is None:
+        current_payload, _, current_parse_error = load_restore_work_item(work_item)
+        if current_parse_error or not isinstance(current_payload, dict):
+            return None
 
     for queued_item in queued[current_index + 1 :]:
         next_payload, next_requested_show, next_parse_error = load_restore_work_item(queued_item)
         if next_parse_error or not isinstance(next_payload, dict):
             continue
-        if request_suppresses_prior_music(next_payload, next_requested_show):
-            return True
+        if not request_suppresses_prior_music(next_payload, next_requested_show):
+            continue
 
-    return False
+        next_kind = str(next_payload.get("kind", "")).strip().lower()
+        if is_music_restore_kind(next_kind) and music_requests_share_stable_identity(current_payload, next_payload):
+            continue
+
+        return {
+            "work_item": queued_item,
+            "payload": next_payload,
+            "requested_show": next_requested_show,
+            "kind": next_kind,
+            "requested_at": str(next_payload.get("requested_at", "")).strip(),
+            "identity": stable_music_identity(next_payload),
+        }
+
+    return None
+
+
+def is_superseded_music_request(
+    work_item: Path,
+    current_kind: str,
+    current_payload: Optional[dict[str, Any]] = None,
+) -> bool:
+    return find_superseding_music_request(work_item, current_kind, current_payload) is not None
 
 
 def should_skip_superseded_music_request(
     work_item: Path,
     current_kind: str,
     requested_show: Optional[bool],
+    current_payload: Optional[dict[str, Any]] = None,
 ) -> bool:
     # Foreground music requests should yield to newer visible music/restore work.
     # Background requests can continue because they no longer compete for display.
     if requested_show is False:
         return False
-    return is_superseded_music_request(work_item, current_kind)
+    return is_superseded_music_request(work_item, current_kind, current_payload)
+
+
+def write_superseded_music_status(
+    *,
+    tv_ip: str,
+    kind: str,
+    request_value: str,
+    requested_at: str,
+    requested_show: Optional[bool],
+    is_art_mode: bool,
+    restore_payload: dict[str, Any],
+    pick_source: str,
+    phase_action: str,
+    selected_content_id: Optional[str] = None,
+    chosen: Optional[str] = None,
+    extra_fields: Optional[dict[str, Any]] = None,
+) -> None:
+    status_payload = {
+        "ok": True,
+        "mode": "restore",
+        "tv_ip": tv_ip,
+        "kind": kind,
+        "value": request_value,
+        "requested_at": requested_at,
+        "requested_show": requested_show,
+        "effective_show": False,
+        "art_mode": is_art_mode,
+        "requested_music_session_key": str(restore_payload.get("music_session_key", "")).strip(),
+        "restore_content_id": str(restore_payload.get("restore_content_id", "")).strip(),
+        "pick_source": pick_source,
+        "addon_version": ADDON_VERSION,
+        "selected_content_id": selected_content_id,
+        "chosen": chosen,
+        "phase": "done",
+        "phase_action": phase_action,
+        "phase_status": "skipped",
+    }
+    if isinstance(extra_fields, dict):
+        status_payload.update(extra_fields)
+    write_status(status_payload)
 
 
 @contextmanager
@@ -4036,6 +4170,650 @@ def choose_music_failure_fallback(cache_key: str) -> tuple[Optional[Path], str, 
         return fallback_path, "music_fallback_file", str(fallback_path.parent), 1, 0
 
     return None, "", "", 0, -1
+
+
+def cleanup_music_job_dir(job_dir: Path) -> None:
+    try:
+        shutil.rmtree(job_dir)
+    except FileNotFoundError:
+        pass
+
+
+def terminate_process_tree(process: subprocess.Popen[Any], *, grace_s: float = 1.0) -> None:
+    if process.poll() is not None:
+        return
+    try:
+        process.terminate()
+    except Exception:
+        pass
+    deadline = time.monotonic() + max(0.1, float(grace_s))
+    while time.monotonic() < deadline:
+        if process.poll() is not None:
+            return
+        time.sleep(0.05)
+    if process.poll() is None:
+        try:
+            process.kill()
+        except Exception:
+            pass
+
+
+def music_job_stage_paths(job_dir: Path, stem_key: str) -> dict[str, Path]:
+    safe_stem = str(stem_key or "music").strip() or "music"
+    return {
+        "source_path": job_dir / f"{safe_stem}__source.jpg",
+        "background_path": job_dir / f"{safe_stem}__3840x2160__background.png",
+        "wide_png_path": job_dir / f"{safe_stem}__3840x2160.png",
+        "compressed_jpg_path": job_dir / f"{safe_stem}__3840x2160.jpg",
+    }
+
+
+def promote_music_job_outputs(
+    *,
+    staged_result: dict[str, Any],
+    src_path: Path,
+    background_path: Path,
+    wide_png_path: Path,
+    compressed_jpg_path: Path,
+) -> dict[str, Optional[Path]]:
+    promoted: dict[str, Optional[Path]] = {
+        "source_path": None,
+        "background_path": None,
+        "wide_png_path": None,
+        "compressed_jpg_path": None,
+        "wide_path": None,
+    }
+
+    def copy_if_present(raw_key: str, target_path: Path) -> Optional[Path]:
+        raw_value = str(staged_result.get(raw_key, "")).strip()
+        if not raw_value:
+            return None
+        source = Path(raw_value)
+        if not source.exists():
+            return None
+        target_path.parent.mkdir(parents=True, exist_ok=True)
+        if source.resolve() != target_path.resolve():
+            shutil.copy2(source, target_path)
+        return target_path
+
+    promoted["source_path"] = copy_if_present("source_path", src_path)
+    promoted["background_path"] = copy_if_present("background_path", background_path)
+    promoted["wide_png_path"] = copy_if_present("wide_png_path", wide_png_path)
+    promoted["compressed_jpg_path"] = copy_if_present("compressed_jpg_path", compressed_jpg_path)
+    promoted["wide_path"] = promoted["compressed_jpg_path"] or promoted["wide_png_path"]
+    return promoted
+
+
+def run_music_generation_pipeline(job: dict[str, Any]) -> dict[str, Any]:
+    restore_payload = job.get("restore_payload") if isinstance(job.get("restore_payload"), dict) else {}
+    kind = str(job.get("kind", "")).strip().lower()
+    artist = str(job.get("artist", "")).strip()
+    album = str(job.get("album", "")).strip()
+    track = str(job.get("track", "")).strip()
+    cache_key = str(job.get("cache_key", "")).strip()
+    source_url = normalize_remote_artwork_url(job.get("source_url"))
+    source_preference = str(job.get("source_preference", "")).strip().lower()
+    force_regen = bool(job.get("force_regen", False))
+    force_new_background = bool(job.get("force_new_background", False))
+    collection_id = parse_collection_id_value(job.get("collection_id"))
+    requested_at = str(job.get("requested_at", "")).strip()
+    openai_api_key = str(job.get("openai_api_key", "")).strip()
+    openai_model = str(job.get("openai_model", "")).strip()
+    openai_timeout_s = int(job.get("openai_timeout_s", 90) or 90)
+    stem_key = str(job.get("stem_key", "")).strip() or music_generation_stem(
+        collection_id=collection_id,
+        artist=artist,
+        album=album,
+        source_url=source_url,
+    )
+    job_dir = Path(str(job.get("job_dir", "")).strip())
+    existing_source_path_raw = str(job.get("existing_source_path", "")).strip()
+    existing_source_path = Path(existing_source_path_raw) if existing_source_path_raw else None
+    stage_paths = music_job_stage_paths(job_dir, stem_key)
+    src_path = stage_paths["source_path"]
+    background_path = stage_paths["background_path"]
+    wide_png_path = stage_paths["wide_png_path"]
+    compressed_jpg_path = stage_paths["compressed_jpg_path"]
+    job_dir.mkdir(parents=True, exist_ok=True)
+
+    def log_music_generation_step(stage: str, **fields: Any) -> None:
+        log_event(
+            "music_generation_step",
+            stage=stage,
+            cache_key=cache_key,
+            kind=kind,
+            artist=artist,
+            album=album,
+            collection_id=collection_id,
+            worker_job_id=str(job.get("job_id", "")).strip(),
+            **fields,
+        )
+
+    def emit_cover_art_step(stage: str, fields: dict[str, Any]) -> None:
+        log_music_generation_step(stage, **fields)
+
+    generation_started_at = time.perf_counter()
+    log_music_generation_step(
+        "worker_start",
+        force_regen=force_regen,
+        force_new_background=force_new_background,
+        source_preference=source_preference,
+        source_url_provided=bool(source_url),
+        requested_at=requested_at,
+    )
+
+    try:
+        refresh_source_art = bool(source_url) or (
+            not force_new_background
+            and should_refresh_music_source_art(force_regen=force_regen, source_preference=source_preference)
+        )
+        if not refresh_source_art and existing_source_path is not None and existing_source_path.exists():
+            src_path.parent.mkdir(parents=True, exist_ok=True)
+            if existing_source_path.resolve() != src_path.resolve():
+                shutil.copy2(existing_source_path, src_path)
+            log_music_generation_step(
+                "existing_source_staged",
+                source_path=str(existing_source_path),
+                staged_path=str(src_path),
+            )
+
+        if not src_path.exists() and not refresh_source_art:
+            stage_started_at = time.perf_counter()
+            log_music_generation_step("stage_source_from_index_start")
+            maybe_stage_source_art_from_index(
+                src_path=src_path,
+                artist=artist,
+                album=album,
+                collection_id=collection_id,
+            )
+            log_music_generation_step(
+                "stage_source_from_index_done",
+                duration_ms=int((time.perf_counter() - stage_started_at) * 1000),
+                source_exists=src_path.exists(),
+            )
+
+        if not source_url and not src_path.exists():
+            if collection_id is not None:
+                lookup_started_at = time.perf_counter()
+                log_music_generation_step("itunes_lookup_start")
+                lookup = itunes_lookup(collection_id, timeout_s=10)
+                results = lookup.get("results") if isinstance(lookup, dict) else []
+                album_info = {}
+                if isinstance(results, list):
+                    for item in results:
+                        if isinstance(item, dict) and (item.get("artworkUrl100") or item.get("artworkUrl60")):
+                            album_info = item
+                            break
+                source_url = resolve_artwork_url(album_info)
+                log_music_generation_step(
+                    "itunes_lookup_done",
+                    duration_ms=int((time.perf_counter() - lookup_started_at) * 1000),
+                    result_count=len(results) if isinstance(results, list) else 0,
+                    source_url_found=bool(source_url),
+                )
+            if not source_url and artist and album:
+                album_candidates: list[str] = []
+
+                def add_album_candidate(value: str) -> None:
+                    v = str(value or "").strip()
+                    if v and v not in album_candidates:
+                        album_candidates.append(v)
+
+                add_album_candidate(album)
+                add_album_candidate(re.sub(r"\s*\([^)]*\)\s*", " ", album))
+                add_album_candidate(re.sub(r"\s*\[[^\]]*\]\s*", " ", album))
+                if ":" in album:
+                    add_album_candidate(album.split(":", 1)[0])
+                    add_album_candidate(album.split(":", 1)[1])
+                add_album_candidate(re.sub(r"\s*[-–]\s*expanded.*$", "", album, flags=re.IGNORECASE))
+
+                log_music_generation_step(
+                    "itunes_search_candidates",
+                    candidate_count=len(album_candidates),
+                    candidates=album_candidates,
+                )
+                for album_candidate in album_candidates:
+                    search_started_at = time.perf_counter()
+                    log_music_generation_step("itunes_search_start", album_candidate=album_candidate)
+                    album_info = itunes_search(artist, album_candidate, timeout_s=10)
+                    source_url = resolve_artwork_url(album_info)
+                    log_music_generation_step(
+                        "itunes_search_done",
+                        album_candidate=album_candidate,
+                        duration_ms=int((time.perf_counter() - search_started_at) * 1000),
+                        source_url_found=bool(source_url),
+                        match_collection_id=album_info.get("collectionId") if isinstance(album_info, dict) else None,
+                        match_collection_name=album_info.get("collectionName") if isinstance(album_info, dict) else None,
+                        match_artist_name=album_info.get("artistName") if isinstance(album_info, dict) else None,
+                    )
+                    if source_url:
+                        break
+            if not source_url and artist and track:
+                track_lookup_started_at = time.perf_counter()
+                log_music_generation_step("itunes_track_search_start", track_candidate=track)
+                track_info = itunes_track_search(artist, track, timeout_s=10)
+                source_url = resolve_artwork_url(track_info)
+                if collection_id is None and isinstance(track_info, dict):
+                    resolved_collection = parse_collection_id_value(track_info.get("collectionId"))
+                    if resolved_collection is not None:
+                        collection_id = resolved_collection
+                log_music_generation_step(
+                    "itunes_track_search_done",
+                    duration_ms=int((time.perf_counter() - track_lookup_started_at) * 1000),
+                    source_url_found=bool(source_url),
+                    match_collection_id=track_info.get("collectionId") if isinstance(track_info, dict) else None,
+                    match_collection_name=track_info.get("collectionName") if isinstance(track_info, dict) else None,
+                    match_artist_name=track_info.get("artistName") if isinstance(track_info, dict) else None,
+                )
+            if not source_url and artist and album and album != track:
+                album_track_lookup_started_at = time.perf_counter()
+                log_music_generation_step("itunes_track_search_start", track_candidate=album, fallback_from="album")
+                track_info = itunes_track_search(artist, album, timeout_s=10)
+                source_url = resolve_artwork_url(track_info)
+                if collection_id is None and isinstance(track_info, dict):
+                    resolved_collection = parse_collection_id_value(track_info.get("collectionId"))
+                    if resolved_collection is not None:
+                        collection_id = resolved_collection
+                log_music_generation_step(
+                    "itunes_track_search_done",
+                    track_candidate=album,
+                    fallback_from="album",
+                    duration_ms=int((time.perf_counter() - album_track_lookup_started_at) * 1000),
+                    source_url_found=bool(source_url),
+                    match_collection_id=track_info.get("collectionId") if isinstance(track_info, dict) else None,
+                    match_collection_name=track_info.get("collectionName") if isinstance(track_info, dict) else None,
+                    match_artist_name=track_info.get("artistName") if isinstance(track_info, dict) else None,
+                )
+            if not source_url and not (artist and album) and collection_id is None:
+                log_music_generation_step("artwork_resolution_failed", reason="unsupported_metadata")
+                raise ValueError("unsupported metadata; provide artwork_url, collection_id, or artist+album")
+
+        if not source_url and not src_path.exists():
+            log_music_generation_step("artwork_resolution_failed", reason="unable_to_resolve_artwork_url")
+            raise ValueError("Unable to resolve artwork URL from request metadata")
+
+        if not src_path.exists():
+            download_started_at = time.perf_counter()
+            log_music_generation_step("download_artwork_start")
+            download_artwork(source_url, str(src_path), timeout_s=15)
+            log_music_generation_step(
+                "download_artwork_done",
+                duration_ms=int((time.perf_counter() - download_started_at) * 1000),
+                source_path=str(src_path),
+                source_bytes=src_path.stat().st_size if src_path.exists() else None,
+            )
+
+        use_legacy_masked = bool(RUNTIME_OPTIONS.get("legacy_masked_outpaint", False))
+        if use_legacy_masked:
+            log_event("legacy_masked_outpaint_requested", enabled=True, note="using reference_no_mask pipeline")
+
+        try:
+            log_music_generation_step("generate_reference_frame_start", openai_model=openai_model)
+            final_png, background_png, request_id, model_used = generate_reference_frame_from_album(
+                source_album_path=src_path,
+                openai_api_key=openai_api_key,
+                openai_model=openai_model,
+                timeout_s=openai_timeout_s,
+                album_shadow=True,
+                step_hook=emit_cover_art_step,
+            )
+            generation_mode = "openai_reference"
+            log_music_generation_step(
+                "generate_reference_frame_done",
+                mode=generation_mode,
+                request_id=request_id,
+                model_used=model_used,
+            )
+        except Exception as gen_exc:
+            log_music_generation_step("generate_reference_frame_failed", error=repr(gen_exc))
+            final_png, background_png = generate_local_fallback_frame_from_album(
+                source_album_path=src_path,
+                album_shadow=True,
+                step_hook=emit_cover_art_step,
+            )
+            request_id = None
+            model_used = "local-fallback"
+            gen_msg = repr(gen_exc).lower()
+            if is_openai_org_verification_error(gen_exc):
+                generation_mode = "local_fallback_openai_verification"
+            elif "moderation_blocked" in gen_msg or "safety system" in gen_msg:
+                generation_mode = "local_fallback_blocked"
+            else:
+                generation_mode = "local_fallback_openai_error"
+            log_event(
+                "music_openai_fallback",
+                cache_key=cache_key,
+                error=repr(gen_exc),
+                mode=generation_mode,
+            )
+            log_music_generation_step("fallback_generation_done", mode=generation_mode)
+
+        write_started_at = time.perf_counter()
+        log_music_generation_step("write_outputs_start")
+        wide_png_path.parent.mkdir(parents=True, exist_ok=True)
+        background_path.parent.mkdir(parents=True, exist_ok=True)
+        compressed_jpg_path.parent.mkdir(parents=True, exist_ok=True)
+        wide_png_path.write_bytes(final_png)
+        background_path.write_bytes(background_png)
+        log_music_generation_step(
+            "write_outputs_done",
+            duration_ms=int((time.perf_counter() - write_started_at) * 1000),
+            wide_png_path=str(wide_png_path),
+            wide_png_bytes=wide_png_path.stat().st_size if wide_png_path.exists() else None,
+            background_path=str(background_path),
+            background_png_bytes=background_path.stat().st_size if background_path.exists() else None,
+        )
+        compress_started_at = time.perf_counter()
+        log_music_generation_step("compress_start", max_bytes=JPEG_MAX_BYTES)
+        compressed_ok, compressed_size = compress_png_path_to_jpeg_max_bytes(
+            wide_png_path,
+            compressed_jpg_path,
+            max_bytes=JPEG_MAX_BYTES,
+        )
+        log_music_generation_step(
+            "compress_done",
+            duration_ms=int((time.perf_counter() - compress_started_at) * 1000),
+            compressed_within_limit=compressed_ok,
+            compressed_bytes=compressed_size,
+            compressed_path=str(compressed_jpg_path),
+        )
+        wide_path = compressed_jpg_path if compressed_jpg_path.exists() else wide_png_path
+        encoded_type = guess_file_type(wide_path)
+        encoded_bytes = wide_path.stat().st_size
+        log_music_generation_step(
+            "worker_complete",
+            total_duration_ms=int((time.perf_counter() - generation_started_at) * 1000),
+            mode=generation_mode,
+            output_path=str(wide_path),
+        )
+        return {
+            "ok": True,
+            "cache_key": cache_key,
+            "collection_id": collection_id,
+            "source_url": source_url,
+            "source_path": str(src_path) if src_path.exists() else "",
+            "background_path": str(background_path) if background_path.exists() else "",
+            "wide_png_path": str(wide_png_path) if wide_png_path.exists() else "",
+            "compressed_jpg_path": str(compressed_jpg_path) if compressed_jpg_path.exists() else "",
+            "wide_path": str(wide_path),
+            "encoded_type": encoded_type,
+            "encoded_bytes": encoded_bytes,
+            "compressed_ok": compressed_ok,
+            "compressed_size": compressed_size,
+            "generation_mode": generation_mode,
+            "request_id": request_id,
+            "model_used": model_used,
+        }
+    except Exception as e:
+        log_music_generation_step(
+            "failed",
+            total_duration_ms=int((time.perf_counter() - generation_started_at) * 1000),
+            error=repr(e),
+        )
+        append_music_error(
+            {
+                "cache_key": cache_key,
+                "collection_id": collection_id,
+                "artist": artist,
+                "album": album,
+                "track": track,
+                "music_session_key": restore_payload.get("music_session_key", ""),
+                "key_source": restore_payload.get("key_source", ""),
+                "error": repr(e),
+            }
+        )
+        restore_content_id = str(restore_payload.get("restore_content_id", "")).strip()
+        if restore_content_id:
+            log_event(
+                "music_restore_content_id_fallback",
+                cache_key=cache_key,
+                error=repr(e),
+                restore_content_id=restore_content_id,
+            )
+            return {
+                "ok": False,
+                "fallback_kind": "restore_content_id",
+                "target_cid": restore_content_id,
+                "pick_source": "music_restore_content_id_fallback",
+                "cache_key": cache_key,
+                "error": repr(e),
+            }
+        fallback_path, fallback_source, fallback_folder, fallback_file_count, fallback_index = choose_music_failure_fallback(cache_key)
+        if fallback_path is None:
+            raise
+        return {
+            "ok": False,
+            "fallback_kind": "file",
+            "fallback_path": str(fallback_path),
+            "fallback_source": fallback_source or "music_fallback_file",
+            "fallback_folder": fallback_folder,
+            "fallback_file_count": fallback_file_count,
+            "fallback_index": fallback_index,
+            "cache_key": cache_key,
+            "error": repr(e),
+        }
+
+
+def run_music_generation_worker_job(spec_path: Path) -> int:
+    spec_raw = json.loads(spec_path.read_text(encoding="utf-8"))
+    if not isinstance(spec_raw, dict):
+        raise ValueError("music worker spec must be a JSON object")
+    result_path = Path(str(spec_raw.get("result_path", "")).strip())
+    if not str(result_path):
+        raise ValueError("music worker spec missing result_path")
+    try:
+        result = run_music_generation_pipeline(spec_raw)
+        atomic_write_json(result_path, result)
+        return 0
+    except Exception as exc:
+        atomic_write_json(
+            result_path,
+            {
+                "ok": False,
+                "worker_failed": True,
+                "error": repr(exc),
+                "job_id": str(spec_raw.get("job_id", "")).strip(),
+            },
+        )
+        raise
+
+
+def run_cancellable_music_generation_worker(
+    job_spec: dict[str, Any],
+    *,
+    superseded_check: Callable[[], Optional[dict[str, Any]]],
+    poll_interval_s: float = 0.25,
+) -> dict[str, Any]:
+    job_id = uuid.uuid4().hex
+    job_dir = MUSIC_JOB_DIR / job_id
+    spec_path = job_dir / "spec.json"
+    result_path = job_dir / "result.json"
+    job_dir.mkdir(parents=True, exist_ok=True)
+    full_spec = dict(job_spec)
+    full_spec["job_id"] = job_id
+    full_spec["job_dir"] = str(job_dir)
+    full_spec["result_path"] = str(result_path)
+    atomic_write_json(spec_path, full_spec)
+
+    process = subprocess.Popen(
+        [sys.executable, str(Path(__file__).resolve()), "--music-generation-worker", str(spec_path)],
+        stdout=None,
+        stderr=None,
+    )
+    write_active_music_job(
+        {
+            "job_id": job_id,
+            "pid": process.pid,
+            "started_at": utc_now_iso(),
+            "cache_key": str(full_spec.get("cache_key", "")).strip(),
+            "identity": stable_music_identity(full_spec.get("restore_payload", {})),
+            "artist": str(full_spec.get("artist", "")).strip(),
+            "album": str(full_spec.get("album", "")).strip(),
+            "requested_at": str(full_spec.get("requested_at", "")).strip(),
+            "addon_version": ADDON_VERSION,
+        }
+    )
+
+    try:
+        while True:
+            enqueue_restore_inbox_if_present()
+            superseding_request = superseded_check()
+            if superseding_request is not None:
+                terminate_process_tree(process)
+                return {
+                    "canceled": True,
+                    "job_id": job_id,
+                    "job_dir": str(job_dir),
+                    "superseding_request": superseding_request,
+                }
+
+            return_code = process.poll()
+            if return_code is not None:
+                break
+            time.sleep(max(0.05, float(poll_interval_s)))
+
+        result: dict[str, Any] = {}
+        if result_path.exists():
+            loaded = json.loads(result_path.read_text(encoding="utf-8"))
+            if isinstance(loaded, dict):
+                result = loaded
+        result["job_id"] = job_id
+        result["job_dir"] = str(job_dir)
+        result["return_code"] = return_code
+        if return_code != 0 and not result:
+            raise RuntimeError(f"music generation worker exited with code {return_code}")
+        return result
+    finally:
+        clear_active_music_job()
+        remove_file_if_exists(spec_path)
+
+
+def run_reference_generation_worker_job(spec_path: Path) -> int:
+    spec_raw = json.loads(spec_path.read_text(encoding="utf-8"))
+    if not isinstance(spec_raw, dict):
+        raise ValueError("reference generation worker spec must be a JSON object")
+    job_dir = Path(str(spec_raw.get("job_dir", "")).strip())
+    result_path = Path(str(spec_raw.get("result_path", "")).strip())
+    if not str(job_dir) or not str(result_path):
+        raise ValueError("reference generation worker spec missing paths")
+
+    source_album_path = Path(str(spec_raw.get("source_album_path", "")).strip())
+    if not source_album_path.exists():
+        raise ValueError(f"source album path not found: {source_album_path}")
+
+    final_png_path = job_dir / "final.png"
+    background_png_path = job_dir / "background.png"
+    job_dir.mkdir(parents=True, exist_ok=True)
+
+    try:
+        final_png, background_png, request_id, model_used = generate_reference_frame_from_album(
+            source_album_path=source_album_path,
+            openai_api_key=str(spec_raw.get("openai_api_key", "")).strip(),
+            openai_model=str(spec_raw.get("openai_model", "")).strip(),
+            timeout_s=int(spec_raw.get("openai_timeout_s", 90) or 90),
+            album_shadow=True,
+        )
+        generation_mode = "openai_reference"
+    except Exception as gen_exc:
+        final_png, background_png = generate_local_fallback_frame_from_album(
+            source_album_path=source_album_path,
+            album_shadow=True,
+        )
+        request_id = None
+        model_used = "local-fallback"
+        gen_msg = repr(gen_exc).lower()
+        if is_openai_org_verification_error(gen_exc):
+            generation_mode = "local_fallback_openai_verification"
+        elif "moderation_blocked" in gen_msg or "safety system" in gen_msg:
+            generation_mode = "local_fallback_blocked"
+        else:
+            generation_mode = "local_fallback_openai_error"
+        log_event(
+            "music_openai_fallback",
+            cache_key=str(spec_raw.get("cache_key", "")).strip(),
+            error=repr(gen_exc),
+            mode=generation_mode,
+        )
+
+    final_png_path.write_bytes(final_png)
+    background_png_path.write_bytes(background_png)
+    atomic_write_json(
+        result_path,
+        {
+            "ok": True,
+            "final_png_path": str(final_png_path),
+            "background_png_path": str(background_png_path),
+            "request_id": request_id,
+            "model_used": model_used,
+            "generation_mode": generation_mode,
+        },
+    )
+    return 0
+
+
+def run_cancellable_reference_generation(
+    *,
+    source_album_path: Path,
+    cache_key: str,
+    openai_api_key: str,
+    openai_model: str,
+    openai_timeout_s: int,
+    superseded_check: Callable[[], Optional[dict[str, Any]]],
+    poll_interval_s: float = 0.25,
+) -> dict[str, Any]:
+    job_id = uuid.uuid4().hex
+    job_dir = MUSIC_JOB_DIR / f"reference_{job_id}"
+    spec_path = job_dir / "spec.json"
+    result_path = job_dir / "result.json"
+    job_dir.mkdir(parents=True, exist_ok=True)
+    atomic_write_json(
+        spec_path,
+        {
+            "job_id": job_id,
+            "job_dir": str(job_dir),
+            "result_path": str(result_path),
+            "source_album_path": str(source_album_path),
+            "cache_key": cache_key,
+            "openai_api_key": openai_api_key,
+            "openai_model": openai_model,
+            "openai_timeout_s": openai_timeout_s,
+        },
+    )
+    process = subprocess.Popen(
+        [sys.executable, str(Path(__file__).resolve()), "--music-reference-worker", str(spec_path)],
+        stdout=None,
+        stderr=None,
+    )
+    try:
+        while True:
+            enqueue_restore_inbox_if_present()
+            superseding_request = superseded_check()
+            if superseding_request is not None:
+                terminate_process_tree(process)
+                return {
+                    "canceled": True,
+                    "job_id": job_id,
+                    "job_dir": str(job_dir),
+                    "superseding_request": superseding_request,
+                }
+            return_code = process.poll()
+            if return_code is not None:
+                break
+            time.sleep(max(0.05, float(poll_interval_s)))
+
+        result: dict[str, Any] = {}
+        if result_path.exists():
+            loaded = json.loads(result_path.read_text(encoding="utf-8"))
+            if isinstance(loaded, dict):
+                result = loaded
+        result["job_id"] = job_id
+        result["job_dir"] = str(job_dir)
+        result["return_code"] = return_code
+        if return_code != 0 and not result:
+            raise RuntimeError(f"reference generation worker exited with code {return_code}")
+        return result
+    finally:
+        remove_file_if_exists(spec_path)
 
 
 def upload_local_file(art: Any, file_path: Path) -> Optional[str]:
@@ -4832,7 +5610,56 @@ def main() -> None:
                     artist = str(restore_payload.get("artist", "")).strip()
                     album = str(restore_payload.get("album", "")).strip()
                     track = str(restore_payload.get("track", "")).strip()
-                    if should_skip_superseded_music_request(work_item, kind, requested_show):
+                    current_music_identity = stable_music_identity(restore_payload)
+
+                    def skip_if_superseded_music_request(
+                        *,
+                        stage: str,
+                        pick_source_override: str,
+                        phase_action: str,
+                        selected_content_id: Optional[str] = None,
+                        chosen: Optional[str] = None,
+                        extra_fields: Optional[dict[str, Any]] = None,
+                    ) -> bool:
+                        superseding_request = find_superseding_music_request(work_item, kind, restore_payload)
+                        if superseding_request is None:
+                            return False
+
+                        superseding_payload = superseding_request.get("payload") if isinstance(superseding_request, dict) else {}
+                        log_event(
+                            "music_request_skipped",
+                            reason=stage,
+                            kind=kind,
+                            artist=artist,
+                            album=album,
+                            requested_at=requested_at,
+                            requested_music_session_key=str(restore_payload.get("music_session_key", "")).strip(),
+                            current_identity=current_music_identity,
+                            superseding_identity=str(superseding_request.get("identity", "")).strip(),
+                            superseding_kind=str(superseding_request.get("kind", "")).strip(),
+                            superseding_requested_at=str(superseding_request.get("requested_at", "")).strip(),
+                            superseding_artist=str(superseding_payload.get("artist", "")).strip(),
+                            superseding_album=str(superseding_payload.get("album", "")).strip(),
+                            selected_content_id=selected_content_id,
+                        )
+                        save_state(state)
+                        write_superseded_music_status(
+                            tv_ip=tv_ip,
+                            kind=kind,
+                            request_value=request_value,
+                            requested_at=requested_at,
+                            requested_show=requested_show,
+                            is_art_mode=is_art_mode,
+                            restore_payload=restore_payload,
+                            pick_source=pick_source_override,
+                            phase_action=phase_action,
+                            selected_content_id=selected_content_id,
+                            chosen=chosen,
+                            extra_fields=extra_fields,
+                        )
+                        return True
+
+                    if should_skip_superseded_music_request(work_item, kind, requested_show, restore_payload):
                         show_flag = False
                         pick_source = "music_superseded_before_generation"
                         log_event(
@@ -4843,28 +5670,18 @@ def main() -> None:
                             album=album,
                             requested_at=requested_at,
                             requested_music_session_key=str(restore_payload.get("music_session_key", "")).strip(),
+                            current_identity=current_music_identity,
                         )
-                        write_status(
-                            {
-                                "ok": True,
-                                "mode": "restore",
-                                "tv_ip": tv_ip,
-                                "kind": kind,
-                                "value": request_value,
-                                "requested_at": requested_at,
-                                "requested_show": requested_show,
-                                "effective_show": False,
-                                "art_mode": is_art_mode,
-                                "requested_music_session_key": str(restore_payload.get("music_session_key", "")).strip(),
-                                "restore_content_id": str(restore_payload.get("restore_content_id", "")).strip(),
-                                "pick_source": pick_source,
-                                "addon_version": ADDON_VERSION,
-                                "selected_content_id": None,
-                                "chosen": None,
-                                "phase": "done",
-                                "phase_action": "skipped_superseded_music_request",
-                                "phase_status": "skipped",
-                            }
+                        write_superseded_music_status(
+                            tv_ip=tv_ip,
+                            kind=kind,
+                            request_value=request_value,
+                            requested_at=requested_at,
+                            requested_show=requested_show,
+                            is_art_mode=is_art_mode,
+                            restore_payload=restore_payload,
+                            pick_source=pick_source,
+                            phase_action="skipped_superseded_music_request",
                         )
                         continue
                     duplicate_content_id = resolve_duplicate_music_request_content_id(restore_payload, kind)
@@ -5063,6 +5880,20 @@ def main() -> None:
                             target_cid = cached_content_id
                             encoded_type = guess_file_type(wide_path)
                             encoded_bytes = wide_path.stat().st_size
+                            if skip_if_superseded_music_request(
+                                stage="superseded_before_cache_update",
+                                pick_source_override="music_superseded_before_cache_update",
+                                phase_action="skipped_superseded_music_request_before_cache_update",
+                                selected_content_id=target_cid,
+                                chosen=selected_name or target_cid,
+                                extra_fields={
+                                    "cache_key": cache_key,
+                                    "widescreen_path": str(wide_path),
+                                    "encoded_type": encoded_type,
+                                    "encoded_bytes": encoded_bytes,
+                                },
+                            ):
+                                continue
                             update_music_association(
                                 restore_payload,
                                 cache_key=cache_key,
@@ -5092,6 +5923,20 @@ def main() -> None:
                             target_cid = association_content_id
                             encoded_type = guess_file_type(wide_path)
                             encoded_bytes = wide_path.stat().st_size
+                            if skip_if_superseded_music_request(
+                                stage="superseded_before_cache_update",
+                                pick_source_override="music_superseded_before_cache_update",
+                                phase_action="skipped_superseded_music_request_before_cache_update",
+                                selected_content_id=target_cid,
+                                chosen=selected_name or target_cid,
+                                extra_fields={
+                                    "cache_key": cache_key,
+                                    "widescreen_path": str(wide_path),
+                                    "encoded_type": encoded_type,
+                                    "encoded_bytes": encoded_bytes,
+                                },
+                            ):
+                                continue
                             update_catalog_content_id(MUSIC_CATALOG_PATH, catalog_key, target_cid)
                             update_music_association(
                                 restore_payload,
@@ -5121,10 +5966,37 @@ def main() -> None:
                         else:
                             encoded_type = guess_file_type(wide_path)
                             encoded_bytes = wide_path.stat().st_size
+                            if skip_if_superseded_music_request(
+                                stage="superseded_before_upload",
+                                pick_source_override="music_superseded_before_upload",
+                                phase_action="skipped_superseded_music_request_before_upload",
+                                chosen=selected_name,
+                                extra_fields={
+                                    "cache_key": cache_key,
+                                    "widescreen_path": str(wide_path),
+                                    "encoded_type": encoded_type,
+                                    "encoded_bytes": encoded_bytes,
+                                },
+                            ):
+                                continue
                             art, target_cid = upload_local_file_with_reconnect(tv_ip, art, wide_path)
                             if not target_cid:
                                 raise ValueError("Cached music upload succeeded but content_id was not found")
                             append_uploaded_id(state, "cover_uploaded_ids", target_cid)
+                            if skip_if_superseded_music_request(
+                                stage="superseded_before_cache_update",
+                                pick_source_override="music_superseded_before_cache_update",
+                                phase_action="skipped_superseded_music_request_before_cache_update",
+                                selected_content_id=target_cid,
+                                chosen=selected_name or target_cid,
+                                extra_fields={
+                                    "cache_key": cache_key,
+                                    "widescreen_path": str(wide_path),
+                                    "encoded_type": encoded_type,
+                                    "encoded_bytes": encoded_bytes,
+                                },
+                            ):
+                                continue
                             update_catalog_content_id(MUSIC_CATALOG_PATH, catalog_key, target_cid)
                             update_music_association(
                                 restore_payload,
@@ -5359,54 +6231,77 @@ def main() -> None:
                                     source_path=str(src_path),
                                     source_bytes=src_path.stat().st_size if src_path.exists() else None,
                                 )
+                            if skip_if_superseded_music_request(
+                                stage="superseded_after_lookup_download",
+                                pick_source_override="music_superseded_after_lookup_download",
+                                phase_action="skipped_superseded_music_request_after_lookup_download",
+                                chosen=selected_name,
+                                extra_fields={
+                                    "cache_key": cache_key,
+                                    "source_path": str(src_path),
+                                },
+                            ):
+                                continue
 
                             use_legacy_masked = bool(RUNTIME_OPTIONS.get("legacy_masked_outpaint", False))
                             if use_legacy_masked:
                                 log_event("legacy_masked_outpaint_requested", enabled=True, note="using reference_no_mask pipeline")
 
+                            reference_generation_result: Optional[dict[str, Any]] = None
                             try:
                                 log_music_generation_step("generate_reference_frame_start", openai_model=openai_model)
-                                final_png, background_png, request_id, model_used = generate_reference_frame_from_album(
+                                reference_generation_result = run_cancellable_reference_generation(
                                     source_album_path=src_path,
+                                    cache_key=cache_key,
                                     openai_api_key=openai_api_key,
                                     openai_model=openai_model,
-                                    timeout_s=openai_timeout_s,
-                                    album_shadow=True,
-                                    step_hook=emit_cover_art_step,
+                                    openai_timeout_s=openai_timeout_s,
+                                    superseded_check=lambda: find_superseding_music_request(work_item, kind, restore_payload),
                                 )
-                                generation_mode = "openai_reference"
+                                if reference_generation_result.get("canceled"):
+                                    if skip_if_superseded_music_request(
+                                        stage="superseded_during_generation",
+                                        pick_source_override="music_superseded_during_generation",
+                                        phase_action="skipped_superseded_music_request_during_generation",
+                                        chosen=selected_name,
+                                        extra_fields={
+                                            "cache_key": cache_key,
+                                            "source_path": str(src_path),
+                                        },
+                                    ):
+                                        continue
+                                    raise RuntimeError("music_reference_generation_canceled_without_superseding_request")
+                                if reference_generation_result.get("return_code", 0) != 0 or not reference_generation_result.get("ok"):
+                                    raise ValueError(str(reference_generation_result.get("error", "reference_generation_worker_failed")))
+                                request_id = reference_generation_result.get("request_id")
+                                model_used = reference_generation_result.get("model_used")
+                                generation_mode = str(reference_generation_result.get("generation_mode", "")).strip() or "openai_reference"
+                                final_png = Path(str(reference_generation_result.get("final_png_path", "")).strip()).read_bytes()
+                                background_png = Path(str(reference_generation_result.get("background_png_path", "")).strip()).read_bytes()
                                 log_music_generation_step(
                                     "generate_reference_frame_done",
                                     mode=generation_mode,
                                     request_id=request_id,
                                     model_used=model_used,
                                 )
-                            except Exception as gen_exc:
-                                log_music_generation_step(
-                                    "generate_reference_frame_failed",
-                                    error=repr(gen_exc),
-                                )
-                                final_png, background_png = generate_local_fallback_frame_from_album(
-                                    source_album_path=src_path,
-                                    album_shadow=True,
-                                    step_hook=emit_cover_art_step,
-                                )
-                                request_id = None
-                                model_used = "local-fallback"
-                                gen_msg = repr(gen_exc).lower()
-                                if is_openai_org_verification_error(gen_exc):
-                                    generation_mode = "local_fallback_openai_verification"
-                                elif "moderation_blocked" in gen_msg or "safety system" in gen_msg:
-                                    generation_mode = "local_fallback_blocked"
-                                else:
-                                    generation_mode = "local_fallback_openai_error"
-                                log_event(
-                                    "music_openai_fallback",
-                                    cache_key=cache_key,
-                                    error=repr(gen_exc),
-                                    mode=generation_mode,
-                                )
-                                log_music_generation_step("fallback_generation_done", mode=generation_mode)
+                            finally:
+                                if isinstance(reference_generation_result, dict):
+                                    job_dir_raw = str(reference_generation_result.get("job_dir", "")).strip()
+                                    if job_dir_raw:
+                                        cleanup_music_job_dir(Path(job_dir_raw))
+                            if skip_if_superseded_music_request(
+                                stage="superseded_after_generation",
+                                pick_source_override="music_superseded_after_generation",
+                                phase_action="skipped_superseded_music_request_after_generation",
+                                chosen=selected_name,
+                                extra_fields={
+                                    "cache_key": cache_key,
+                                    "source_path": str(src_path),
+                                    "openai_request_id": locals().get("request_id"),
+                                    "openai_model_used": locals().get("model_used"),
+                                },
+                            ):
+                                continue
 
                             write_started_at = time.perf_counter()
                             log_music_generation_step("write_outputs_start")
@@ -5440,6 +6335,22 @@ def main() -> None:
                             wide_path = compressed_jpg_path if compressed_jpg_path.exists() else wide_png_path
                             encoded_type = guess_file_type(wide_path)
                             encoded_bytes = wide_path.stat().st_size
+                            if skip_if_superseded_music_request(
+                                stage="superseded_before_upload",
+                                pick_source_override="music_superseded_before_upload",
+                                phase_action="skipped_superseded_music_request_before_upload",
+                                chosen=selected_name,
+                                extra_fields={
+                                    "cache_key": cache_key,
+                                    "source_path": str(src_path),
+                                    "widescreen_path": str(wide_path),
+                                    "encoded_type": encoded_type,
+                                    "encoded_bytes": encoded_bytes,
+                                    "openai_request_id": locals().get("request_id"),
+                                    "openai_model_used": locals().get("model_used"),
+                                },
+                            ):
+                                continue
                             upload_started_at = time.perf_counter()
                             log_music_generation_step(
                                 "upload_start",
@@ -5456,6 +6367,23 @@ def main() -> None:
                                 selected_content_id=target_cid,
                             )
                             append_uploaded_id(state, "cover_uploaded_ids", target_cid)
+                            if skip_if_superseded_music_request(
+                                stage="superseded_before_cache_update",
+                                pick_source_override="music_superseded_before_cache_update",
+                                phase_action="skipped_superseded_music_request_before_cache_update",
+                                selected_content_id=target_cid,
+                                chosen=selected_name or target_cid,
+                                extra_fields={
+                                    "cache_key": cache_key,
+                                    "source_path": str(src_path),
+                                    "widescreen_path": str(wide_path),
+                                    "encoded_type": encoded_type,
+                                    "encoded_bytes": encoded_bytes,
+                                    "openai_request_id": locals().get("request_id"),
+                                    "openai_model_used": locals().get("model_used"),
+                                },
+                            ):
+                                continue
                             catalog_key = music_catalog_key_for_path(wide_path)
                             update_catalog_content_id(MUSIC_CATALOG_PATH, catalog_key, target_cid)
                             update_music_association(
@@ -5556,6 +6484,19 @@ def main() -> None:
                                 selected_name = fallback_path.name
                                 encoded_type = guess_file_type(fallback_path)
                                 encoded_bytes = fallback_path.stat().st_size
+                                if skip_if_superseded_music_request(
+                                    stage="superseded_before_upload",
+                                    pick_source_override="music_superseded_before_upload",
+                                    phase_action="skipped_superseded_music_request_before_upload",
+                                    chosen=selected_name,
+                                    extra_fields={
+                                        "cache_key": cache_key,
+                                        "fallback_path": str(fallback_path),
+                                        "encoded_type": encoded_type,
+                                        "encoded_bytes": encoded_bytes,
+                                    },
+                                ):
+                                    continue
                                 art, target_cid = upload_local_file_with_reconnect(tv_ip, art, fallback_path)
                                 if not target_cid:
                                     raise ValueError("Fallback cover upload succeeded but content_id was not found")
@@ -5576,14 +6517,25 @@ def main() -> None:
                 else:
                     raise ValueError(f"Unsupported restore kind: {kind!r}")
 
-                if show_flag and is_superseded_music_request(work_item, kind):
-                    show_flag = False
-                    log_event(
-                        "restore_show_suppressed",
-                        reason="superseded_by_newer_music_request",
-                        kind=kind,
-                        requested_at=requested_at,
-                    )
+                if kind in {"cover_art_reference_background", "cover_art_outpaint"} and show_flag:
+                    if skip_if_superseded_music_request(
+                        stage="superseded_before_apply",
+                        pick_source_override="music_superseded_before_apply",
+                        phase_action="skipped_superseded_music_request_before_apply",
+                        selected_content_id=target_cid,
+                        chosen=selected_name or target_cid,
+                        extra_fields={
+                            "cache_key": locals().get("cache_key"),
+                            "source_path": str(locals().get("src_path")) if "src_path" in locals() else None,
+                            "widescreen_path": str(locals().get("wide_path")) if "wide_path" in locals() else None,
+                            "fallback_path": str(locals().get("fallback_path")) if "fallback_path" in locals() and locals().get("fallback_path") else None,
+                            "encoded_type": locals().get("encoded_type"),
+                            "encoded_bytes": locals().get("encoded_bytes"),
+                            "openai_request_id": locals().get("request_id"),
+                            "openai_model_used": locals().get("model_used"),
+                        },
+                    ):
+                        continue
 
                 verified = False
                 verification_skipped = False
@@ -5689,6 +6641,20 @@ def main() -> None:
                             invalidate_music_cached_content_id(retry_catalog_key or "", target_cid or "")
 
                         if not verified and retry_upload_file is not None:
+                            if kind in {"cover_art_reference_background", "cover_art_outpaint"} and skip_if_superseded_music_request(
+                                stage="superseded_before_upload",
+                                pick_source_override="music_superseded_before_upload",
+                                phase_action="skipped_superseded_music_request_before_upload",
+                                selected_content_id=target_cid,
+                                chosen=selected_name or target_cid,
+                                extra_fields={
+                                    "cache_key": locals().get("cache_key"),
+                                    "widescreen_path": str(retry_upload_file),
+                                    "encoded_type": guess_file_type(retry_upload_file),
+                                    "encoded_bytes": retry_upload_file.stat().st_size if retry_upload_file.exists() else None,
+                                },
+                            ):
+                                continue
                             log_event(
                                 retry_event,
                                 file=str(retry_upload_file),
@@ -5705,6 +6671,20 @@ def main() -> None:
                             else:
                                 append_local_uploaded_id(state, replacement_cid)
                             target_cid = replacement_cid
+                            if kind in {"cover_art_reference_background", "cover_art_outpaint"} and skip_if_superseded_music_request(
+                                stage="superseded_before_cache_update",
+                                pick_source_override="music_superseded_before_cache_update",
+                                phase_action="skipped_superseded_music_request_before_cache_update",
+                                selected_content_id=target_cid,
+                                chosen=selected_name or target_cid,
+                                extra_fields={
+                                    "cache_key": locals().get("cache_key"),
+                                    "widescreen_path": str(retry_upload_file),
+                                    "encoded_type": guess_file_type(retry_upload_file),
+                                    "encoded_bytes": retry_upload_file.stat().st_size if retry_upload_file.exists() else None,
+                                },
+                            ):
+                                continue
                             if retry_catalog_path and retry_catalog_key:
                                 update_catalog_content_id(
                                     retry_catalog_path,
@@ -6071,6 +7051,10 @@ def main() -> None:
 
 
 if __name__ == "__main__":
+    if len(sys.argv) >= 3 and sys.argv[1] == "--music-generation-worker":
+        raise SystemExit(run_music_generation_worker_job(Path(sys.argv[2])))
+    if len(sys.argv) >= 3 and sys.argv[1] == "--music-reference-worker":
+        raise SystemExit(run_reference_generation_worker_job(Path(sys.argv[2])))
     try:
         main()
     except Exception as e:
