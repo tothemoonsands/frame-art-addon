@@ -426,21 +426,53 @@ class RestoreQueueTests(unittest.TestCase):
         )
         self.assertEqual("SAM-C", picked)
 
-    def test_choose_pick_file_can_repeat_last_applied(self):
+    def test_choose_pick_file_skips_last_bucket_pick_when_alternative_exists(self):
         files = [
             Path("/media/frame_ai/ambient/spring/night/a.jpg"),
             Path("/media/frame_ai/ambient/spring/night/b.jpg"),
         ]
+        state = uploader.default_state()
+        uploader.remember_last_pick(
+            state,
+            "ambient:spring:night",
+            selection_key=f"local:{files[0]}",
+            content_id="MY_A",
+            source="local",
+        )
 
         with mock.patch.object(uploader, "list_local_images", return_value=files):
             picked, resolved_folder, file_count, chosen_index = uploader.choose_pick_file(
                 {"season": "spring", "phase": "night", "holiday": "none", "rng": 1},
-                {"last_applied": str(files[0])},
+                state,
+            )
+
+        self.assertEqual(files[1], picked)
+        self.assertEqual("/media/frame_ai/ambient/spring/night", resolved_folder)
+        self.assertEqual(2, file_count)
+        self.assertEqual(1, chosen_index)
+
+    def test_choose_pick_file_allows_single_art_repeat(self):
+        files = [
+            Path("/media/frame_ai/ambient/spring/night/a.jpg"),
+        ]
+        state = uploader.default_state()
+        uploader.remember_last_pick(
+            state,
+            "ambient:spring:night",
+            selection_key=f"local:{files[0]}",
+            content_id="MY_A",
+            source="local",
+        )
+
+        with mock.patch.object(uploader, "list_local_images", return_value=files):
+            picked, resolved_folder, file_count, chosen_index = uploader.choose_pick_file(
+                {"season": "spring", "phase": "night", "holiday": "none", "rng": 1},
+                state,
             )
 
         self.assertEqual(files[0], picked)
         self.assertEqual("/media/frame_ai/ambient/spring/night", resolved_folder)
-        self.assertEqual(2, file_count)
+        self.assertEqual(1, file_count)
         self.assertEqual(0, chosen_index)
 
     def test_record_samsung_pick_failure_prunes_after_threshold(self):

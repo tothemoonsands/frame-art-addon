@@ -95,7 +95,7 @@ MUSIC_RESTORE_KINDS = {"cover_art_reference_background", "cover_art_outpaint"}
 MUSIC_ASSOCIATION_SESSION_TTL_DAYS = 0
 
 RUNTIME_OPTIONS: dict[str, Any] = {}
-ADDON_VERSION = "4.0.2"
+ADDON_VERSION = "4.0.3"
 HOLIDAY_ALIASES = {
     "football": "huskers",
 }
@@ -573,6 +573,7 @@ def append_uploaded_id(state: dict, state_key: str, target_cid: Any) -> None:
 def default_state() -> dict[str, Any]:
     return {
         "last_applied": None,
+        "last_pick_by_bucket": {},
         "last_ambient_content_id": "",
         "last_ambient_source_kind": "",
         "last_ambient_updated_at": "",
@@ -596,6 +597,21 @@ def load_state() -> dict:
     if not isinstance(data, dict):
         return default_state()
     data.setdefault("last_applied", None)
+    raw_last_pick_by_bucket = data.get("last_pick_by_bucket")
+    if not isinstance(raw_last_pick_by_bucket, dict):
+        raw_last_pick_by_bucket = {}
+    last_pick_by_bucket: dict[str, dict[str, str]] = {}
+    for raw_bucket, raw_record in raw_last_pick_by_bucket.items():
+        bucket = str(raw_bucket or "").strip()
+        if not bucket or not isinstance(raw_record, dict):
+            continue
+        last_pick_by_bucket[bucket] = {
+            "selection_key": str(raw_record.get("selection_key", "") or "").strip(),
+            "content_id": str(raw_record.get("content_id", "") or "").strip(),
+            "source": str(raw_record.get("source", "") or "").strip(),
+            "updated_at": str(raw_record.get("updated_at", "") or "").strip(),
+        }
+    data["last_pick_by_bucket"] = last_pick_by_bucket
     data["last_ambient_content_id"] = str(data.get("last_ambient_content_id", "") or "").strip()
     data["last_ambient_source_kind"] = str(data.get("last_ambient_source_kind", "") or "").strip()
     data["last_ambient_updated_at"] = str(data.get("last_ambient_updated_at", "") or "").strip()
@@ -779,6 +795,94 @@ def list_local_images(folder: Path) -> list[Path]:
     return out
 
 
+def pick_bucket_key(payload: dict, phase: str) -> str:
+    phase_key = str(phase or UNKNOWN_PHASE).strip().lower()
+    if phase_key not in PHASE_SALT:
+        phase_key = UNKNOWN_PHASE
+
+    season = str(payload.get("season", "")).strip().lower() or "unknown"
+    holiday_raw = str(payload.get("holiday", "none")).strip().lower()
+    holiday = HOLIDAY_ALIASES.get(holiday_raw, holiday_raw)
+
+    if holiday and holiday != "none":
+        if holiday in {"christmas", "halloween"}:
+            holiday_bucket = "evening" if phase_key in {"evening", "night"} else "day"
+            return f"holiday:{holiday}:{holiday_bucket}"
+        return f"holiday:{holiday}"
+    return f"ambient:{season}:{phase_key}"
+
+
+def get_last_pick_record(state: dict, bucket_key: str) -> dict[str, str]:
+    records = state.get("last_pick_by_bucket")
+    if not isinstance(records, dict):
+        return {}
+    record = records.get(bucket_key)
+    if not isinstance(record, dict):
+        return {}
+    return {
+        "selection_key": str(record.get("selection_key", "") or "").strip(),
+        "content_id": str(record.get("content_id", "") or "").strip(),
+        "source": str(record.get("source", "") or "").strip(),
+        "updated_at": str(record.get("updated_at", "") or "").strip(),
+    }
+
+
+def remember_last_pick(
+    state: dict,
+    bucket_key: str,
+    *,
+    selection_key: str,
+    content_id: str,
+    source: str,
+) -> None:
+    bucket = str(bucket_key or "").strip()
+    if not bucket:
+        return
+    records = state.get("last_pick_by_bucket")
+    if not isinstance(records, dict):
+        records = {}
+        state["last_pick_by_bucket"] = records
+    records[bucket] = {
+        "selection_key": str(selection_key or "").strip(),
+        "content_id": str(content_id or "").strip(),
+        "source": str(source or "").strip(),
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+    }
+
+
+def local_pick_content_id(candidate: Path) -> str:
+    catalog_path, catalog_key = get_catalog_for_local_pick(candidate)
+    if not catalog_path or not catalog_key:
+        return ""
+    return lookup_catalog_content_id(catalog_path, catalog_key) or ""
+
+
+def local_pick_is_excluded(candidate: Path, excluded_paths: set[str], excluded_content_ids: set[str]) -> bool:
+    candidate_path = str(candidate)
+    if candidate_path in excluded_paths:
+        return True
+    content_id = local_pick_content_id(candidate)
+    return bool(content_id and content_id in excluded_content_ids)
+
+
+def last_pick_exclusions(state: dict, bucket_key: str) -> tuple[set[str], set[str]]:
+    record = get_last_pick_record(state, bucket_key)
+    selection_key = record.get("selection_key", "")
+    excluded_paths: set[str] = set()
+    excluded_content_ids: set[str] = set()
+
+    if selection_key.startswith("local:"):
+        path = selection_key.removeprefix("local:").strip()
+        if path:
+            excluded_paths.add(path)
+
+    content_id = record.get("content_id", "")
+    if content_id:
+        excluded_content_ids.add(content_id)
+
+    return excluded_paths, excluded_content_ids
+
+
 def choose_pick_file(payload: dict, state: dict) -> tuple[Optional[Path], str, int, int]:
     phase = str(payload.get("phase", "")).strip().lower()
     season = str(payload.get("season", "")).strip().lower()
@@ -804,7 +908,21 @@ def choose_pick_file(payload: dict, state: dict) -> tuple[Optional[Path], str, i
 
     salt = PHASE_SALT.get(phase, 0)
     idx = (rng + salt) % file_count
-    return files[idx], str(folder), file_count, idx
+    chosen = files[idx]
+    chosen_index = idx
+
+    if file_count > 1:
+        bucket_key = pick_bucket_key(payload, phase)
+        excluded_paths, excluded_content_ids = last_pick_exclusions(state, bucket_key)
+        for offset in range(file_count):
+            candidate_index = (idx + offset) % file_count
+            candidate = files[candidate_index]
+            if not local_pick_is_excluded(candidate, excluded_paths, excluded_content_ids):
+                chosen = candidate
+                chosen_index = candidate_index
+                break
+
+    return chosen, str(folder), file_count, chosen_index
 
 
 def compute_phase_roll(payload: dict) -> tuple[int, int, str]:
@@ -5413,6 +5531,7 @@ def main() -> None:
                 display_phase = ""
                 display_season = ""
                 display_holiday = ""
+                pick_bucket_key_value = ""
 
                 if kind == "content_id":
                     target_cid = request_value
@@ -5441,6 +5560,7 @@ def main() -> None:
                     display_local_path = local_path
                 elif kind == "pick":
                     rng, phase_roll, phase = compute_phase_roll(restore_payload)
+                    pick_bucket_key_value = pick_bucket_key(restore_payload, phase)
                     display_source_kind = "ambient_or_holiday"
                     display_phase = phase
                     display_season = str(restore_payload.get("season", "")).strip().lower()
@@ -5449,7 +5569,16 @@ def main() -> None:
                     prefer_samsung, bucket, samsung_buckets = should_pick_samsung_bucket(rng, pick_samsung_pct)
 
                     if prefer_samsung:
-                        target_cid = choose_pick_samsung_id(restore_payload, rng, phase)
+                        excluded_content_ids = last_pick_exclusions(state, pick_bucket_key_value)[1]
+                        samsung_pool = get_pick_samsung_pool(restore_payload, phase)
+                        if excluded_content_ids and not any(cid not in excluded_content_ids for cid in samsung_pool):
+                            excluded_content_ids = set()
+                        target_cid = choose_pick_samsung_id(
+                            restore_payload,
+                            rng,
+                            phase,
+                            exclude_ids=excluded_content_ids,
+                        )
                         if target_cid:
                             pick_source = "samsung"
                             resolved_folder = "samsung_pool"
@@ -6802,6 +6931,20 @@ def main() -> None:
                     state["last_applied"] = pending_pick_last_applied
 
                 if kind == "pick" and target_cid and (verified or verification_skipped):
+                    if pick_source == "samsung":
+                        selection_key = f"samsung:{str(target_cid).strip()}"
+                    elif display_local_path:
+                        selection_key = f"local:{display_local_path}"
+                    else:
+                        raw_selection = str(pending_pick_last_applied or "").strip()
+                        selection_key = raw_selection if ":" in raw_selection else f"local:{raw_selection}"
+                    remember_last_pick(
+                        state,
+                        pick_bucket_key_value,
+                        selection_key=selection_key,
+                        content_id=str(target_cid).strip(),
+                        source=str(pick_source or ""),
+                    )
                     state["last_ambient_content_id"] = str(target_cid).strip()
                     state["last_ambient_source_kind"] = str(display_source_kind or "").strip()
                     state["last_ambient_updated_at"] = utc_now_iso()
@@ -6834,6 +6977,7 @@ def main() -> None:
                     pick_source=pick_source,
                     rng=rng,
                     phase_roll=phase_roll,
+                    pick_bucket_key=pick_bucket_key_value,
                     bucket=bucket,
                     samsung_buckets=samsung_buckets,
                     pick_samsung_pct=pick_samsung_pct,
@@ -6862,6 +7006,7 @@ def main() -> None:
                         "pick_source": pick_source,
                         "rng": rng,
                         "phase_roll": phase_roll,
+                        "pick_bucket_key": pick_bucket_key_value,
                         "bucket": bucket,
                         "samsung_buckets": samsung_buckets,
                         "pick_samsung_pct": pick_samsung_pct,
