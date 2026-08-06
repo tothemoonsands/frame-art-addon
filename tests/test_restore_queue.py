@@ -94,10 +94,50 @@ class RestoreQueueTests(unittest.TestCase):
                 "holidays": {},
             }
         }
+        uploader.ACTIVE_TV_CONNECTIONS.clear()
         self.options.write_text(json.dumps(uploader.RUNTIME_OPTIONS), encoding="utf-8")
 
     def tearDown(self) -> None:
+        uploader.ACTIVE_TV_CONNECTIONS.clear()
         self.tmp.cleanup()
+
+    def test_create_tv_client_defaults_to_tokenless_local_port(self):
+        client = object()
+        with mock.patch.object(
+            uploader, "SamsungTVWS", return_value=client
+        ) as samsung_tv:
+            result = uploader.create_tv_client("192.168.1.38")
+
+        self.assertIs(result, client)
+        samsung_tv.assert_called_once_with(
+            "192.168.1.38", port=8001, timeout=15
+        )
+
+    def test_create_tv_client_persists_secure_local_token(self):
+        token_file = self.root / "tokens" / "frame.txt"
+        uploader.RUNTIME_OPTIONS.update(
+            {"tv_ws_port": 8002, "tv_token_file": str(token_file)}
+        )
+        client = object()
+        with mock.patch.object(
+            uploader, "SamsungTVWS", return_value=client
+        ) as samsung_tv:
+            result = uploader.create_tv_client("192.168.1.38")
+
+        self.assertIs(result, client)
+        self.assertTrue(token_file.parent.is_dir())
+        samsung_tv.assert_called_once_with(
+            "192.168.1.38",
+            port=8002,
+            timeout=15,
+            token_file=str(token_file),
+        )
+
+    def test_create_tv_client_rejects_unknown_port(self):
+        uploader.RUNTIME_OPTIONS["tv_ws_port"] = 9000
+
+        with self.assertRaisesRegex(ValueError, "8001 or 8002"):
+            uploader.create_tv_client("192.168.1.38")
 
     def _write_inbox(self, payload):
         self.inbox.write_text(json.dumps(payload), encoding="utf-8")

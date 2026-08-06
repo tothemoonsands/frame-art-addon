@@ -1,6 +1,6 @@
 name: Frame Art Uploader AI
 slug: frame_art_uploader_ai
-version: "4.0.3"
+version: "4.0.4"
 description: >
   Upload AI artwork and music-inspired widescreen art to Samsung Frame TV,
   mix in curated Samsung gallery selections, and keep uploads, queues, and cleanup in sync.
@@ -18,6 +18,8 @@ map:
 
 options:
   tv_ip: "192.168.1.38"
+  tv_ws_port: 8001
+  tv_token_file: "/data/frame_tv_token.txt"
   keep_count: 20
   keep_count_local: 30
   pick_samsung_pct: 60
@@ -73,6 +75,8 @@ options:
 
 schema:
   tv_ip: str
+  tv_ws_port: int
+  tv_token_file: str
   keep_count: int
   keep_count_local: int
   pick_samsung_pct: int

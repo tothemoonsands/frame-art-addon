@@ -95,7 +95,7 @@ MUSIC_RESTORE_KINDS = {"cover_art_reference_background", "cover_art_outpaint"}
 MUSIC_ASSOCIATION_SESSION_TTL_DAYS = 0
 
 RUNTIME_OPTIONS: dict[str, Any] = {}
-ADDON_VERSION = "4.0.3"
+ADDON_VERSION = "4.0.4"
 HOLIDAY_ALIASES = {
     "football": "huskers",
 }
@@ -5053,7 +5053,27 @@ def record_upload_timeout_outcome(*, had_timeout: bool, upload_succeeded: bool) 
 
 def create_tv_client(tv_ip: str) -> Any:
     ws_timeout = resolve_runtime_int_option("art_ws_open_timeout_s", 15, min_value=3, max_value=60)
-    return register_tv_connection(SamsungTVWS(tv_ip, timeout=ws_timeout))
+    try:
+        ws_port = int(RUNTIME_OPTIONS.get("tv_ws_port", 8001))
+    except (TypeError, ValueError) as ex:
+        raise ValueError("tv_ws_port must be 8001 or 8002") from ex
+    if ws_port not in (8001, 8002):
+        raise ValueError("tv_ws_port must be 8001 or 8002")
+
+    client_options: dict[str, Any] = {
+        "port": ws_port,
+        "timeout": ws_timeout,
+    }
+    if ws_port == 8002:
+        token_file = str(
+            RUNTIME_OPTIONS.get("tv_token_file", "/data/frame_tv_token.txt")
+        ).strip()
+        if not token_file:
+            token_file = "/data/frame_tv_token.txt"
+        Path(token_file).parent.mkdir(parents=True, exist_ok=True)
+        client_options["token_file"] = token_file
+
+    return register_tv_connection(SamsungTVWS(tv_ip, **client_options))
 
 
 def create_art_client(tv: Any) -> Any:

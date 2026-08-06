@@ -3,6 +3,15 @@
 This add-on keeps Samsung Frame Art Mode aligned with the artwork flows you are building in Home Assistant.
 It can upload the newest AI-generated image, generate music-inspired widescreen art, selectively show built-in Samsung gallery pieces, and keep local and TV-side artwork catalogs tidy over time.
 
+TV control is direct over the local network and does not use the SmartThings API.
+
+## Local TV connection
+
+- Keep `tv_ws_port: 8001` for the normal tokenless local connection.
+- If the TV requires secure local pairing, set `tv_ws_port: 8002`. Approve the prompt on the TV the first time it connects.
+- The TV-issued token is then retained at `tv_token_file` (default `/data/frame_tv_token.txt`). This is a local television token, not a SmartThings PAT, and it is preserved across add-on restarts.
+- The Samsung WebSocket library is pinned to a reviewed commit so rebuilding the add-on cannot silently pull different connection behavior.
+
 ## What it does
 
 - Uploads new artwork to Samsung Frame Art Mode and can switch to it immediately after upload.

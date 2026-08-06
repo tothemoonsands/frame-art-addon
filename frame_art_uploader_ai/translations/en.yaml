@@ -2,6 +2,12 @@ configuration:
   tv_ip:
     name: TV IP address
     description: IP address of the Samsung Frame TV that should receive uploaded art.
+  tv_ws_port:
+    name: Local TV WebSocket port
+    description: Use 8001 for the normal tokenless local connection. Use 8002 if your TV requires secure local pairing.
+  tv_token_file:
+    name: Secure local TV token file
+    description: Persistent file for the token issued directly by the TV when port 8002 is used. This is not a SmartThings token.
   keep_count:
     name: TV artwork limit
     description: How many uploaded AI artworks to keep on the TV before older ones are removed.
