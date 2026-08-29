@@ -30,12 +30,11 @@ REFERENCE_BACKGROUND_PROMPT = (
 
 HA_EDIT_WIDTH = 1536
 HA_EDIT_HEIGHT = 1024
-HA_EDIT_PASTE_X = 256
-HA_EDIT_PASTE_Y = 0
 HA_EDIT_SIZE = f"{HA_EDIT_WIDTH}x{HA_EDIT_HEIGHT}"
 
 FRAME_FINAL_WIDTH = 3840
 FRAME_FINAL_HEIGHT = 2160
+FINAL_ALBUM_SIZE = 1536
 OPENAI_VERIFICATION_FALLBACK_MODEL = "gpt-image-1.5"
 
 _slug_re = re.compile(r"[^a-z0-9]+")
@@ -313,11 +312,19 @@ def download_artwork(url: str, dest_path: str, timeout_s: int = 15) -> None:
     Path(dest_path).write_bytes(resp.content)
 
 
+def reference_cover_box(width: int, height: int) -> tuple[int, int, int, int]:
+    cover_size = round(width * FINAL_ALBUM_SIZE / FRAME_FINAL_WIDTH)
+    left = (width - cover_size) // 2
+    top = (height - cover_size) // 2
+    return left, top, left + cover_size, top + cover_size
+
+
 def build_reference_canvas_from_album(src_path: str) -> bytes:
+    left, top, right, bottom = reference_cover_box(HA_EDIT_WIDTH, HA_EDIT_HEIGHT)
     with Image.open(src_path) as src:
-        cover = src.convert("RGB").resize((1024, 1024), Image.Resampling.LANCZOS)
+        cover = src.convert("RGB").resize((right - left, bottom - top), Image.Resampling.LANCZOS)
         canvas = Image.new("RGB", (HA_EDIT_WIDTH, HA_EDIT_HEIGHT), (0, 0, 0))
-        canvas.paste(cover, (HA_EDIT_PASTE_X, HA_EDIT_PASTE_Y))
+        canvas.paste(cover, (left, top))
 
     out = BytesIO()
     canvas.save(out, format="PNG")
@@ -510,16 +517,16 @@ def composite_album(
             f"Background must be {FRAME_FINAL_WIDTH}x{FRAME_FINAL_HEIGHT}; got {background.size[0]}x{background.size[1]}"
         )
 
-    x = (FRAME_FINAL_WIDTH - 1536) // 2
-    y = (FRAME_FINAL_HEIGHT - 1536) // 2
+    x = (FRAME_FINAL_WIDTH - FINAL_ALBUM_SIZE) // 2
+    y = (FRAME_FINAL_HEIGHT - FINAL_ALBUM_SIZE) // 2
     with Image.open(source_album_path) as src:
-        album = src.convert("RGBA").resize((1536, 1536), Image.Resampling.LANCZOS)
+        album = src.convert("RGBA").resize((FINAL_ALBUM_SIZE, FINAL_ALBUM_SIZE), Image.Resampling.LANCZOS)
 
     final = background.convert("RGBA")
 
     if album_shadow:
         shadow_layer = Image.new("RGBA", (FRAME_FINAL_WIDTH, FRAME_FINAL_HEIGHT), (0, 0, 0, 0))
-        shadow_rect = Image.new("RGBA", (1536, 1536), (0, 0, 0, 88))
+        shadow_rect = Image.new("RGBA", (FINAL_ALBUM_SIZE, FINAL_ALBUM_SIZE), (0, 0, 0, 88))
         shadow_layer.paste(shadow_rect, (x + 0, y + 16), shadow_rect)
         shadow_layer = shadow_layer.filter(ImageFilter.GaussianBlur(radius=26))
         final = Image.alpha_composite(final, shadow_layer)
