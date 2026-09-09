@@ -75,6 +75,8 @@ class CoverArtItunesTests(unittest.TestCase):
             mock.patch("frame_art_uploader_ai.cover_art._request_openai_reference_background", side_effect=fake_request),
             mock.patch("frame_art_uploader_ai.cover_art.ha_edit_to_frame", return_value=_FakeImage()),
             mock.patch("frame_art_uploader_ai.cover_art.composite_album", return_value=_FakeImage()),
+            mock.patch.object(Path, "read_bytes", return_value=b"source"),
+            mock.patch.object(Path, "write_text"),
         ):
             _, _, request_id, model_used = cover_art.generate_reference_frame_from_album(
                 source_album_path=Path("album.png"),

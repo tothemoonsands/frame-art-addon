@@ -100,3 +100,58 @@ make test
 
 - `make setup` creates `.venv` and installs `requests`, `pillow`, `rapidfuzz`, and `samsungtvws`.
 - `make test` runs `python -m unittest discover -s tests -v` using that local virtual environment, so you do not need to activate it first.
+
+## Reviewed music pipeline (4.1)
+
+`music_pipeline: seamless` uses Flare (`openai_model: gpt-image-2.5-flare`)
+with the reviewed continuation prompt and a real mask: a fully opaque 614 px
+cover centered on a 1536×1024 reference, with a transparent editable exterior.
+Black title bands are continued as graphic design rather than painted over.
+The original cover is restored locally at 1536 px on the final 3840×2160 image.
+The finish matches the original library renderer: black shadow alpha 88/255,
+26 px blur, 16 px downward offset, and **no edge feather**. The review viewer's
+corresponding preset is **Original standard**, with feather Off.
+
+Applicable definitive model/compatibility errors can fall back through Sunburst,
+GPT Image 2, and 1.5 with continuation, followed by the legacy prompt on 2 and 1.5.
+Safety refusals are not replayed against other models, and uncertain network or
+server outcomes do not trigger another paid request. The existing local fallback
+remains available with the same final finish. The known Nevermind cover uses a
+water-only reference; the full original is composited locally. Every successful
+continuation records its actual model, prompt, mask, usage and finish beside the
+source as a `.recipe.json` file. Sources, backgrounds, widescreen PNGs and TV JPEGs
+remain separate. `music_pipeline: legacy` preserves the former generation path.
+
+## Reviewed-library migration
+
+This is a separate, explicit maintenance import; the dashboard's ordinary Library
+Sync button does not launch it. `tools/frame_art_review/build_release.py` freezes
+confirmed selections and hashes. Prepared 4K JPEGs are uploaded without a second
+lossy encode, and the TV's returned content ID is used directly. Ordinary sync now
+recognizes changed files when their previously recorded source hash differs.
+
+A control file at `/share/frame_art_migration/active.json` contains:
+
+```json
+{"release":"/media/frame_art_release", "run":"/share/frame_art_migration/runs/release-1", "paused":false}
+```
+
+While this file exists, the launcher holds normal queued work and runs
+`migration.py` under the shared worker lock. The release is verified, then current
+media and metadata are copied into the run's `backup` directory and checksummed.
+The worker deletes only mapped superseded music IDs, verifies absence, uploads
+one approved replacement, verifies its ID and a readable TV thumbnail, and commits
+its mapping. There is at most one outstanding album replacement. Operations are
+paced at least ten seconds apart, with a one-minute rest after the first album and
+each following five albums. These are conservative operating settings, not a
+Samsung rate-limit claim. Saved unchanged images and unrelated TV art are retained.
+
+Progress and recovery state are in `status.json` and `journal.json` under the run
+directory. On failure the control file is paused; after resolving the failure,
+set `paused` to false to continue from the journal. An `upload_started` entry with
+no acknowledged ID **must be reconciled manually** against its saved pre-upload
+inventory before resuming; the worker will never blindly upload it again. Backups
+are retained for restoring deleted artwork if needed; restored uploads get new TV
+IDs. Final catalog/index/manifest/alias updates are deterministic and repeatable
+under maintenance. Only after final verification is the control file removed and
+normal queue processing restored.

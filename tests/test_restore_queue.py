@@ -843,6 +843,34 @@ class AmbientSeedTests(unittest.TestCase):
         uploader.STATUS_PATH = self.old_status_path
         self.tmp.cleanup()
 
+    @mock.patch("frame_art_uploader_ai.uploader.upload_local_file_with_reconnect")
+    def test_changed_named_image_replaces_old_id_and_hash_only_after_success(self, upload):
+        import hashlib
+        path = self.ambient / "same.jpg"
+        path.write_bytes(b"new image")
+        uploader.atomic_write_json(self.catalog, {"entries": {"same.jpg": {
+            "content_id": "MY_FOLD", "source_hash": hashlib.sha256(b"old image").hexdigest()}}})
+        upload.return_value = (object(), "MY_FNEW")
+        status = uploader.handle_ambient_seed_restore("127.0.0.1", object(),
+            {"ambient_dir": str(self.ambient), "catalog_path": str(self.catalog), "apply_deletions": False}, "")
+        self.assertEqual(1, status["uploaded_count"])
+        entry = json.loads(self.catalog.read_text())["entries"]["same.jpg"]
+        self.assertEqual("MY_FNEW", entry["content_id"])
+        self.assertEqual(hashlib.sha256(b"new image").hexdigest(), entry["source_hash"])
+
+    @mock.patch("frame_art_uploader_ai.uploader.upload_local_file_with_reconnect")
+    def test_failed_changed_image_keeps_old_hash_and_mapping(self, upload):
+        (self.ambient / "same.jpg").write_bytes(b"new image")
+        uploader.atomic_write_json(self.catalog, {"entries": {"same.jpg": {
+            "content_id": "MY_FOLD", "source_hash": "oldhash"}}})
+        upload.side_effect = ValueError("upload failed")
+        status = uploader.handle_ambient_seed_restore("127.0.0.1", object(),
+            {"ambient_dir": str(self.ambient), "catalog_path": str(self.catalog), "apply_deletions": False}, "")
+        entry = json.loads(self.catalog.read_text())["entries"]["same.jpg"]
+        self.assertEqual(1, status["failed_count"])
+        self.assertEqual("MY_FOLD", entry["content_id"])
+        self.assertEqual("oldhash", entry["source_hash"])
+
     def test_parse_dispatch_ambient_seed(self):
         payload = {
             "kind": "ambient_seed",

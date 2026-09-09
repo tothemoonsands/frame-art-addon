@@ -545,7 +545,17 @@ def generate_reference_frame_from_album(
     timeout_s: int = 90,
     album_shadow: bool = True,
     step_hook: Optional[Callable[[str, dict[str, Any]], None]] = None,
+    pipeline: str = "legacy",
 ) -> tuple[bytes, bytes, Optional[str], Optional[str]]:
+    if pipeline == "seamless":
+        import sys
+        try:
+            from . import seamless
+        except ImportError:
+            import seamless
+        return seamless.generate(source_album_path, openai_api_key, openai_model, timeout_s, album_shadow, step_hook, sys.modules[__name__])
+    if pipeline != "legacy":
+        raise ValueError(f"Unknown music pipeline: {pipeline}")
     def emit(stage: str, **fields: Any) -> None:
         if step_hook is not None:
             step_hook(stage, fields)
@@ -652,6 +662,11 @@ def generate_reference_frame_from_album(
         background_png_bytes=background_out.tell(),
     )
 
+    recipe_path = Path(source_album_path).with_suffix(".recipe.json")
+    recipe_path.write_text(json.dumps(dict(pipeline="legacy", model_used=model_used or openai_model,
+        prompt=REFERENCE_BACKGROUND_PROMPT, mask_box=None, request_id=request_id,
+        shadow="legacy_addon" if album_shadow else "none", feather_px=0,
+        source_sha256=hashlib.sha256(Path(source_album_path).read_bytes()).hexdigest()), indent=2))
     return final_out.getvalue(), background_out.getvalue(), request_id, model_used
 
 
@@ -659,6 +674,7 @@ def generate_local_fallback_frame_from_album(
     source_album_path: Path,
     album_shadow: bool = True,
     step_hook: Optional[Callable[[str, dict[str, Any]], None]] = None,
+    pipeline: str = "legacy",
 ) -> tuple[bytes, bytes]:
     def emit(stage: str, **fields: Any) -> None:
         if step_hook is not None:
@@ -706,7 +722,14 @@ def generate_local_fallback_frame_from_album(
 
     t0 = time.perf_counter()
     emit("fallback_album_composite_start", album_shadow=album_shadow)
-    final = composite_album(background, source_album_path, album_shadow=album_shadow)
+    if pipeline == "seamless":
+        try:
+            from .seamless import composite
+        except ImportError:
+            from seamless import composite
+        final = composite(background, source_album_path, album_shadow)
+    else:
+        final = composite_album(background, source_album_path, album_shadow=album_shadow)
     emit(
         "fallback_album_composite_done",
         duration_ms=int((time.perf_counter() - t0) * 1000),
@@ -727,6 +750,10 @@ def generate_local_fallback_frame_from_album(
         final_png_bytes=final_out.tell(),
         background_png_bytes=background_out.tell(),
     )
+    recipe_path = Path(source_album_path).with_suffix(".recipe.json")
+    recipe_path.write_text(json.dumps(dict(pipeline="local_fallback", model_used="local-fallback",
+        shadow=("original" if pipeline == "seamless" else "legacy_addon") if album_shadow else "none",
+        feather_px=0, source_sha256=hashlib.sha256(Path(source_album_path).read_bytes()).hexdigest()), indent=2))
     return final_out.getvalue(), background_out.getvalue()
 
 

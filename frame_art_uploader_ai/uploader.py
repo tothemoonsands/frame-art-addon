@@ -95,7 +95,7 @@ MUSIC_RESTORE_KINDS = {"cover_art_reference_background", "cover_art_outpaint"}
 MUSIC_ASSOCIATION_SESSION_TTL_DAYS = 0
 
 RUNTIME_OPTIONS: dict[str, Any] = {}
-ADDON_VERSION = "4.0.6"
+ADDON_VERSION = "4.1.0"
 HOLIDAY_ALIASES = {
     "football": "huskers",
 }
@@ -2801,6 +2801,17 @@ def update_music_index_entry(
     payload["status"] = "ok"
     payload["content_id"] = str(content_id or "").strip()
     payload["prompt_variant"] = "reference_background_nomask"
+    if source_path:
+        recipe_path = Path(source_path).with_suffix(".recipe.json")
+        if recipe_path.exists():
+            try:
+                recipe = json.loads(recipe_path.read_text())
+                payload["recipe_path"] = str(recipe_path)
+                payload["prompt_variant"] = recipe.get("pipeline", "reference_background_nomask")
+                payload["model_used"] = recipe.get("model_used")
+                payload["render_style"] = {"shadow": recipe.get("shadow"), "feather": recipe.get("feather_px", 0)}
+            except (ValueError, OSError):
+                pass
     payload["output_path"] = str(wide_path)
     payload["compressed_output_path"] = str(compressed_path)
     source_path_str = str(source_path).strip() if source_path else ""
@@ -3532,10 +3543,6 @@ def handle_seed_restore(
             continue
         cached_id = str(entry.get("content_id", "")).strip()
         cached_hash = str(entry.get("source_hash", "")).strip()
-        if file_hash and cached_hash != file_hash:
-            entry["source_hash"] = file_hash
-            entry["canonical_key"] = str(entry.get("canonical_key", "")).strip() or key
-            entries[key] = entry
 
         if file_hash and not force_reupload:
             reused = hash_index.get(file_hash)
@@ -3599,7 +3606,7 @@ def handle_seed_restore(
                 }
                 continue
 
-        if cached_id and not force_reupload:
+        if cached_id and not force_reupload and (not file_hash or not cached_hash or cached_hash == file_hash):
             skipped_count += 1
             last_cid = cached_id
             if file_hash:
@@ -4217,6 +4224,9 @@ def load_restore_work_item(path: Path) -> tuple[Optional[dict], Optional[bool], 
 
 def prepare_for_frame(img_bytes: bytes) -> tuple[bytes, str]:
     im = Image.open(BytesIO(img_bytes))
+    if im.format == "JPEG" and im.size == (3840, 2160) and im.mode == "RGB" and len(img_bytes) <= JPEG_MAX_BYTES:
+        im.load()
+        return img_bytes, "JPEG"
 
     if im.mode not in {"RGB", "RGBA", "L"}:
         im = im.convert("RGB")
@@ -4355,6 +4365,10 @@ def promote_music_job_outputs(
         return target_path
 
     promoted["source_path"] = copy_if_present("source_path", src_path)
+    staged_source = str(staged_result.get("source_path", ""))
+    recipe_source = Path(staged_source).with_suffix(".recipe.json") if staged_source else None
+    if recipe_source and recipe_source.is_file() and recipe_source != src_path.with_suffix(".recipe.json"):
+        shutil.copy2(recipe_source, src_path.with_suffix(".recipe.json"))
     promoted["background_path"] = copy_if_present("background_path", background_path)
     promoted["wide_png_path"] = copy_if_present("wide_png_path", wide_png_path)
     promoted["compressed_jpg_path"] = copy_if_present("compressed_jpg_path", compressed_jpg_path)
@@ -4568,6 +4582,7 @@ def run_music_generation_pipeline(job: dict[str, Any]) -> dict[str, Any]:
         try:
             log_music_generation_step("generate_reference_frame_start", openai_model=openai_model)
             final_png, background_png, request_id, model_used = generate_reference_frame_from_album(
+                pipeline=str(load_options().get("music_pipeline", "seamless")),
                 source_album_path=src_path,
                 openai_api_key=openai_api_key,
                 openai_model=openai_model,
@@ -4585,6 +4600,7 @@ def run_music_generation_pipeline(job: dict[str, Any]) -> dict[str, Any]:
         except Exception as gen_exc:
             log_music_generation_step("generate_reference_frame_failed", error=repr(gen_exc))
             final_png, background_png = generate_local_fallback_frame_from_album(
+                pipeline=str(load_options().get("music_pipeline", "seamless")),
                 source_album_path=src_path,
                 album_shadow=True,
                 step_hook=emit_cover_art_step,
@@ -4825,6 +4841,7 @@ def run_reference_generation_worker_job(spec_path: Path) -> int:
 
     try:
         final_png, background_png, request_id, model_used = generate_reference_frame_from_album(
+            pipeline=str(load_options().get("music_pipeline", "seamless")),
             source_album_path=source_album_path,
             openai_api_key=str(spec_raw.get("openai_api_key", "")).strip(),
             openai_model=str(spec_raw.get("openai_model", "")).strip(),
@@ -4834,6 +4851,7 @@ def run_reference_generation_worker_job(spec_path: Path) -> int:
         generation_mode = "openai_reference"
     except Exception as gen_exc:
         final_png, background_png = generate_local_fallback_frame_from_album(
+            pipeline=str(load_options().get("music_pipeline", "seamless")),
             source_album_path=source_album_path,
             album_shadow=True,
         )
@@ -4947,10 +4965,10 @@ def run_cancellable_reference_generation(
 def upload_local_file(art: Any, file_path: Path) -> Optional[str]:
     raw_bytes = file_path.read_bytes()
     processed_bytes, file_type = prepare_for_frame(raw_bytes)
-    art.upload(processed_bytes, file_type=file_type, matte="none")
-    available = art.available()
-    myf = extract_myf_ids(available)
-    return myf[-1][1] if myf else None
+    content_id = art.upload(processed_bytes, file_type=file_type, matte="none")
+    if not isinstance(content_id, str) or not content_id.strip():
+        raise ValueError("Upload acknowledgement missing content_id; reconcile TV inventory before retry")
+    return content_id
 
 
 def is_broken_pipe_error(exc: Exception) -> bool:
@@ -5430,6 +5448,8 @@ def run_pending_keep_count_cleanup(art: Any, state: dict, keep_count: int) -> li
 
 def main() -> None:
     global RUNTIME_OPTIONS
+    if Path("/share/frame_art_migration/active.json").exists():
+        return
     opts = load_options()
     RUNTIME_OPTIONS = opts if isinstance(opts, dict) else {}
     state = load_state()
@@ -5492,6 +5512,8 @@ def main() -> None:
         handled_restore_work = False
         queue_drain_grace_s = resolve_runtime_int_option("queue_drain_grace_s", 2, min_value=0, max_value=10)
         while True:
+            if Path("/share/frame_art_migration/active.json").exists():
+                return
             work_item = dequeue_next_restore_work_item_with_grace(
                 grace_s=queue_drain_grace_s if handled_restore_work else 0.0,
             )
