@@ -140,7 +140,7 @@ While this file exists, the launcher holds normal queued work and runs
 `migration.py` under the shared worker lock. The release is verified, then current
 media and metadata are copied into the run's `backup` directory and checksummed.
 The worker deletes only mapped superseded music IDs, verifies absence, uploads
-one approved replacement, verifies its ID and a readable TV thumbnail, and commits
+one approved replacement, verifies its acknowledged ID in the TV inventory, and commits
 its mapping. There is at most one outstanding album replacement. Operations are
 paced at least ten seconds apart, with a one-minute rest after the first album and
 each following five albums. These are conservative operating settings, not a

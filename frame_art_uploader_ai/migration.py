@@ -11,7 +11,6 @@ import re
 import shutil
 import time
 from datetime import datetime, timezone
-from io import BytesIO
 from pathlib import Path
 
 from PIL import Image
@@ -233,14 +232,6 @@ class Migration:
         cid = state['content_id']
         if cid not in self.inventory():
             raise ValueError(f'Uploaded/retained image is missing from TV: {cid}')
-        if not state.get('reused'):
-            thumbnail = self.art.get_thumbnail(cid)
-            if not isinstance(thumbnail, (bytes, bytearray)):
-                raise ValueError('TV thumbnail response is not image bytes')
-            with Image.open(BytesIO(thumbnail)) as image:
-                image.verify()
-            (self.run / 'thumbnails').mkdir(exist_ok=True)
-            (self.run / 'thumbnails' / f'{key}.jpg').write_bytes(thumbnail)
         state['state'] = 'verified'
         self.save()
         self.commit_row(row, state)

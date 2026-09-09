@@ -37,9 +37,7 @@ class TV:
         return 'MY_FNEW'
 
     def get_thumbnail(self,cid):
-        out = BytesIO()
-        Image.new('RGB',(40,20)).save(out,format='JPEG')
-        return out.getvalue()
+        raise AssertionError('Migration must not request thumbnails')
 
 
 class MigrationTests(unittest.TestCase):
