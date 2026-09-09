@@ -52,7 +52,9 @@ def state():
             r['generation_model']=recipe.get('model',stage.get('model'))
             r['generation_mode']=recipe.get('mode',stage.get('mode'))
             r['stages_remaining']=len(stages)-1-r['stage'] if b and b['mode']=='fallback' else None
-    return workflow.enrich(curation.enrich_state(dict(albums=rows,batches=batches,reasons=REASONS,profiles=list(PROFILES),spent=spent,
+    migration_path=ROOT/'reports/migration-live.json'
+    migration=json.loads(migration_path.read_text()) if migration_path.exists() else None
+    return workflow.enrich(curation.enrich_state(dict(migration=migration,albums=rows,batches=batches,reasons=REASONS,profiles=list(PROFILES),spent=spent,
                 lifetime_guard_spend=lifetime_guard_spend,lifetime_spend_limit=lifetime_spend_limit)))
 
 def detail(album_id):
