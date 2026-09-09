@@ -7,14 +7,16 @@ import fcntl
 import hashlib
 import json
 import subprocess
+import shlex
 import time
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor
 
 import curation
 from store import ROOT
+from ha_connection import command as ssh_command
 
-SSH=['ssh','-o','BatchMode=yes','-o','ConnectTimeout=10','root@192.168.1.202']
+SSH=ssh_command()
 RELEASE=ROOT/'release-original-finish'
 REPORT=ROOT/'reports/migration-live.json'
 REMOTE_RUN='/share/frame_art_migration/runs/original-finish-20260909'
@@ -42,7 +44,7 @@ def main():
             listing=ROOT/'logs'/f'release-shard-{number}.txt'
             listing.write_text('\n'.join(files)+'\n')
             with (ROOT/'logs'/f'release-shard-{number}.log').open('a') as log:
-                subprocess.run(['rsync','-a','--partial','--stats','-e','ssh -o BatchMode=yes -o ConnectTimeout=10',
+                subprocess.run(['rsync','-a','--partial','--stats','-e',shlex.join(SSH[:-1]),
                     '--files-from='+str(listing),str(RELEASE)+'/', 'root@192.168.1.202:/media/frame_art_release/'],
                     stdout=log,stderr=log,check=True)
             print(f'Transfer shard {number+1}/4 complete',flush=True)
@@ -63,6 +65,8 @@ if not c.get('probe_ok') or c.get('error'):raise SystemExit('TV connection probe
 version=json.loads(subprocess.check_output(['ha','apps','info','ad1c2f89_frame_art_uploader_ai','--raw-json']))['data']['version']
 if version!='4.1.0':raise SystemExit('Required add-on version is not installed')
 if hashlib.sha256(Path('/media/frame_art_release/release.json').read_bytes()).hexdigest()!={digest!r}:raise SystemExit('Remote release changed')
+journal=Path(c['run'])/'journal.json'
+if journal.exists():raise SystemExit('Migration already has a journal; inspect its state rather than restarting the staging handoff')
 c.update(paused=False,probe_only=False)
 t=p.with_suffix('.tmp');t.write_text(json.dumps(c));t.replace(p)
 print('Verified stage complete; authorized migration started')
