@@ -14,6 +14,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from PIL import Image
+from websocket import WebSocketConnectionClosedException, WebSocketTimeoutException
 
 CONTROL = Path('/share/frame_art_migration/active.json')
 MUSIC = Path('/media/frame_ai/music')
@@ -71,7 +72,7 @@ class Paused(RuntimeError):
 
 
 class Migration:
-    def __init__(self, control, art, *, music=MUSIC, share=SHARE, data=DATA, sleep=time.sleep):
+    def __init__(self, control, art, *, music=MUSIC, share=SHARE, data=DATA, sleep=time.sleep, art_factory=None):
         self.control = Path(control)
         self.config = read(control)
         self.root = Path(self.config['release'])
@@ -80,6 +81,7 @@ class Migration:
         self.run.mkdir(parents=True, exist_ok=True)
         self.music, self.share, self.data = Path(music), Path(share), Path(data)
         self.art, self.sleep = art, sleep
+        self.art_factory = art_factory
         self.journal = read(self.run / 'journal.json', {'release_hash': sha(self.root / 'release.json'),
             'rows': {}, 'phase': 'preflight', 'created_at': now(), 'last_mutation': 0})
         if self.journal['release_hash'] != sha(self.root / 'release.json'):
@@ -97,8 +99,21 @@ class Migration:
         if read(self.control, {}).get('paused', True):
             raise Paused('Migration paused by control file')
 
+    def read_tv(self, method):
+        # Only read-only requests may be replayed. Mutation acknowledgement
+        # uncertainty must still pause for reconciliation.
+        for attempt in range(3):
+            try:
+                return getattr(self.art, method)()
+            except (OSError, WebSocketConnectionClosedException, WebSocketTimeoutException):
+                if self.art_factory is None or attempt == 2:
+                    raise
+                self.check_pause()
+                self.sleep(2)
+                self.art = self.art_factory()
+
     def inventory(self):
-        raw = self.art.available()
+        raw = self.read_tv('available')
         if not isinstance(raw, list) or any(not isinstance(v, dict) or not v.get('content_id') for v in raw):
             raise ValueError('TV did not return a valid inventory')
         return {v['content_id'] for v in raw}
@@ -165,12 +180,12 @@ class Migration:
             raise ValueError('Retired IDs overlap retained or other-category artwork')
         if not self.journal.get('inventory_verified'):
             write(self.run / 'initial-inventory.json', sorted(ids))
-            write(self.run / 'initial-current.json', self.art.get_current())
+            write(self.run / 'initial-current.json', self.read_tv('get_current'))
             self.save(inventory_verified=True)
         self.save(phase='replacing', error=None)
 
     def switch_from(self, old_id, ids):
-        current = self.art.get_current()
+        current = self.read_tv('get_current')
         current_id = current.get('content_id') if isinstance(current, dict) else None
         if not current_id:
             raise ValueError('Cannot identify currently selected TV art')
@@ -182,7 +197,7 @@ class Migration:
         if not choices:
             raise ValueError('No verified retained artwork to select before deletion')
         self.mutate(self.art.select_image, choices[0], show=False)
-        if self.art.get_current().get('content_id') == old_id:
+        if self.read_tv('get_current').get('content_id') == old_id:
             raise ValueError('TV has not switched away from artwork being replaced')
 
     def replace(self, row):
@@ -313,6 +328,9 @@ class Migration:
             # is ever outstanding because deletion and upload are serial per album.
             if count == 1 or (count-1) % 5 == 0:
                 self.sleep(60)
+                self.check_pause()
+                if self.art_factory is not None:
+                    self.art = self.art_factory()
         self.finalize()
 
 
@@ -398,7 +416,11 @@ def main():
             return
         worker = None
         try:
-            art = uploader.create_art_client(uploader.create_tv_client(uploader.RUNTIME_OPTIONS['tv_ip']))
+            def connect():
+                uploader.close_registered_tv_connections(context='migration_reconnect')
+                return uploader.register_tv_connection(uploader.create_art_client(
+                    uploader.create_tv_client(uploader.RUNTIME_OPTIONS['tv_ip'])))
+            art = connect()
             if config.get('probe_only'):
                 inventory = art.available()
                 if not isinstance(inventory, list):
@@ -408,7 +430,7 @@ def main():
                 config.update(paused=True, probe_only=False, probe_ok=True)
                 write(args.control, config)
             else:
-                worker = Migration(args.control, art)
+                worker = Migration(args.control, art, art_factory=connect)
                 worker.execute()
         except Exception as exc:
             config = read(args.control, config)

@@ -63,7 +63,7 @@ from pathlib import Path
 p=Path('/share/frame_art_migration/active.json');c=json.loads(p.read_text())
 if not c.get('probe_ok') or c.get('error'):raise SystemExit('TV connection probe must succeed before migration starts')
 version=json.loads(subprocess.check_output(['ha','apps','info','ad1c2f89_frame_art_uploader_ai','--raw-json']))['data']['version']
-if version!='4.1.1':raise SystemExit('Required add-on version is not installed')
+if version!='4.1.2':raise SystemExit('Required add-on version is not installed')
 if hashlib.sha256(Path('/media/frame_art_release/release.json').read_bytes()).hexdigest()!={digest!r}:raise SystemExit('Remote release changed')
 journal=Path(c['run'])/'journal.json'
 if journal.exists():raise SystemExit('Migration already has a journal; inspect its state rather than restarting the staging handoff')

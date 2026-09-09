@@ -1,6 +1,7 @@
 import json
 import tempfile
 import unittest
+from unittest.mock import Mock
 from io import BytesIO
 from pathlib import Path
 
@@ -78,6 +79,45 @@ class MigrationTests(unittest.TestCase):
 
     def worker(self):
         return m.Migration(self.control,self.tv,music=self.music,share=self.share,data=self.data,sleep=lambda _:None)
+
+    def test_broken_pipe_on_read_reconnects_without_replaying_mutations(self):
+        worker=self.worker()
+        broken=Mock()
+        broken.available.side_effect=BrokenPipeError(32, 'Broken pipe')
+        worker.art=broken
+        worker.art_factory=Mock(return_value=self.tv)
+        self.assertEqual(self.tv.ids,worker.inventory())
+        worker.art_factory.assert_called_once()
+        self.assertEqual([],self.tv.calls)
+
+    def test_read_retries_are_bounded(self):
+        worker=self.worker()
+        broken=Mock()
+        broken.available.side_effect=BrokenPipeError(32, 'Broken pipe')
+        worker.art=broken
+        worker.art_factory=Mock(return_value=broken)
+        with self.assertRaises(BrokenPipeError):worker.inventory()
+        self.assertEqual(3,broken.available.call_count)
+        self.assertEqual(2,worker.art_factory.call_count)
+
+    def test_reconnect_after_rest_before_next_album(self):
+        worker=self.worker()
+        idle=[False]
+        available=self.tv.available
+        def read():
+            if idle[0]:raise AssertionError('Used stale connection after rest')
+            return available()
+        self.tv.available=read
+        def sleep(seconds):
+            if seconds==60:idle[0]=True
+        def connect():
+            idle[0]=False
+            return self.tv
+        worker.sleep=sleep
+        worker.art_factory=Mock(side_effect=connect)
+        worker.execute()
+        worker.art_factory.assert_called_once()
+        self.assertEqual(1,sum(x[0]=='upload' for x in self.tv.calls))
 
     def test_delete_first_verified_mapping_and_unrelated_art_preserved(self):
         worker=self.worker()
