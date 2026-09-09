@@ -16,6 +16,7 @@ from pipeline import render, PROFILES
 from fallback import stages_for
 import curation
 import workflow
+import migration_status
 
 HERE=Path(__file__).resolve().parent
 RENDER_LOCK=threading.Lock()
@@ -52,8 +53,7 @@ def state():
             r['generation_model']=recipe.get('model',stage.get('model'))
             r['generation_mode']=recipe.get('mode',stage.get('mode'))
             r['stages_remaining']=len(stages)-1-r['stage'] if b and b['mode']=='fallback' else None
-    migration_path=ROOT/'reports/migration-live.json'
-    migration=json.loads(migration_path.read_text()) if migration_path.exists() else None
+    migration=migration_status.status()
     return workflow.enrich(curation.enrich_state(dict(migration=migration,albums=rows,batches=batches,reasons=REASONS,profiles=list(PROFILES),spent=spent,
                 lifetime_guard_spend=lifetime_guard_spend,lifetime_spend_limit=lifetime_spend_limit)))
 
@@ -96,6 +96,7 @@ class Handler(BaseHTTPRequestHandler):
             if path=='/curation':return self.send_bytes((HERE/'curation.html').read_bytes(),'text/html; charset=utf-8')
             if path.startswith('/api/workflow/'):
                 return self.send_json(workflow.detail(int(path.rsplit('/',1)[1])))
+            if path=='/api/migration':return self.send_json(migration_status.status())
             if path=='/api/state':return self.send_json(state())
             if path.startswith('/api/curation/'):
                 return self.send_json(curation.detail(int(path.rsplit('/',1)[1])))
@@ -201,5 +202,6 @@ class Handler(BaseHTTPRequestHandler):
 if __name__=='__main__':
     parser=argparse.ArgumentParser();parser.add_argument('--port',type=int,default=8766)
     PORT=parser.parse_args().port;init()
+    migration_status.start()
     print(f'Local review: http://127.0.0.1:{PORT}/',flush=True)
     ThreadingHTTPServer(('127.0.0.1',PORT),Handler).serve_forever()
