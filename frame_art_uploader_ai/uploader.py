@@ -95,7 +95,7 @@ MUSIC_RESTORE_KINDS = {"cover_art_reference_background", "cover_art_outpaint"}
 MUSIC_ASSOCIATION_SESSION_TTL_DAYS = 0
 
 RUNTIME_OPTIONS: dict[str, Any] = {}
-ADDON_VERSION = "4.1.3"
+ADDON_VERSION = "4.1.4"
 HOLIDAY_ALIASES = {
     "football": "huskers",
 }
@@ -1136,6 +1136,7 @@ def parse_restore_request_payload(payload: Any) -> tuple[Optional[dict], Optiona
             return None, requested_show, "Malformed restore timestamp"
 
     normalized = dict(payload)
+    normalized["use_frontier_model"] = parse_bool(payload.get("use_frontier_model")) is True
     normalized["suppress_prior_music"] = bool(payload.get("suppress_prior_music", False))
     kind = str(payload.get("kind", "")).strip().lower()
     if not kind:
@@ -1209,6 +1210,8 @@ def parse_restore_request_payload(payload: Any) -> tuple[Optional[dict], Optiona
                 normalized["collection_id"] = None
         normalized["force_regen"] = bool(payload.get("force_regen", False))
         normalized["force_new_background"] = bool(payload.get("force_new_background", False))
+        if normalized["use_frontier_model"] and not normalized["force_new_background"]:
+            normalized["force_regen"] = True
 
     if kind == "music_feedback":
         if requested_show is None:
@@ -3972,6 +3975,12 @@ def resolve_music_catalog_path(catalog_key: str) -> Optional[Path]:
     return None
 
 
+def resolve_music_model(options: dict[str, Any], *, use_frontier_model: bool = False) -> str:
+    key = "openai_frontier_model" if use_frontier_model else "openai_model"
+    default = "gpt-image-2.5-sunburst" if use_frontier_model else "gpt-image-2.5-flare"
+    return str(options.get(key, default) or "").strip() or default
+
+
 def build_music_request_from_feedback(payload: dict[str, Any], *, show: bool, force_regen: bool = False) -> dict[str, Any]:
     artwork_url = extract_remote_artwork_url(payload)
     action = str(payload.get("action", "")).strip().lower()
@@ -3992,6 +4001,8 @@ def build_music_request_from_feedback(payload: dict[str, Any], *, show: bool, fo
         "source_preference": "itunes",
         "force_regen": force_regen,
         "force_new_background": force_new_background,
+        "use_frontier_model": parse_bool(payload.get("use_frontier_model")) is True,
+        "current_content_id": str(payload.get("current_content_id", "")).strip(),
     }
 
 
@@ -4845,11 +4856,15 @@ def run_reference_generation_worker_job(spec_path: Path) -> int:
             source_album_path=source_album_path,
             openai_api_key=str(spec_raw.get("openai_api_key", "")).strip(),
             openai_model=str(spec_raw.get("openai_model", "")).strip(),
+            allow_fallback=not spec_raw.get("use_frontier_model", False),
             timeout_s=int(spec_raw.get("openai_timeout_s", 90) or 90),
             album_shadow=True,
         )
         generation_mode = "openai_reference"
     except Exception as gen_exc:
+        if spec_raw.get("use_frontier_model", False):
+            atomic_write_json(result_path, {"ok": False, "error": str(gen_exc)})
+            return 1
         final_png, background_png = generate_local_fallback_frame_from_album(
             pipeline=str(load_options().get("music_pipeline", "seamless")),
             source_album_path=source_album_path,
@@ -4897,6 +4912,7 @@ def run_cancellable_reference_generation(
     superseded_check: Callable[[], Optional[dict[str, Any]]],
     poll_hook: Optional[Callable[[], None]] = None,
     poll_interval_s: float = 0.25,
+    use_frontier_model: bool = False,
 ) -> dict[str, Any]:
     job_id = uuid.uuid4().hex
     job_dir = MUSIC_JOB_DIR / f"reference_{job_id}"
@@ -4910,6 +4926,7 @@ def run_cancellable_reference_generation(
             "job_dir": str(job_dir),
             "result_path": str(result_path),
             "source_album_path": str(source_album_path),
+            "use_frontier_model": use_frontier_model,
             "cache_key": cache_key,
             "openai_api_key": openai_api_key,
             "openai_model": openai_model,
@@ -5747,7 +5764,7 @@ def main() -> None:
                     )
 
                     followup_kind = "none"
-                    if action == "regen_now":
+                    if action == "regen_now" and not restore_payload.get("use_frontier_model", False):
                         association_record = lookup_music_association(restore_payload)
                         assoc_collection_id = None
                         assoc_cache_key = ""
@@ -5790,8 +5807,8 @@ def main() -> None:
                         followup_payload = build_music_request_from_feedback(restore_payload, show=show_flag, force_regen=True)
                         enqueue_restore_payload(followup_payload)
                         followup_kind = "cover_art_reference_background"
-                    elif action == "regen_background":
-                        followup_payload = build_music_request_from_feedback(restore_payload, show=show_flag, force_regen=False)
+                    elif action in {"regen_background", "regen_now"}:
+                        followup_payload = build_music_request_from_feedback(restore_payload, show=show_flag, force_regen=action == "regen_now")
                         enqueue_restore_payload(followup_payload)
                         followup_kind = "cover_art_reference_background"
                     elif action == "use_candidate_now":
@@ -5834,6 +5851,8 @@ def main() -> None:
                     continue
                 elif kind in {"cover_art_reference_background", "cover_art_outpaint"}:
                     display_source_kind = "music"
+                    use_frontier_model = restore_payload.get("use_frontier_model", False)
+                    request_model = resolve_music_model(opts, use_frontier_model=use_frontier_model)
                     artist = str(restore_payload.get("artist", "")).strip()
                     album = str(restore_payload.get("album", "")).strip()
                     track = str(restore_payload.get("track", "")).strip()
@@ -6033,6 +6052,9 @@ def main() -> None:
                         if isinstance(association_record, dict)
                         else ""
                     )
+                    # Keep every existing artifact intact until a frontier replacement succeeds.
+                    if use_frontier_model:
+                        stem_key = f"{stem_key}__frontier_{uuid.uuid4().hex}"
                     src_path = SOURCE_DIR / f"{stem_key}.jpg"
                     background_path = BACKGROUND_DIR / f"{stem_key}__3840x2160__background.png"
                     wide_png_path = WIDESCREEN_DIR / f"{stem_key}__3840x2160.png"
@@ -6285,7 +6307,7 @@ def main() -> None:
 
                         def maybe_try_music_wait_fallback() -> None:
                             nonlocal art, music_wait_fallback_applied, music_wait_fallback_content_id, music_wait_fallback_attempted
-                            if music_wait_fallback_attempted or not show_flag:
+                            if use_frontier_model or music_wait_fallback_attempted or not show_flag:
                                 return
                             music_wait_fallback_attempted = True
                             art, music_wait_fallback_applied, music_wait_fallback_content_id = apply_music_wait_fallback_if_available(
@@ -6490,7 +6512,8 @@ def main() -> None:
                                     source_album_path=src_path,
                                     cache_key=cache_key,
                                     openai_api_key=openai_api_key,
-                                    openai_model=openai_model,
+                                    openai_model=request_model,
+                                    use_frontier_model=use_frontier_model,
                                     openai_timeout_s=openai_timeout_s,
                                     superseded_check=lambda: find_superseding_music_request(work_item, kind, restore_payload),
                                     poll_hook=maybe_try_music_wait_fallback,
@@ -6672,6 +6695,8 @@ def main() -> None:
                                 selected_content_id=target_cid,
                             )
                         except Exception as e:
+                            if use_frontier_model:
+                                raise RuntimeError(f"Frontier model {request_model} failed; current artwork retained. {e}") from e
                             cover_error = e
                             log_music_generation_step(
                                 "failed",
@@ -7184,6 +7209,7 @@ def main() -> None:
                         "mode": "restore",
                         "tv_ip": tv_ip,
                         "kind": payload_kind,
+                        "use_frontier_model": bool(restore_payload.get("use_frontier_model", False)),
                         "requested_at": requested_at,
                         "requested_music_session_key": (
                             str(restore_payload.get("music_session_key", "")).strip()

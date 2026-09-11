@@ -546,6 +546,7 @@ def generate_reference_frame_from_album(
     album_shadow: bool = True,
     step_hook: Optional[Callable[[str, dict[str, Any]], None]] = None,
     pipeline: str = "legacy",
+    allow_fallback: bool = True,
 ) -> tuple[bytes, bytes, Optional[str], Optional[str]]:
     if pipeline == "seamless":
         import sys
@@ -553,7 +554,7 @@ def generate_reference_frame_from_album(
             from . import seamless
         except ImportError:
             import seamless
-        return seamless.generate(source_album_path, openai_api_key, openai_model, timeout_s, album_shadow, step_hook, sys.modules[__name__])
+        return seamless.generate(source_album_path, openai_api_key, openai_model, timeout_s, album_shadow, step_hook, sys.modules[__name__], allow_fallback=allow_fallback)
     if pipeline != "legacy":
         raise ValueError(f"Unknown music pipeline: {pipeline}")
     def emit(stage: str, **fields: Any) -> None:
@@ -579,7 +580,7 @@ def generate_reference_frame_from_album(
             timeout_s=timeout_s,
         )
     except Exception as request_error:
-        if not should_retry_openai_with_verification_fallback(request_error, openai_model):
+        if not allow_fallback or not should_retry_openai_with_verification_fallback(request_error, openai_model):
             raise
         retry_model = OPENAI_VERIFICATION_FALLBACK_MODEL
         emit(

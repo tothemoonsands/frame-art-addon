@@ -77,7 +77,7 @@ def request_image(key, model, prompt, canvas, mask, timeout):
     return base64.b64decode(payload['data'][0]['b64_json'], validate=True), response.headers.get('x-request-id'), returned, payload.get('usage')
 
 
-def generate(source, key, primary, timeout, shadow, hook, cover_art):
+def generate(source, key, primary, timeout, shadow, hook, cover_art, allow_fallback=True):
     if not key:
         raise ValueError('Missing OpenAI API key')
     if primary not in MODELS:
@@ -99,6 +99,8 @@ def generate(source, key, primary, timeout, shadow, hook, cover_art):
     stages = [(m, 'water' if water else 'continuation') for m in dict.fromkeys((primary, *MODELS[1:]))]
     if not water:
         stages += [('gpt-image-2', 'legacy'), ('gpt-image-1.5', 'legacy')]
+    if not allow_fallback:
+        stages = stages[:1]
     attempts = []
     for model, mode in stages:
         prompt = WATER_PROMPT if water else cover_art.REFERENCE_BACKGROUND_PROMPT if mode == 'legacy' else PROMPT
@@ -109,7 +111,7 @@ def generate(source, key, primary, timeout, shadow, hook, cover_art):
                 mask if mode == 'continuation' else None, timeout)
         except RequestFailure as exc:
             attempts.append({'model': model, 'mode': mode, 'code': exc.code, 'request_id': exc.request_id})
-            if exc.can_fallback():
+            if allow_fallback and exc.can_fallback():
                 continue
             raise
         background = cover_art.ha_edit_to_frame(raw)
