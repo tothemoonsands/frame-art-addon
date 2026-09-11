@@ -1,8 +1,31 @@
 # Local Frame Art review
 
-This companion app snapshots the existing library, generates versioned candidates, and stores review decisions in SQLite. It does not import `uploader.py`, write to Home Assistant, or control/delete TV artwork. The production add-on is unchanged.
+This companion app snapshots the existing library, generates versioned candidates, and stores review decisions in SQLite. Generation and review stay local. The separate, explicitly started release builder and staging tools hand approved artwork to the Home Assistant migration worker, which controls the TV under maintenance.
+
+The pilot and batch descriptions below document this run's history, not a universal recipe for future runs. See [the repeatable-upgrade plan](UPGRADE_WORKFLOW.md) for current capabilities, lessons learned, and remaining implementation work. Production behavior and the migration contract are documented in [the add-on README](../../frame_art_uploader_ai/README.md#reviewed-library-migration).
 
 ## Run
+
+The post-deployment manual review portal is at `/manual-review`. It lists all active
+canonical albums, using the release's finished JPEG where the selected asset still
+matches and the latest selected candidate for later repairs. It uses the original
+standard finish. It does not query TV thumbnails or launch generation/deployment.
+
+Click the artwork to add up to 30 numbered problem markers. Click a marker to remove
+it; describe the numbered issues in the notes, select optional tags, and choose
+Looks good (A), Needs fix (F), or Later (S). Decisions save to SQLite and advance.
+Search, status filters, a full-size preview, and Undo last save support revisiting
+decisions. Saved progress survives reloads; unsaved edits prompt before navigation.
+
+`GET /api/manual-review/export` returns the flagged queue with album IDs, selected
+assets, notes, issue tags, and normalized `[x,y]` marker coordinates (top-left origin).
+The queue is stored in `manual_reviews`, with history in `manual_review_events`.
+Review revisions protect concurrent edits; a different selected asset returns an
+album to unreviewed while retaining prior guidance. For each queued repair, preserve
+the source cover, repair the surrounding background, composite the exact resized
+source back over it, verify cover pixels in the lossless output, and show the user
+the preview before deploying. Record approved replacements as new candidates so the
+portal displays the new version. Keep all prior layers and deployment journals.
 
 From the repository root:
 
@@ -106,3 +129,15 @@ A deterministic solid-color repair creates a zero-cost candidate through the sam
 `repairs.queue_backgrounds` freezes explicit, album-specific scenery/design prompts for an authorized selection of unkept regeneration records. The worker uses the Image API generations endpoint with a JSON text prompt and uploads **no cover or mask**. This makes a separate decorative background rather than another outpainting of the cover. The original cover stays in the local source folder and is composited afterward with the global shadow/feather settings. The worker records `api_input: text_only`, the prompt, model, source checksum, raw response, background, final images and usage. Source changes since staging stop before an API request.
 
 The route has one Sunburst high stage, the existing $50/run and $200/lifetime guards, no automatic model fallback, and no automatic acceptance. A previous refusal can receive a distinct scenery-only design without resubmitting its refused image input. Any newly refused or uncertain request stays for inspection. Local solid-color alternatives cost zero. Confirmed records and prior image files remain protected. The viewer labels generated alternatives `Background alternative · Sunburst`.
+
+### Final manual-fix comparison
+
+Run `.venv/bin/python tools/frame_art_review/final_comparison.py` and open
+`http://127.0.0.1:8767/`. The frozen 23-album comparison manifest lives under
+`reports/final-23-comparison/manifest.json` in the review data directory. It pairs
+pre-upgrade snapshot images with approved manual repairs (or current released
+images where generation was rejected). Rejections are highlighted. Choices are
+saved atomically in `selections.json` with exact asset paths and SHA-256 hashes;
+stale tabs cannot overwrite newer choices. This page does not deploy or modify
+the library. Verify the chosen hashes and retain the source/recipe when preparing
+the eventual deployment.

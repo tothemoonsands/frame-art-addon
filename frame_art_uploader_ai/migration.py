@@ -323,6 +323,8 @@ class Migration:
             if self.journal['rows'].get(str(row['album_id']), {}).get('state') == 'complete':
                 continue
             self.replace(row)
+            if row.get('reuse_id'):
+                continue
             count += 1
             # One-album canary, followed by batches of five. Only one replacement
             # is ever outstanding because deletion and upload are serial per album.

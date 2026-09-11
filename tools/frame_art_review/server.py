@@ -17,6 +17,7 @@ from fallback import stages_for
 import curation
 import workflow
 import migration_status
+import manual_review
 
 HERE=Path(__file__).resolve().parent
 RENDER_LOCK=threading.Lock()
@@ -94,6 +95,12 @@ class Handler(BaseHTTPRequestHandler):
             if path=='/review':return self.send_bytes((HERE/'index.html').read_bytes(),'text/html; charset=utf-8')
             if path=='/':return self.send_bytes((HERE/'workbench.html').read_bytes(),'text/html; charset=utf-8')
             if path=='/curation':return self.send_bytes((HERE/'curation.html').read_bytes(),'text/html; charset=utf-8')
+            if path=='/manual-review':return self.send_bytes((HERE/'manual_review.html').read_bytes(),'text/html; charset=utf-8')
+            if path=='/api/manual-review':return self.send_json(manual_review.state())
+            if path=='/api/manual-review/export':return self.send_json(manual_review.export())
+            if path=='/manual-art':
+                with RENDER_LOCK:file=manual_review.artwork(int(q['id'][0]))
+                return self.send_bytes(file.read_bytes(),'image/jpeg')
             if path.startswith('/api/workflow/'):
                 return self.send_json(workflow.detail(int(path.rsplit('/',1)[1])))
             if path=='/api/migration':return self.send_json(migration_status.status())
@@ -150,6 +157,8 @@ class Handler(BaseHTTPRequestHandler):
             if not 0<length<maximum:raise ValueError('Invalid request size')
             if self.headers.get('Content-Type')!='application/json':raise ValueError('JSON required')
             data=json.loads(self.rfile.read(length))
+            if self.path=='/api/manual-review':
+                return self.send_json(manual_review.save(int(data['album_id']),int(data['revision']),data['asset'],data['status'],data.get('notes',''),data.get('reasons'),data.get('points')))
             if self.path=='/api/workflow-action':
                 return self.send_json(workflow.decide(int(data['album_id']),int(data['revision']),data['action'],data.get('asset'),data.get('notes',''),data.get('reasons')))
             if self.path=='/api/workflow-edit':
@@ -201,7 +210,7 @@ class Handler(BaseHTTPRequestHandler):
 
 if __name__=='__main__':
     parser=argparse.ArgumentParser();parser.add_argument('--port',type=int,default=8766)
-    PORT=parser.parse_args().port;init()
+    PORT=parser.parse_args().port;init();manual_review.init()
     migration_status.start()
     print(f'Local review: http://127.0.0.1:{PORT}/',flush=True)
     ThreadingHTTPServer(('127.0.0.1',PORT),Handler).serve_forever()

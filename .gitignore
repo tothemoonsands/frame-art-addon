@@ -9,3 +9,4 @@ __MACOSX/
 frame_art_uploader_ai/__pycache__/
 tests/__pycache__/
 tmp/
+tools/frame_art_review/__pycache__/
