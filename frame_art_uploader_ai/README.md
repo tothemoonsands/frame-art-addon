@@ -12,6 +12,11 @@ TV control is direct over the local network and does not use the SmartThings API
 - The TV-issued token is then retained at `tv_token_file` (default `/data/frame_tv_token.txt`). This is a local television token, not a SmartThings PAT, and it is preserved across add-on restarts.
 - The Samsung WebSocket library is pinned to a reviewed commit so rebuilding the add-on cannot silently pull different connection behavior.
 
+Version 4.1.3 reconnects after a Samsung `ms.channel.clientDisconnect` event
+during upload setup, using the configured retry limit and backoff. The upload
+reuses the saved image without repeating generation. Authentication failures and
+missing upload acknowledgements still stop for inspection.
+
 ## What it does
 
 - Uploads new artwork to Samsung Frame Art Mode and can switch to it immediately after upload.

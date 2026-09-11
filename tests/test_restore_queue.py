@@ -2431,6 +2431,99 @@ class MusicAssociationLookupTests(unittest.TestCase):
         self.assertFalse(override["cache_reuse_recommended"])
 
 
+class UploadDisconnectTests(unittest.TestCase):
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.image = Path(tmp.name) / "saved-album.jpg"
+        self.image.write_bytes(b"saved artwork")
+        self.patch("RUNTIME_OPTIONS", {
+            "art_preconnect_before_upload": True,
+            "art_socket_retries": 3,
+            "art_retry_backoff_s": 2,
+        })
+        self.patch("maybe_wait_for_upload_timeout_cooldown")
+        self.outcome = self.patch("record_upload_timeout_outcome")
+        self.patch("log_event")
+        self.prepare = self.patch("prepare_for_frame", return_value=(b"prepared artwork", "JPEG"))
+        self.sleep = self.patch("time.sleep")
+        self.create_tv = self.patch("create_tv_client")
+        self.create_art = self.patch("create_art_client")
+
+    def patch(self, name, *args, **kwargs):
+        patcher = mock.patch("frame_art_uploader_ai.uploader." + name, *args, **kwargs)
+        result = patcher.start()
+        self.addCleanup(patcher.stop)
+        return result
+
+    @staticmethod
+    def disconnect():
+        # Same structured argument supplied by samsungtvws.ConnectionFailure.
+        return RuntimeError({"data": {"isHost": False}, "event": "ms.channel.clientDisconnect"})
+
+    def test_upload_reconnects_after_handshake_disconnect_and_reuses_saved_image(self):
+        first, second = mock.Mock(), mock.Mock()
+        first.upload.side_effect = self.disconnect()
+        second.upload.return_value = "MY_F42"
+        self.create_art.side_effect = [first, second]
+
+        art, content_id = uploader.upload_local_file_with_reconnect("1.2.3.4", object(), self.image)
+
+        self.assertIs(art, second)
+        self.assertEqual(content_id, "MY_F42")
+        for client in (first, second):
+            client.upload.assert_called_once_with(b"prepared artwork", file_type="JPEG", matte="none")
+        self.assertEqual(self.prepare.call_args_list, [mock.call(b"saved artwork")] * 2)
+        first.close.assert_called_once_with()
+        second.close.assert_not_called()
+        self.sleep.assert_called_once_with(2.0)
+        self.assertEqual(self.create_tv.call_count, 2)
+        self.outcome.assert_called_once_with(had_timeout=False, upload_succeeded=True)
+
+    def test_repeated_disconnects_stop_at_configured_attempt_limit(self):
+        clients = [mock.Mock() for _ in range(3)]
+        failure = self.disconnect()
+        for client in clients:
+            client.upload.side_effect = failure
+        self.create_art.side_effect = clients
+
+        with self.assertRaises(RuntimeError) as caught:
+            uploader.upload_local_file_with_reconnect("1.2.3.4", object(), self.image)
+
+        self.assertIs(caught.exception, failure)
+        self.assertEqual(self.create_tv.call_count, 3)
+        self.assertEqual(self.sleep.call_args_list, [mock.call(2.0), mock.call(4.0)])
+        for client in clients:
+            self.assertEqual(client.upload.call_count, 1)
+        for client in clients[:-1]:
+            client.close.assert_called_once_with()
+        self.outcome.assert_called_once_with(had_timeout=False, upload_succeeded=False)
+
+    def test_unauthorized_handshake_is_not_retried(self):
+        client = self.create_art.return_value
+        failure = RuntimeError({"event": "ms.channel.unauthorized"})
+        client.upload.side_effect = failure
+
+        with self.assertRaises(RuntimeError) as caught:
+            uploader.upload_local_file_with_reconnect("1.2.3.4", object(), self.image)
+
+        self.assertIs(caught.exception, failure)
+        self.assertEqual(client.upload.call_count, 1)
+        self.assertEqual(self.create_tv.call_count, 1)
+        self.sleep.assert_not_called()
+
+    def test_missing_upload_acknowledgement_is_not_retried(self):
+        client = self.create_art.return_value
+        client.upload.return_value = None
+
+        with self.assertRaisesRegex(ValueError, "reconcile TV inventory before retry"):
+            uploader.upload_local_file_with_reconnect("1.2.3.4", object(), self.image)
+
+        self.assertEqual(client.upload.call_count, 1)
+        self.assertEqual(self.create_tv.call_count, 1)
+        self.sleep.assert_not_called()
+
+
 class HiddenSelectTests(unittest.TestCase):
     def setUp(self) -> None:
         self.tmp = tempfile.TemporaryDirectory()

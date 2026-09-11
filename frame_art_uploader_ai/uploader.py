@@ -95,7 +95,7 @@ MUSIC_RESTORE_KINDS = {"cover_art_reference_background", "cover_art_outpaint"}
 MUSIC_ASSOCIATION_SESSION_TTL_DAYS = 0
 
 RUNTIME_OPTIONS: dict[str, Any] = {}
-ADDON_VERSION = "4.1.2"
+ADDON_VERSION = "4.1.3"
 HOLIDAY_ALIASES = {
     "football": "huskers",
 }
@@ -4981,6 +4981,15 @@ def is_broken_pipe_error(exc: Exception) -> bool:
 def is_art_socket_retryable_error(exc: Exception) -> bool:
     if isinstance(exc, (BrokenPipeError, TimeoutError)):
         return True
+    # samsungtvws wraps unexpected handshake events in ConnectionFailure with
+    # the TV response as its argument. A client disconnect can race the new
+    # channel opening; retry that specific event without retrying auth failures
+    # or uploads whose acknowledgement is missing.
+    if any(
+        isinstance(response, dict) and response.get("event") == "ms.channel.clientDisconnect"
+        for response in exc.args
+    ):
+        return True
     message = repr(exc).lower()
     return (
         "broken pipe" in message
@@ -5397,6 +5406,7 @@ def upload_local_file_with_reconnect(tv_ip: str, art: Any, file_path: Path) -> t
                 attempt=attempt + 1,
                 max_attempts=upload_attempts,
             )
+            safe_close_tv_connection(current_art, context="upload_retry")
             time.sleep(retry_backoff_seconds(attempt))
             try:
                 retry_tv = create_tv_client(tv_ip)
