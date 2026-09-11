@@ -41,6 +41,18 @@ class SeamlessTests(unittest.TestCase):
         recipe=json.loads(self.source.with_suffix('.recipe.json').read_text())
         self.assertEqual(('original',0),(recipe['shadow'],recipe['feather_px']))
 
+    def test_frontier_compatibility_error_does_not_silently_downgrade(self):
+        class Response:
+            status_code = 404
+            headers = {}
+            def json(self):
+                return {'error': {'code': 'model_not_found', 'message': 'Frontier model unavailable'}}
+        with patch.object(seamless, 'request_image', side_effect=seamless.RequestFailure(Response())) as request:
+            with self.assertRaisesRegex(seamless.RequestFailure, 'Frontier model unavailable'):
+                seamless.generate(self.source, 'test', 'gpt-image-2.5-sunburst', 120, True, None, cover_art, allow_fallback=False)
+        self.assertEqual(1, request.call_count)
+        self.assertFalse(self.source.with_suffix('.recipe.json').exists())
+
     def test_transport_failure_does_not_try_another_model(self):
         with patch.object(seamless,'request_image',side_effect=requests.Timeout) as request:
             with self.assertRaises(requests.Timeout):

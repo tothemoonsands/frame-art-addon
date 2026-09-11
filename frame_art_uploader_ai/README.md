@@ -5,6 +5,29 @@ It can upload the newest AI-generated image, generate music-inspired widescreen 
 
 TV control is direct over the local network and does not use the SmartThings API.
 
+## Frontier repairs (4.1.4)
+
+The add-on Configuration menu has two independent model fields:
+
+- **OpenAI model** (`openai_model`, default `gpt-image-2.5-flare`) for ordinary generation.
+- **Frontier OpenAI model** (`openai_frontier_model`, default `gpt-image-2.5-sunburst`) for explicit one-time repairs.
+
+The HA Music Actions buttons **Fix with frontier** and **Frontier background**
+use the frontier setting for that request. Fix refreshes the cover/generation;
+background regenerates around the selected cover. Both force a new generation
+instead of reusing the cached final image. Existing buttons keep using the main setting.
+
+A frontier model error is reported in the HA status sensor and a persistent
+notification. The current TV artwork, existing files, and match are retained;
+there is no automatic retry with another model or local replacement image.
+Subsequent ordinary requests still use the main setting. Frontier outputs use
+separate filenames so a failed generation cannot overwrite the current artwork.
+
+Queue/API callers can set `use_frontier_model: true` on a `music_feedback`
+request (`regen_now` or `regen_background`) or a `cover_art_reference` request.
+Omitting it preserves ordinary behavior. Install add-on 4.1.4 before using the
+new HA buttons, then pull/reload the HA configuration as usual.
+
 ## Local TV connection
 
 - Keep `tv_ws_port: 8001` for the normal tokenless local connection.

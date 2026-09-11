@@ -5493,7 +5493,6 @@ def main() -> None:
     prefix = str(opts.get("filename_prefix", "ai_"))
     select_after = bool(opts.get("select_after_upload", True))
     openai_api_key = str(opts.get("openai_api_key", "")).strip()
-    openai_model = str(opts.get("openai_model", "gpt-image-2")).strip() or "gpt-image-2"
     openai_timeout_s = resolve_runtime_int_option("openai_timeout_s", 120, min_value=30, max_value=600)
     _ = resolve_runtime_int_option("art_socket_retries", 5, min_value=1, max_value=10)
     _ = resolve_runtime_int_option("art_retry_backoff_s", 2, min_value=1, max_value=30)
@@ -6507,7 +6506,7 @@ def main() -> None:
 
                             reference_generation_result: Optional[dict[str, Any]] = None
                             try:
-                                log_music_generation_step("generate_reference_frame_start", openai_model=openai_model)
+                                log_music_generation_step("generate_reference_frame_start", openai_model=request_model)
                                 reference_generation_result = run_cancellable_reference_generation(
                                     source_album_path=src_path,
                                     cache_key=cache_key,
@@ -7071,6 +7070,7 @@ def main() -> None:
                         "tv_ip": tv_ip,
                         "kind": kind,
                         "value": request_value,
+                        "use_frontier_model": bool(restore_payload.get("use_frontier_model", False)),
                         "requested_at": requested_at,
                         "resolved_folder": resolved_folder,
                         "file_count": file_count,
@@ -7209,7 +7209,7 @@ def main() -> None:
                         "mode": "restore",
                         "tv_ip": tv_ip,
                         "kind": payload_kind,
-                        "use_frontier_model": bool(restore_payload.get("use_frontier_model", False)),
+                        "use_frontier_model": bool((restore_payload or {}).get("use_frontier_model", False)),
                         "requested_at": requested_at,
                         "requested_music_session_key": (
                             str(restore_payload.get("music_session_key", "")).strip()

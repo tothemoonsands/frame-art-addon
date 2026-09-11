@@ -1,4 +1,5 @@
 import json
+from contextlib import ExitStack
 import sys
 import tempfile
 import threading
@@ -100,6 +101,142 @@ class RestoreQueueTests(unittest.TestCase):
     def tearDown(self) -> None:
         uploader.ACTIVE_TV_CONNECTIONS.clear()
         self.tmp.cleanup()
+
+    def test_frontier_model_selection_does_not_change_main_setting(self):
+        options = {"openai_model": "main-custom", "openai_frontier_model": "frontier-custom"}
+        self.assertEqual("frontier-custom", uploader.resolve_music_model(options, use_frontier_model=True))
+        self.assertEqual("main-custom", uploader.resolve_music_model(options))
+        self.assertEqual("gpt-image-2.5-sunburst", uploader.resolve_music_model({}, use_frontier_model=True))
+
+    def test_frontier_flag_survives_feedback_and_bypasses_cached_results(self):
+        for action in ("regen_now", "regen_background"):
+            with self.subTest(action=action):
+                feedback, _, error = uploader.parse_restore_request_payload({
+                    "kind": "music_feedback", "action": action, "artist": "A", "album": "B",
+                    "use_frontier_model": True, "current_content_id": "MY_CURRENT",
+                })
+                self.assertIsNone(error)
+                request = uploader.build_music_request_from_feedback(feedback, show=True)
+                normalized, _, error = uploader.parse_restore_request_payload(request)
+                self.assertIsNone(error)
+                self.assertTrue(normalized["use_frontier_model"])
+                self.assertTrue(normalized["force_regen"] or normalized["force_new_background"])
+                self.assertEqual("MY_CURRENT", normalized["current_content_id"])
+        request, _, _ = uploader.parse_restore_request_payload({
+            "kind": "cover_art_reference", "artist": "A", "album": "B", "use_frontier_model": "false",
+        })
+        self.assertFalse(request["use_frontier_model"])
+
+    def test_frontier_worker_reports_original_error_without_local_fallback(self):
+        job_dir = self.root / "worker"
+        job_dir.mkdir()
+        source = job_dir / "source.jpg"
+        source.write_bytes(b"original source")
+        result_path = job_dir / "result.json"
+        spec_path = job_dir / "spec.json"
+        spec_path.write_text(json.dumps({
+            "job_dir": str(job_dir), "result_path": str(result_path),
+            "source_album_path": str(source), "use_frontier_model": True,
+            "openai_model": "gpt-image-2.5-sunburst",
+        }))
+        with mock.patch.object(uploader, "generate_reference_frame_from_album", side_effect=ValueError("model unavailable")) as generate, mock.patch.object(uploader, "generate_local_fallback_frame_from_album") as fallback:
+            self.assertEqual(1, uploader.run_reference_generation_worker_job(spec_path))
+        self.assertFalse(generate.call_args.kwargs["allow_fallback"])
+        fallback.assert_not_called()
+        self.assertEqual({"ok": False, "error": "model unavailable"}, json.loads(result_path.read_text()))
+        self.assertEqual(b"original source", source.read_bytes())
+        self.assertFalse((job_dir / "final.png").exists())
+
+    def test_frontier_feedback_does_not_delete_match_before_generation(self):
+        self.options.write_text(json.dumps({"tv_ip": "192.0.2.1", "queue_drain_grace_s": 0}))
+        self.queue.mkdir()
+        (self.queue / "feedback.json").write_text(json.dumps({
+            "kind": "music_feedback", "artist": "A", "album": "B", "action": "regen_now",
+            "use_frontier_model": True, "current_content_id": "MY_CURRENT",
+        }))
+        with ExitStack() as stack:
+            def patch(name, **kwargs):
+                return stack.enter_context(mock.patch.object(uploader, name, **kwargs))
+            patch("create_tv_client")
+            patch("create_art_client")
+            patch("get_current_info", return_value={"content_id": "MY_CURRENT"})
+            patch("append_music_triage_issue", return_value="test-issue")
+            patch("enqueue_music_feedback_item")
+            enqueue = patch("enqueue_restore_payload")
+            invalidate = patch("invalidate_music_association_for_album")
+            cleanup = patch("cleanup_music_graph_for_deletion")
+            uploader.main()
+        invalidate.assert_not_called()
+        cleanup.assert_not_called()
+        followup = enqueue.call_args.args[0]
+        self.assertTrue(followup["force_regen"])
+        self.assertTrue(followup["use_frontier_model"])
+        self.assertEqual("MY_CURRENT", followup["current_content_id"])
+
+    def test_reference_worker_success_uses_requested_model_and_tier(self):
+        for frontier in (False, True):
+            with self.subTest(frontier=frontier):
+                job_dir = self.root / str(frontier)
+                job_dir.mkdir()
+                source = job_dir / "source.jpg"
+                source.write_bytes(b"cover")
+                result_path = job_dir / "result.json"
+                spec_path = job_dir / "spec.json"
+                spec_path.write_text(json.dumps({
+                    "job_dir": str(job_dir), "result_path": str(result_path),
+                    "source_album_path": str(source), "use_frontier_model": frontier,
+                    "openai_model": "custom-model",
+                }))
+                with mock.patch.object(uploader, "generate_reference_frame_from_album", return_value=(b"final", b"background", "request-1", "custom-model")) as generate:
+                    self.assertEqual(0, uploader.run_reference_generation_worker_job(spec_path))
+                self.assertEqual(not frontier, generate.call_args.kwargs["allow_fallback"])
+                self.assertEqual("custom-model", generate.call_args.kwargs["openai_model"])
+                self.assertEqual(b"final", (job_dir / "final.png").read_bytes())
+                self.assertTrue(json.loads(result_path.read_text())["ok"])
+
+    def test_frontier_failure_keeps_current_art_and_association_and_reports_ha_error(self):
+        self.options.write_text(json.dumps({"tv_ip": "192.0.2.1", "queue_drain_grace_s": 0,
+                                          "openai_model": "main-custom", "openai_frontier_model": "frontier-custom"}))
+        self.queue.mkdir()
+        work = self.queue / "request.json"
+        work.write_text(json.dumps({"kind": "cover_art_reference", "artist": "A", "album": "B",
+            "use_frontier_model": True, "show": True, "artwork_url": "https://example.com/cover.jpg"}))
+        art = mock.Mock()
+        previous = self.root / "previous.jpg"
+        previous.write_bytes(b"current artwork")
+        association = {"content_id": "MY_CURRENT", "catalog_key": previous.name, "cache_reuse_recommended": True}
+        with ExitStack() as stack:
+            def patch(name, **kwargs):
+                return stack.enter_context(mock.patch.object(uploader, name, **kwargs))
+            for name in ("SOURCE_DIR", "BACKGROUND_DIR", "WIDESCREEN_DIR", "COMPRESSED_DIR", "FALLBACK_DIR"):
+                stack.enter_context(mock.patch.object(uploader, name, self.root))
+            patch("create_tv_client")
+            patch("create_art_client", return_value=art)
+            patch("get_current_info", return_value={"content_id": "MY_CURRENT"})
+            patch("should_skip_superseded_music_request", return_value=False)
+            patch("find_superseding_music_request", return_value=None)
+            patch("lookup_music_association", return_value=association)
+            patch("download_artwork", side_effect=lambda url, path, **kw: Path(path).write_bytes(b"new source"))
+            patch("update_error_display_state")
+            patch("append_music_error")
+            generate = patch("run_cancellable_reference_generation", return_value={"ok": False, "error": "model unavailable", "return_code": 1})
+            wait_fallback = patch("apply_music_wait_fallback_if_available")
+            fallback = patch("choose_music_failure_fallback")
+            upload = patch("upload_local_file_with_reconnect")
+            update = patch("update_music_association")
+            uploader.main()
+        self.assertEqual("frontier-custom", generate.call_args.kwargs["openai_model"])
+        self.assertTrue(generate.call_args.kwargs["use_frontier_model"])
+        wait_fallback.assert_not_called()
+        fallback.assert_not_called()
+        upload.assert_not_called()
+        update.assert_not_called()
+        art.select_image.assert_not_called()
+        self.assertEqual(b"current artwork", previous.read_bytes())
+        status = json.loads(self.status.read_text())
+        self.assertFalse(status["ok"])
+        self.assertTrue(status["use_frontier_model"])
+        self.assertIn("model unavailable", status["error"])
 
     def test_create_tv_client_defaults_to_tokenless_local_port(self):
         client = object()
