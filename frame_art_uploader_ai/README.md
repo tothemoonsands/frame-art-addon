@@ -5,6 +5,19 @@ It can upload the newest AI-generated image, generate music-inspired widescreen 
 
 TV control is direct over the local network and does not use the SmartThings API.
 
+## Old prompt button (4.1.5)
+
+The HA Music Actions button **Old prompt background** regenerates the current
+cover background using the original reference-background prompt and legacy
+unmasked generation/rendering path. It uses the main model and forces a fresh
+generation. This is a one-request override; the configured `music_pipeline`
+and the frontier buttons keep their existing behavior. Normal generation error
+fallbacks still apply.
+
+Queue/API callers can set `use_legacy_prompt: true` on a `music_feedback` or
+`cover_art_reference` request. It can also be combined with `use_frontier_model`
+when calling the request API. Update the add-on to 4.1.5 before using the button.
+
 ## Frontier repairs (4.1.4)
 
 The add-on Configuration menu has two independent model fields:

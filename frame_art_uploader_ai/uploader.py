@@ -95,7 +95,7 @@ MUSIC_RESTORE_KINDS = {"cover_art_reference_background", "cover_art_outpaint"}
 MUSIC_ASSOCIATION_SESSION_TTL_DAYS = 0
 
 RUNTIME_OPTIONS: dict[str, Any] = {}
-ADDON_VERSION = "4.1.4"
+ADDON_VERSION = "4.1.5"
 HOLIDAY_ALIASES = {
     "football": "huskers",
 }
@@ -1137,6 +1137,7 @@ def parse_restore_request_payload(payload: Any) -> tuple[Optional[dict], Optiona
 
     normalized = dict(payload)
     normalized["use_frontier_model"] = parse_bool(payload.get("use_frontier_model")) is True
+    normalized["use_legacy_prompt"] = parse_bool(payload.get("use_legacy_prompt")) is True
     normalized["suppress_prior_music"] = bool(payload.get("suppress_prior_music", False))
     kind = str(payload.get("kind", "")).strip().lower()
     if not kind:
@@ -1210,6 +1211,8 @@ def parse_restore_request_payload(payload: Any) -> tuple[Optional[dict], Optiona
                 normalized["collection_id"] = None
         normalized["force_regen"] = bool(payload.get("force_regen", False))
         normalized["force_new_background"] = bool(payload.get("force_new_background", False))
+        if normalized["use_legacy_prompt"]:
+            normalized["force_new_background"] = True
         if normalized["use_frontier_model"] and not normalized["force_new_background"]:
             normalized["force_regen"] = True
 
@@ -3975,6 +3978,12 @@ def resolve_music_catalog_path(catalog_key: str) -> Optional[Path]:
     return None
 
 
+def resolve_music_pipeline(options: dict[str, Any], *, use_legacy_prompt: bool = False) -> str:
+    if use_legacy_prompt:
+        return "legacy"
+    return str(options.get("music_pipeline", "seamless"))
+
+
 def resolve_music_model(options: dict[str, Any], *, use_frontier_model: bool = False) -> str:
     key = "openai_frontier_model" if use_frontier_model else "openai_model"
     default = "gpt-image-2.5-sunburst" if use_frontier_model else "gpt-image-2.5-flare"
@@ -4002,6 +4011,7 @@ def build_music_request_from_feedback(payload: dict[str, Any], *, show: bool, fo
         "force_regen": force_regen,
         "force_new_background": force_new_background,
         "use_frontier_model": parse_bool(payload.get("use_frontier_model")) is True,
+        "use_legacy_prompt": parse_bool(payload.get("use_legacy_prompt")) is True,
         "current_content_id": str(payload.get("current_content_id", "")).strip(),
     }
 
@@ -4402,6 +4412,10 @@ def run_music_generation_pipeline(job: dict[str, Any]) -> dict[str, Any]:
     requested_at = str(job.get("requested_at", "")).strip()
     openai_api_key = str(job.get("openai_api_key", "")).strip()
     openai_model = str(job.get("openai_model", "")).strip()
+    music_pipeline = resolve_music_pipeline(
+        load_options(),
+        use_legacy_prompt=parse_bool(job.get("use_legacy_prompt", restore_payload.get("use_legacy_prompt"))) is True,
+    )
     openai_timeout_s = int(job.get("openai_timeout_s", 90) or 90)
     stem_key = str(job.get("stem_key", "")).strip() or music_generation_stem(
         collection_id=collection_id,
@@ -4593,7 +4607,7 @@ def run_music_generation_pipeline(job: dict[str, Any]) -> dict[str, Any]:
         try:
             log_music_generation_step("generate_reference_frame_start", openai_model=openai_model)
             final_png, background_png, request_id, model_used = generate_reference_frame_from_album(
-                pipeline=str(load_options().get("music_pipeline", "seamless")),
+                pipeline=music_pipeline,
                 source_album_path=src_path,
                 openai_api_key=openai_api_key,
                 openai_model=openai_model,
@@ -4611,7 +4625,7 @@ def run_music_generation_pipeline(job: dict[str, Any]) -> dict[str, Any]:
         except Exception as gen_exc:
             log_music_generation_step("generate_reference_frame_failed", error=repr(gen_exc))
             final_png, background_png = generate_local_fallback_frame_from_album(
-                pipeline=str(load_options().get("music_pipeline", "seamless")),
+                pipeline=music_pipeline,
                 source_album_path=src_path,
                 album_shadow=True,
                 step_hook=emit_cover_art_step,
@@ -4846,13 +4860,16 @@ def run_reference_generation_worker_job(spec_path: Path) -> int:
     if not source_album_path.exists():
         raise ValueError(f"source album path not found: {source_album_path}")
 
+    music_pipeline = resolve_music_pipeline(
+        load_options(), use_legacy_prompt=parse_bool(spec_raw.get("use_legacy_prompt")) is True,
+    )
     final_png_path = job_dir / "final.png"
     background_png_path = job_dir / "background.png"
     job_dir.mkdir(parents=True, exist_ok=True)
 
     try:
         final_png, background_png, request_id, model_used = generate_reference_frame_from_album(
-            pipeline=str(load_options().get("music_pipeline", "seamless")),
+            pipeline=music_pipeline,
             source_album_path=source_album_path,
             openai_api_key=str(spec_raw.get("openai_api_key", "")).strip(),
             openai_model=str(spec_raw.get("openai_model", "")).strip(),
@@ -4866,7 +4883,7 @@ def run_reference_generation_worker_job(spec_path: Path) -> int:
             atomic_write_json(result_path, {"ok": False, "error": str(gen_exc)})
             return 1
         final_png, background_png = generate_local_fallback_frame_from_album(
-            pipeline=str(load_options().get("music_pipeline", "seamless")),
+            pipeline=music_pipeline,
             source_album_path=source_album_path,
             album_shadow=True,
         )
@@ -4913,6 +4930,7 @@ def run_cancellable_reference_generation(
     poll_hook: Optional[Callable[[], None]] = None,
     poll_interval_s: float = 0.25,
     use_frontier_model: bool = False,
+    use_legacy_prompt: bool = False,
 ) -> dict[str, Any]:
     job_id = uuid.uuid4().hex
     job_dir = MUSIC_JOB_DIR / f"reference_{job_id}"
@@ -4927,6 +4945,7 @@ def run_cancellable_reference_generation(
             "result_path": str(result_path),
             "source_album_path": str(source_album_path),
             "use_frontier_model": use_frontier_model,
+            "use_legacy_prompt": use_legacy_prompt,
             "cache_key": cache_key,
             "openai_api_key": openai_api_key,
             "openai_model": openai_model,
@@ -6513,6 +6532,7 @@ def main() -> None:
                                     openai_api_key=openai_api_key,
                                     openai_model=request_model,
                                     use_frontier_model=use_frontier_model,
+                                    use_legacy_prompt=restore_payload.get("use_legacy_prompt", False),
                                     openai_timeout_s=openai_timeout_s,
                                     superseded_check=lambda: find_superseding_music_request(work_item, kind, restore_payload),
                                     poll_hook=maybe_try_music_wait_fallback,

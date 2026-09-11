@@ -102,6 +102,50 @@ class RestoreQueueTests(unittest.TestCase):
         uploader.ACTIVE_TV_CONNECTIONS.clear()
         self.tmp.cleanup()
 
+    def test_old_prompt_request_survives_feedback_and_forces_new_generation(self):
+        feedback, _, error = uploader.parse_restore_request_payload({
+            "kind": "music_feedback", "action": "regen_background", "artist": "A", "album": "B",
+            "use_legacy_prompt": True,
+        })
+        self.assertIsNone(error)
+        followup = uploader.build_music_request_from_feedback(feedback, show=True)
+        request, _, error = uploader.parse_restore_request_payload(followup)
+        self.assertIsNone(error)
+        self.assertTrue(request["use_legacy_prompt"])
+        self.assertTrue(request["force_new_background"])
+        self.assertFalse(request["use_frontier_model"])
+        for flag, expected in ((True, True), (False, False), ("false", False)):
+            request, _, error = uploader.parse_restore_request_payload({
+                "kind": "cover_art_reference", "artist": "A", "album": "B", "use_legacy_prompt": flag,
+            })
+            self.assertIsNone(error)
+            self.assertEqual(expected, request["use_legacy_prompt"])
+            self.assertEqual(expected, request["force_new_background"])
+
+    def test_old_prompt_worker_override_is_one_request_and_applies_to_fallback(self):
+        self.options.write_text(json.dumps({"music_pipeline": "seamless"}))
+        for index, (old_prompt, fail, expected) in enumerate(((True, False, "legacy"), (False, False, "seamless"), (True, True, "legacy"))):
+            with self.subTest(old_prompt=old_prompt, fail=fail):
+                job_dir = self.root / str(index)
+                job_dir.mkdir()
+                source = job_dir / "source.jpg"
+                source.write_bytes(b"cover")
+                spec = job_dir / "spec.json"
+                spec.write_text(json.dumps({
+                    "job_dir": str(job_dir), "result_path": str(job_dir / "result.json"),
+                    "source_album_path": str(source), "use_legacy_prompt": old_prompt,
+                    "openai_model": "main-model",
+                }))
+                with mock.patch.object(uploader, "generate_reference_frame_from_album", return_value=(b"final", b"background", "req", "main-model"), side_effect=ValueError("error") if fail else None) as generate, mock.patch.object(uploader, "generate_local_fallback_frame_from_album", return_value=(b"fallback", b"background")) as fallback:
+                    self.assertEqual(0, uploader.run_reference_generation_worker_job(spec))
+                self.assertEqual(expected, generate.call_args.kwargs["pipeline"])
+                self.assertEqual("main-model", generate.call_args.kwargs["openai_model"])
+                if fail:
+                    self.assertEqual(expected, fallback.call_args.kwargs["pipeline"])
+                else:
+                    fallback.assert_not_called()
+        self.assertEqual("seamless", uploader.load_options()["music_pipeline"])
+
     def test_frontier_model_selection_does_not_change_main_setting(self):
         options = {"openai_model": "main-custom", "openai_frontier_model": "frontier-custom"}
         self.assertEqual("frontier-custom", uploader.resolve_music_model(options, use_frontier_model=True))
