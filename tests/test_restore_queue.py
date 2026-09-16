@@ -25,6 +25,7 @@ if "cover_art" not in sys.modules:
     cover.COMPRESSED_DIR = Path(".")
     cover.WIDESCREEN_DIR = Path(".")
     cover.JPEG_MAX_BYTES = 4 * 1024 * 1024
+    cover.build_session_background_prompt = lambda *a, **k: "session prompt"
     cover.download_artwork = lambda *a, **k: None
     cover.compress_png_path_to_jpeg_max_bytes = lambda *a, **k: (True, 0)
     cover.ensure_dirs = lambda *a, **k: None
@@ -35,6 +36,8 @@ if "cover_art" not in sys.modules:
     cover.normalize_key = lambda *a, **k: "k"
     cover.generate_reference_frame_from_album = lambda *a, **k: (b"", b"", None, None)
     cover.generate_local_fallback_frame_from_album = lambda *a, **k: (b"", b"")
+    cover.generate_local_session_background = lambda *a, **k: (b"", b"")
+    cover.generate_session_background_frame = lambda *a, **k: (b"", b"", None, None)
     cover.resolve_artwork_url = lambda *a, **k: ""
     sys.modules["cover_art"] = cover
 
@@ -237,6 +240,31 @@ class RestoreQueueTests(unittest.TestCase):
                 self.assertEqual("custom-model", generate.call_args.kwargs["openai_model"])
                 self.assertEqual(b"final", (job_dir / "final.png").read_bytes())
                 self.assertTrue(json.loads(result_path.read_text())["ok"])
+
+    def test_reference_worker_generates_coverless_session_without_source_album(self):
+        job_dir = self.root / "playlist-worker"
+        job_dir.mkdir()
+        result_path = job_dir / "result.json"
+        spec_path = job_dir / "spec.json"
+        spec_path.write_text(json.dumps({
+            "job_dir": str(job_dir),
+            "result_path": str(result_path),
+            "source_album_path": "",
+            "session_background": True,
+            "session_prompt": "playlist: Halloween lofi",
+            "openai_model": "custom-model",
+        }))
+        with mock.patch.object(
+            uploader,
+            "generate_session_background_frame",
+            return_value=(b"session-final", b"session-background", "request-2", "custom-model"),
+        ) as generate:
+            self.assertEqual(0, uploader.run_reference_generation_worker_job(spec_path))
+
+        self.assertEqual("playlist: Halloween lofi", generate.call_args.kwargs["prompt"])
+        self.assertEqual(b"session-final", (job_dir / "final.png").read_bytes())
+        result = json.loads(result_path.read_text())
+        self.assertEqual("openai_session_background", result["generation_mode"])
 
     def test_frontier_failure_keeps_current_art_and_association_and_reports_ha_error(self):
         self.options.write_text(json.dumps({"tv_ip": "192.0.2.1", "queue_drain_grace_s": 0,
@@ -1697,6 +1725,26 @@ class MusicSeedDeletionTests(unittest.TestCase):
         self.assertFalse((self.source / "123.jpg").exists())
 
 class CoverArtPayloadNormalizationTests(unittest.TestCase):
+    def test_session_background_payload_parses_context_and_disables_album_composite(self):
+        payload = {
+            "kind": "cover_art_reference",
+            "music_session_key": "playlist:Halloween lofi",
+            "listening_mode": "playlist",
+            "collection_name": "Halloween lofi",
+            "album": "Halloween lofi",
+            "preserve_album": False,
+            "context_tracks": json.dumps([
+                {"media_title": "Haunted Pumpkin", "media_artist": "PBdR"}
+            ]),
+        }
+
+        normalized, _, err = uploader.parse_restore_request_payload(payload)
+
+        self.assertIsNone(err)
+        self.assertFalse(normalized["preserve_album"])
+        self.assertEqual("Halloween lofi", normalized["collection_name"])
+        self.assertEqual("Haunted Pumpkin", normalized["context_tracks"][0]["media_title"])
+
     def test_non_shazam_source_clears_shazam_key(self):
         payload = {
             "kind": "cover_art_reference",

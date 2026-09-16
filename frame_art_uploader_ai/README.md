@@ -5,6 +5,14 @@ It can upload the newest AI-generated image, generate music-inspired widescreen 
 
 TV control is direct over the local network and does not use the SmartThings API.
 
+## Playlist and radio session backgrounds (4.1.6)
+
+Playlist and radio requests can set `preserve_album: false`, provide a stable
+`collection_name`, and include up to 20 representative `context_tracks`. The
+add-on generates and caches one full-frame gallery image for the collection
+without resolving or compositing an album cover. Album requests keep the
+existing cover-derived pipeline.
+
 ## Old prompt button (4.1.5)
 
 The HA Music Actions button **Old prompt background** regenerates the current

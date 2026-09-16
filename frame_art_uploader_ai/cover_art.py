@@ -28,6 +28,15 @@ REFERENCE_BACKGROUND_PROMPT = (
     "watermarks, faces, or copyrighted characters. Do not recreate the exact album cover composition."
 )
 
+SESSION_BACKGROUND_PROMPT = (
+    "Create an original 16:9 full-bleed gallery artwork representing this {mode}: {name}. "
+    "Use the collection title as the primary theme and the representative music metadata only "
+    "as supporting mood, era, genre, and atmosphere clues: {context}. Make the composition feel "
+    "cohesive across the whole collection rather than tied to one song. It should read as tasteful "
+    "living-room art, with no album cover, inset square, frame, text, logos, labels, signatures, "
+    "watermarks, faces, copyrighted characters, or recognizable performer likenesses."
+)
+
 HA_EDIT_WIDTH = 1536
 HA_EDIT_HEIGHT = 1024
 HA_EDIT_SIZE = f"{HA_EDIT_WIDTH}x{HA_EDIT_HEIGHT}"
@@ -451,6 +460,86 @@ def _request_openai_reference_background(
         seed=seed,
         timeout_s=timeout_s,
     )
+
+
+def build_session_background_prompt(
+    listening_mode: str,
+    collection_name: str,
+    context_tracks: Any = None,
+) -> str:
+    mode = str(listening_mode or "collection").strip().lower() or "collection"
+    name = str(collection_name or "Untitled music collection").strip() or "Untitled music collection"
+    items = context_tracks if isinstance(context_tracks, list) else []
+    clues: list[str] = []
+    for item in items[:20]:
+        if not isinstance(item, dict):
+            continue
+        title = str(item.get("media_title") or item.get("title") or "").strip()
+        artist = str(item.get("media_artist") or item.get("artist") or "").strip()
+        album = str(item.get("media_album_name") or item.get("album") or "").strip()
+        detail = " — ".join(part for part in (title, artist, album) if part)
+        if detail and detail not in clues:
+            clues.append(detail)
+    context = "; ".join(clues) if clues else "No representative tracks are available; interpret the collection title conservatively"
+    # Keep image requests bounded even when providers return unusually verbose metadata.
+    context = context[:2400].rsplit(";", 1)[0] if len(context) > 2400 and ";" in context[:2400] else context[:2400]
+    return SESSION_BACKGROUND_PROMPT.format(mode=mode, name=name[:300], context=context)
+
+
+def _session_reference_canvas() -> bytes:
+    canvas = Image.new("RGB", (HA_EDIT_WIDTH, HA_EDIT_HEIGHT), (43, 42, 40))
+    out = BytesIO()
+    canvas.save(out, format="PNG", optimize=False)
+    return out.getvalue()
+
+
+def generate_local_session_background(prompt: str) -> tuple[bytes, bytes]:
+    digest = hashlib.sha256(prompt.encode("utf-8")).digest()
+    left = tuple(28 + digest[i] % 72 for i in range(3))
+    right = tuple(28 + digest[i] % 72 for i in range(3, 6))
+    image = Image.new("RGB", (2, 1))
+    image.putdata([left, right])
+    image = image.resize((FRAME_FINAL_WIDTH, FRAME_FINAL_HEIGHT), Image.Resampling.BICUBIC)
+    image = image.filter(ImageFilter.GaussianBlur(radius=32))
+    out = BytesIO()
+    image.save(out, format="PNG", optimize=False, compress_level=1)
+    payload = out.getvalue()
+    return payload, payload
+
+
+def generate_session_background_frame(
+    *,
+    prompt: str,
+    openai_api_key: str,
+    openai_model: str,
+    timeout_s: int = 90,
+    allow_fallback: bool = True,
+) -> tuple[bytes, bytes, Optional[str], Optional[str]]:
+    canvas = _session_reference_canvas()
+    try:
+        generated_bytes, request_id, model_used = _request_openai_reference_background_once(
+            input_canvas_png=canvas,
+            openai_api_key=openai_api_key,
+            openai_model=openai_model,
+            prompt=prompt,
+            timeout_s=timeout_s,
+        )
+    except Exception as request_error:
+        if not allow_fallback or not should_retry_openai_with_verification_fallback(request_error, openai_model):
+            raise
+        fallback_model = OPENAI_VERIFICATION_FALLBACK_MODEL
+        generated_bytes, request_id, model_used = _request_openai_reference_background_once(
+            input_canvas_png=canvas,
+            openai_api_key=openai_api_key,
+            openai_model=fallback_model,
+            prompt=prompt,
+            timeout_s=timeout_s,
+        )
+    background = ha_edit_to_frame(generated_bytes)
+    out = BytesIO()
+    background.save(out, format="PNG", optimize=False, compress_level=1)
+    payload = out.getvalue()
+    return payload, payload, request_id, model_used
 
 
 def generate_reference_background(

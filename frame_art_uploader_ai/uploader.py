@@ -31,15 +31,18 @@ from cover_art import (
     SOURCE_DIR,
     WIDESCREEN_DIR,
     compress_png_path_to_jpeg_max_bytes,
+    build_session_background_prompt,
     download_artwork,
     ensure_dirs,
     generate_local_fallback_frame_from_album,
+    generate_local_session_background,
     itunes_lookup,
     itunes_search,
     itunes_track_search,
     is_openai_org_verification_error,
     normalize_key,
     generate_reference_frame_from_album,
+    generate_session_background_frame,
     resolve_artwork_url,
 )
 
@@ -95,7 +98,7 @@ MUSIC_RESTORE_KINDS = {"cover_art_reference_background", "cover_art_outpaint"}
 MUSIC_ASSOCIATION_SESSION_TTL_DAYS = 0
 
 RUNTIME_OPTIONS: dict[str, Any] = {}
-ADDON_VERSION = "4.1.5"
+ADDON_VERSION = "4.1.6"
 HOLIDAY_ALIASES = {
     "football": "huskers",
 }
@@ -1199,6 +1202,15 @@ def parse_restore_request_payload(payload: Any) -> tuple[Optional[dict], Optiona
         normalized["album"] = album
         normalized["track"] = track
         normalized["listening_mode"] = str(payload.get("listening_mode", "")).strip()
+        normalized["collection_name"] = str(payload.get("collection_name", "")).strip()
+        normalized["preserve_album"] = parse_bool(payload.get("preserve_album")) is not False
+        context_tracks = payload.get("context_tracks", [])
+        if isinstance(context_tracks, str):
+            try:
+                context_tracks = json.loads(context_tracks)
+            except (TypeError, ValueError):
+                context_tracks = []
+        normalized["context_tracks"] = [item for item in context_tracks if isinstance(item, dict)][:20] if isinstance(context_tracks, list) else []
         normalized["restore_content_id"] = str(payload.get("restore_content_id", "")).strip()
         normalized["source_preference"] = str(payload.get("source_preference", "")).strip().lower()
         collection_id_raw = payload.get("collection_id")
@@ -3017,6 +3029,8 @@ def lookup_music_association(restore_payload: dict[str, Any]) -> Optional[dict[s
     catalog = load_frame_art_catalog(MUSIC_ASSOCIATIONS_PATH)
     entries = catalog.get("entries") if isinstance(catalog.get("entries"), dict) else {}
     if not isinstance(entries, dict) or not entries:
+        if restore_payload.get("preserve_album") is False:
+            return None
         return lookup_music_association_fuzzy(restore_payload)
 
     music_session_key = str(restore_payload.get("music_session_key", "")).strip()
@@ -3076,6 +3090,11 @@ def lookup_music_association(restore_payload: dict[str, Any]) -> Optional[dict[s
         record = entries.get(key)
         if isinstance(record, dict):
             return promote_exact_album_match(record)
+
+    # Collection/session artwork must never fuzzy-match an unrelated album just
+    # because the playlist or station name resembles an album title.
+    if restore_payload.get("preserve_album") is False:
+        return None
 
     if album_key_norm:
         for key, record in entries.items():
@@ -4403,6 +4422,14 @@ def run_music_generation_pipeline(job: dict[str, Any]) -> dict[str, Any]:
     artist = str(job.get("artist", "")).strip()
     album = str(job.get("album", "")).strip()
     track = str(job.get("track", "")).strip()
+    listening_mode = str(restore_payload.get("listening_mode", "")).strip().lower()
+    session_background = restore_payload.get("preserve_album") is False
+    collection_name = str(restore_payload.get("collection_name", "")).strip() or album
+    session_prompt = build_session_background_prompt(
+        listening_mode,
+        collection_name,
+        restore_payload.get("context_tracks", []),
+    ) if session_background else ""
     cache_key = str(job.get("cache_key", "")).strip()
     source_url = normalize_remote_artwork_url(job.get("source_url"))
     source_preference = str(job.get("source_preference", "")).strip().lower()
@@ -4432,6 +4459,8 @@ def run_music_generation_pipeline(job: dict[str, Any]) -> dict[str, Any]:
     wide_png_path = stage_paths["wide_png_path"]
     compressed_jpg_path = stage_paths["compressed_jpg_path"]
     job_dir.mkdir(parents=True, exist_ok=True)
+    if session_background and not src_path.exists():
+        Image.new("RGB", (512, 512), (43, 42, 40)).save(src_path, format="JPEG", quality=90)
 
     def log_music_generation_step(stage: str, **fields: Any) -> None:
         log_event(
@@ -4460,7 +4489,7 @@ def run_music_generation_pipeline(job: dict[str, Any]) -> dict[str, Any]:
     )
 
     try:
-        refresh_source_art = bool(source_url) or (
+        refresh_source_art = False if session_background else bool(source_url) or (
             not force_new_background
             and should_refresh_music_source_art(force_regen=force_regen, source_preference=source_preference)
         )
@@ -4606,16 +4635,26 @@ def run_music_generation_pipeline(job: dict[str, Any]) -> dict[str, Any]:
 
         try:
             log_music_generation_step("generate_reference_frame_start", openai_model=openai_model)
-            final_png, background_png, request_id, model_used = generate_reference_frame_from_album(
-                pipeline=music_pipeline,
-                source_album_path=src_path,
-                openai_api_key=openai_api_key,
-                openai_model=openai_model,
-                timeout_s=openai_timeout_s,
-                album_shadow=True,
-                step_hook=emit_cover_art_step,
-            )
-            generation_mode = "openai_reference"
+            if session_background:
+                final_png, background_png, request_id, model_used = generate_session_background_frame(
+                    prompt=session_prompt,
+                    openai_api_key=openai_api_key,
+                    openai_model=openai_model,
+                    timeout_s=openai_timeout_s,
+                    allow_fallback=not bool(job.get("use_frontier_model", False)),
+                )
+                generation_mode = "openai_session_background"
+            else:
+                final_png, background_png, request_id, model_used = generate_reference_frame_from_album(
+                    pipeline=music_pipeline,
+                    source_album_path=src_path,
+                    openai_api_key=openai_api_key,
+                    openai_model=openai_model,
+                    timeout_s=openai_timeout_s,
+                    album_shadow=True,
+                    step_hook=emit_cover_art_step,
+                )
+                generation_mode = "openai_reference"
             log_music_generation_step(
                 "generate_reference_frame_done",
                 mode=generation_mode,
@@ -4624,12 +4663,15 @@ def run_music_generation_pipeline(job: dict[str, Any]) -> dict[str, Any]:
             )
         except Exception as gen_exc:
             log_music_generation_step("generate_reference_frame_failed", error=repr(gen_exc))
-            final_png, background_png = generate_local_fallback_frame_from_album(
-                pipeline=music_pipeline,
-                source_album_path=src_path,
-                album_shadow=True,
-                step_hook=emit_cover_art_step,
-            )
+            if session_background:
+                final_png, background_png = generate_local_session_background(session_prompt)
+            else:
+                final_png, background_png = generate_local_fallback_frame_from_album(
+                    pipeline=music_pipeline,
+                    source_album_path=src_path,
+                    album_shadow=True,
+                    step_hook=emit_cover_art_step,
+                )
             request_id = None
             model_used = "local-fallback"
             gen_msg = repr(gen_exc).lower()
@@ -4856,8 +4898,9 @@ def run_reference_generation_worker_job(spec_path: Path) -> int:
     if not str(job_dir) or not str(result_path):
         raise ValueError("reference generation worker spec missing paths")
 
+    session_background = parse_bool(spec_raw.get("session_background")) is True
     source_album_path = Path(str(spec_raw.get("source_album_path", "")).strip())
-    if not source_album_path.exists():
+    if not session_background and not source_album_path.exists():
         raise ValueError(f"source album path not found: {source_album_path}")
 
     music_pipeline = resolve_music_pipeline(
@@ -4868,25 +4911,40 @@ def run_reference_generation_worker_job(spec_path: Path) -> int:
     job_dir.mkdir(parents=True, exist_ok=True)
 
     try:
-        final_png, background_png, request_id, model_used = generate_reference_frame_from_album(
-            pipeline=music_pipeline,
-            source_album_path=source_album_path,
-            openai_api_key=str(spec_raw.get("openai_api_key", "")).strip(),
-            openai_model=str(spec_raw.get("openai_model", "")).strip(),
-            allow_fallback=not spec_raw.get("use_frontier_model", False),
-            timeout_s=int(spec_raw.get("openai_timeout_s", 90) or 90),
-            album_shadow=True,
-        )
-        generation_mode = "openai_reference"
+        if session_background:
+            final_png, background_png, request_id, model_used = generate_session_background_frame(
+                prompt=str(spec_raw.get("session_prompt", "")).strip(),
+                openai_api_key=str(spec_raw.get("openai_api_key", "")).strip(),
+                openai_model=str(spec_raw.get("openai_model", "")).strip(),
+                allow_fallback=not spec_raw.get("use_frontier_model", False),
+                timeout_s=int(spec_raw.get("openai_timeout_s", 90) or 90),
+            )
+            generation_mode = "openai_session_background"
+        else:
+            final_png, background_png, request_id, model_used = generate_reference_frame_from_album(
+                pipeline=music_pipeline,
+                source_album_path=source_album_path,
+                openai_api_key=str(spec_raw.get("openai_api_key", "")).strip(),
+                openai_model=str(spec_raw.get("openai_model", "")).strip(),
+                allow_fallback=not spec_raw.get("use_frontier_model", False),
+                timeout_s=int(spec_raw.get("openai_timeout_s", 90) or 90),
+                album_shadow=True,
+            )
+            generation_mode = "openai_reference"
     except Exception as gen_exc:
         if spec_raw.get("use_frontier_model", False):
             atomic_write_json(result_path, {"ok": False, "error": str(gen_exc)})
             return 1
-        final_png, background_png = generate_local_fallback_frame_from_album(
-            pipeline=music_pipeline,
-            source_album_path=source_album_path,
-            album_shadow=True,
-        )
+        if session_background:
+            final_png, background_png = generate_local_session_background(
+                str(spec_raw.get("session_prompt", "")).strip()
+            )
+        else:
+            final_png, background_png = generate_local_fallback_frame_from_album(
+                pipeline=music_pipeline,
+                source_album_path=source_album_path,
+                album_shadow=True,
+            )
         request_id = None
         model_used = "local-fallback"
         gen_msg = repr(gen_exc).lower()
@@ -4931,6 +4989,8 @@ def run_cancellable_reference_generation(
     poll_interval_s: float = 0.25,
     use_frontier_model: bool = False,
     use_legacy_prompt: bool = False,
+    session_background: bool = False,
+    session_prompt: str = "",
 ) -> dict[str, Any]:
     job_id = uuid.uuid4().hex
     job_dir = MUSIC_JOB_DIR / f"reference_{job_id}"
@@ -4946,6 +5006,8 @@ def run_cancellable_reference_generation(
             "source_album_path": str(source_album_path),
             "use_frontier_model": use_frontier_model,
             "use_legacy_prompt": use_legacy_prompt,
+            "session_background": session_background,
+            "session_prompt": session_prompt,
             "cache_key": cache_key,
             "openai_api_key": openai_api_key,
             "openai_model": openai_model,
@@ -5874,6 +5936,17 @@ def main() -> None:
                     artist = str(restore_payload.get("artist", "")).strip()
                     album = str(restore_payload.get("album", "")).strip()
                     track = str(restore_payload.get("track", "")).strip()
+                    listening_mode = str(restore_payload.get("listening_mode", "")).strip().lower()
+                    session_background = restore_payload.get("preserve_album") is False
+                    collection_name = str(restore_payload.get("collection_name", "")).strip() or album
+                    context_tracks = restore_payload.get("context_tracks", [])
+                    if not isinstance(context_tracks, list):
+                        context_tracks = []
+                    session_prompt = build_session_background_prompt(
+                        listening_mode,
+                        collection_name,
+                        context_tracks,
+                    ) if session_background else ""
                     current_music_identity = stable_music_identity(restore_payload)
 
                     def skip_if_superseded_music_request(
@@ -6078,6 +6151,10 @@ def main() -> None:
                     wide_png_path = WIDESCREEN_DIR / f"{stem_key}__3840x2160.png"
                     wide_jpg_path = WIDESCREEN_DIR / f"{stem_key}__3840x2160.jpg"
                     compressed_jpg_path = COMPRESSED_DIR / f"{stem_key}__3840x2160.jpg"
+
+                    if session_background and not src_path.exists():
+                        src_path.parent.mkdir(parents=True, exist_ok=True)
+                        Image.new("RGB", (512, 512), (43, 42, 40)).save(src_path, format="JPEG", quality=90)
 
                     # Backward-compat candidates from older cover_art layout.
                     legacy_png_path = WIDESCREEN_DIR / f"{cache_key}.png"
@@ -6361,11 +6438,11 @@ def main() -> None:
                                     cache_reuse_confidence=association_record.get("cache_reuse_confidence"),
                                 )
 
-                            refresh_source_art = bool(source_url) or (
+                            refresh_source_art = False if session_background else bool(source_url) or (
                                 not force_new_background
                                 and should_refresh_music_source_art(
-                                force_regen=force_regen,
-                                source_preference=source_preference,
+                                    force_regen=force_regen,
+                                    source_preference=source_preference,
                                 )
                             )
                             if refresh_source_art and src_path.exists():
@@ -6533,6 +6610,8 @@ def main() -> None:
                                     openai_model=request_model,
                                     use_frontier_model=use_frontier_model,
                                     use_legacy_prompt=restore_payload.get("use_legacy_prompt", False),
+                                    session_background=session_background,
+                                    session_prompt=session_prompt,
                                     openai_timeout_s=openai_timeout_s,
                                     superseded_check=lambda: find_superseding_music_request(work_item, kind, restore_payload),
                                     poll_hook=maybe_try_music_wait_fallback,

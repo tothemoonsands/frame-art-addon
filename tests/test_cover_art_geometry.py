@@ -112,6 +112,33 @@ class CoverArtGeometryTests(unittest.TestCase):
         self.assertNotIn("image", request_kwargs["data"])
         self.assertNotIn("image[]", request_kwargs["data"])
 
+    def test_session_prompt_uses_collection_and_bounded_track_context(self):
+        tracks = [
+            {
+                "media_title": "Haunted Pumpkin",
+                "media_artist": "PBdR",
+                "media_album_name": "Lofi Girl - Halloween 2023",
+            },
+            {"media_title": "Witching Hour", "media_artist": "Jam'addict"},
+        ]
+        prompt = cover_art.build_session_background_prompt(
+            "playlist", "Halloween lofi", tracks
+        )
+
+        self.assertIn("playlist: Halloween lofi", prompt)
+        self.assertIn("Haunted Pumpkin", prompt)
+        self.assertIn("Witching Hour", prompt)
+        self.assertIn("no album cover", prompt.lower())
+
+    def test_local_session_fallback_is_full_frame_and_coverless(self):
+        final_png, background_png = cover_art.generate_local_session_background(
+            "playlist: Halloween lofi"
+        )
+
+        self.assertEqual(final_png, background_png)
+        with Image.open(BytesIO(final_png)) as image:
+            self.assertEqual((3840, 2160), image.size)
+
 
 if __name__ == "__main__":
     unittest.main()
