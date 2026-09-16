@@ -33,7 +33,9 @@ SESSION_BACKGROUND_PROMPT = (
     "Use the collection title as the primary theme and the representative music metadata only "
     "as supporting mood, era, genre, and atmosphere clues: {context}. Make the composition feel "
     "cohesive across the whole collection rather than tied to one song. It should read as tasteful "
-    "living-room art, with no album cover, inset square, frame, text, logos, labels, signatures, "
+    "living-room art. Do not depict musical equipment or music-listening objects: no turntables, "
+    "vinyl records, record players, speakers, headphones, microphones, instruments, mixing consoles, "
+    "or studio gear. Also include no album cover, inset square, frame, text, logos, labels, signatures, "
     "watermarks, faces, copyrighted characters, or recognizable performer likenesses."
 )
 

@@ -129,6 +129,9 @@ class CoverArtGeometryTests(unittest.TestCase):
         self.assertIn("Haunted Pumpkin", prompt)
         self.assertIn("Witching Hour", prompt)
         self.assertIn("no album cover", prompt.lower())
+        self.assertIn("no turntables", prompt.lower())
+        self.assertIn("speakers", prompt.lower())
+        self.assertIn("vinyl records", prompt.lower())
 
     def test_local_session_fallback_is_full_frame_and_coverless(self):
         final_png, background_png = cover_art.generate_local_session_background(
