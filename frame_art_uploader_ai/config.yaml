@@ -1,6 +1,6 @@
 name: Frame Art Uploader AI
 slug: frame_art_uploader_ai
-version: "4.1.7"
+version: "4.1.8"
 description: >
   Upload AI artwork and music-inspired widescreen art to Samsung Frame TV,
   mix in curated Samsung gallery selections, and keep uploads, queues, and cleanup in sync.
@@ -63,6 +63,9 @@ options:
   openai_api_key: ""
   openai_model: "gpt-image-2.5-flare"
   openai_frontier_model: "gpt-image-2.5-sunburst"
+  openai_context_model: "gpt-6-astra"
+  session_context_planning: true
+  session_context_web_search: true
   openai_timeout_s: 120
   art_socket_retries: 5
   art_preconnect_before_select: true
@@ -147,6 +150,9 @@ schema:
   openai_api_key: str
   openai_model: str
   openai_frontier_model: str?
+  openai_context_model: str
+  session_context_planning: bool
+  session_context_web_search: bool
   openai_timeout_s: int
   art_socket_retries: int
   art_preconnect_before_select: bool

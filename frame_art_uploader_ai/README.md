@@ -5,7 +5,7 @@ It can upload the newest AI-generated image, generate music-inspired widescreen 
 
 TV control is direct over the local network and does not use the SmartThings API.
 
-## Playlist and radio session backgrounds (4.1.7)
+## Playlist and radio session backgrounds (4.1.8)
 
 Playlist and radio requests can set `preserve_album: false`, provide a stable
 `collection_name`, and include up to 20 representative `context_tracks`. The
@@ -13,7 +13,19 @@ add-on generates and caches one full-frame gallery image for the collection
 without resolving or compositing an album cover. Album requests keep the
 existing cover-derived pipeline. Session prompts explicitly exclude musical
 equipment and music-listening objects so the Frame artwork does not visually
-compete with equipment in the room.
+compete with equipment in the room. Radio station names are treated as musical
+identity clues instead of literal scene requests, and the prompt steers away
+from generic staged coffee, wellness, sunset, and interior-design imagery.
+
+Before generating a new collection image, the add-on asks the configured
+`openai_context_model` to create a concise curator profile from the collection
+name and representative tracks. Web search is available when public context
+would improve the result—for example, resolving a community station to its
+place and culture—but the planner can simply reason from the music when search
+would add nothing. Profiles are cached in
+`/data/frame_art_session_profiles.json`, so regenerating artwork does not repeat
+the research step. `session_context_planning` and
+`session_context_web_search` can disable either capability independently.
 
 ## Old prompt button (4.1.5)
 

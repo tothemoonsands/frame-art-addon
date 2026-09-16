@@ -41,6 +41,7 @@ from cover_art import (
     itunes_track_search,
     is_openai_org_verification_error,
     normalize_key,
+    resolve_session_art_profile,
     generate_reference_frame_from_album,
     generate_session_background_frame,
     resolve_artwork_url,
@@ -98,7 +99,7 @@ MUSIC_RESTORE_KINDS = {"cover_art_reference_background", "cover_art_outpaint"}
 MUSIC_ASSOCIATION_SESSION_TTL_DAYS = 0
 
 RUNTIME_OPTIONS: dict[str, Any] = {}
-ADDON_VERSION = "4.1.7"
+ADDON_VERSION = "4.1.8"
 HOLIDAY_ALIASES = {
     "football": "huskers",
 }
@@ -4425,11 +4426,16 @@ def run_music_generation_pipeline(job: dict[str, Any]) -> dict[str, Any]:
     listening_mode = str(restore_payload.get("listening_mode", "")).strip().lower()
     session_background = restore_payload.get("preserve_album") is False
     collection_name = str(restore_payload.get("collection_name", "")).strip() or album
+    context_tracks = restore_payload.get("context_tracks", [])
+    if not isinstance(context_tracks, list):
+        context_tracks = []
     session_prompt = build_session_background_prompt(
         listening_mode,
         collection_name,
-        restore_payload.get("context_tracks", []),
+        context_tracks,
     ) if session_background else ""
+    session_art_profile: Optional[dict[str, Any]] = None
+    session_art_profile_meta: Optional[dict[str, Any]] = None
     cache_key = str(job.get("cache_key", "")).strip()
     source_url = normalize_remote_artwork_url(job.get("source_url"))
     source_preference = str(job.get("source_preference", "")).strip().lower()
@@ -4439,8 +4445,9 @@ def run_music_generation_pipeline(job: dict[str, Any]) -> dict[str, Any]:
     requested_at = str(job.get("requested_at", "")).strip()
     openai_api_key = str(job.get("openai_api_key", "")).strip()
     openai_model = str(job.get("openai_model", "")).strip()
+    music_options = load_options()
     music_pipeline = resolve_music_pipeline(
-        load_options(),
+        music_options,
         use_legacy_prompt=parse_bool(job.get("use_legacy_prompt", restore_payload.get("use_legacy_prompt"))) is True,
     )
     openai_timeout_s = int(job.get("openai_timeout_s", 90) or 90)
@@ -4636,6 +4643,32 @@ def run_music_generation_pipeline(job: dict[str, Any]) -> dict[str, Any]:
         try:
             log_music_generation_step("generate_reference_frame_start", openai_model=openai_model)
             if session_background:
+                session_art_profile, session_art_profile_meta = resolve_session_art_profile(
+                    listening_mode=listening_mode,
+                    collection_name=collection_name,
+                    context_tracks=context_tracks,
+                    openai_api_key=openai_api_key,
+                    context_model=str(music_options.get("openai_context_model", "gpt-6-astra")).strip(),
+                    timeout_s=min(openai_timeout_s, 60),
+                    enable_planning=parse_bool(music_options.get("session_context_planning", True)) is not False,
+                    enable_web_search=parse_bool(music_options.get("session_context_web_search", True)) is not False,
+                )
+                session_prompt = build_session_background_prompt(
+                    listening_mode,
+                    collection_name,
+                    context_tracks,
+                    art_profile=session_art_profile,
+                )
+                log_music_generation_step(
+                    "session_context_planned",
+                    profile_source=session_art_profile_meta.get("source"),
+                    profile_cache_key=session_art_profile_meta.get("cache_key"),
+                    planner=session_art_profile_meta.get("planner"),
+                    planner_errors=(
+                        session_art_profile_meta.get("errors")
+                        or session_art_profile_meta.get("retry_errors")
+                    ),
+                )
                 final_png, background_png, request_id, model_used = generate_session_background_frame(
                     prompt=session_prompt,
                     openai_api_key=openai_api_key,
@@ -5947,6 +5980,8 @@ def main() -> None:
                         collection_name,
                         context_tracks,
                     ) if session_background else ""
+                    session_art_profile: Optional[dict[str, Any]] = None
+                    session_art_profile_meta: Optional[dict[str, Any]] = None
                     current_music_identity = stable_music_identity(restore_payload)
 
                     def skip_if_superseded_music_request(
@@ -6602,6 +6637,33 @@ def main() -> None:
 
                             reference_generation_result: Optional[dict[str, Any]] = None
                             try:
+                                if session_background:
+                                    session_art_profile, session_art_profile_meta = resolve_session_art_profile(
+                                        listening_mode=listening_mode,
+                                        collection_name=collection_name,
+                                        context_tracks=context_tracks,
+                                        openai_api_key=openai_api_key,
+                                        context_model=str(opts.get("openai_context_model", "gpt-6-astra")).strip(),
+                                        timeout_s=min(openai_timeout_s, 60),
+                                        enable_planning=parse_bool(opts.get("session_context_planning", True)) is not False,
+                                        enable_web_search=parse_bool(opts.get("session_context_web_search", True)) is not False,
+                                    )
+                                    session_prompt = build_session_background_prompt(
+                                        listening_mode,
+                                        collection_name,
+                                        context_tracks,
+                                        art_profile=session_art_profile,
+                                    )
+                                    log_music_generation_step(
+                                        "session_context_planned",
+                                        profile_source=session_art_profile_meta.get("source"),
+                                        profile_cache_key=session_art_profile_meta.get("cache_key"),
+                                        planner=session_art_profile_meta.get("planner"),
+                                        planner_errors=(
+                                            session_art_profile_meta.get("errors")
+                                            or session_art_profile_meta.get("retry_errors")
+                                        ),
+                                    )
                                 log_music_generation_step("generate_reference_frame_start", openai_model=request_model)
                                 reference_generation_result = run_cancellable_reference_generation(
                                     source_album_path=src_path,
@@ -7216,6 +7278,16 @@ def main() -> None:
                         "mask_mode": "none" if kind in {"cover_art_outpaint", "cover_art_reference_background"} else None,
                         "openai_request_id": locals().get("request_id"),
                         "openai_model_used": locals().get("model_used"),
+                        "session_art_profile": (
+                            locals().get("session_art_profile")
+                            if restore_payload.get("preserve_album") is False
+                            else None
+                        ),
+                        "session_art_profile_meta": (
+                            locals().get("session_art_profile_meta")
+                            if restore_payload.get("preserve_album") is False
+                            else None
+                        ),
                         "match_source": match_source_for_status,
                         "match_confidence": match_confidence_for_status,
                         "second_match_confidence": second_match_confidence_for_status,

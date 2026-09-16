@@ -34,6 +34,7 @@ if "cover_art" not in sys.modules:
     cover.itunes_track_search = lambda *a, **k: {}
     cover.is_openai_org_verification_error = lambda *a, **k: False
     cover.normalize_key = lambda *a, **k: "k"
+    cover.resolve_session_art_profile = lambda *a, **k: ({}, {"source": "test"})
     cover.generate_reference_frame_from_album = lambda *a, **k: (b"", b"", None, None)
     cover.generate_local_fallback_frame_from_album = lambda *a, **k: (b"", b"")
     cover.generate_local_session_background = lambda *a, **k: (b"", b"")
