@@ -725,6 +725,17 @@ class RestoreQueueTests(unittest.TestCase):
         self.assertEqual(1, file_count)
         self.assertEqual(0, chosen_index)
 
+    def test_jsignals_selection_uses_local_file_even_for_samsung_pick(self):
+        local_file = Path("/media/frame_ai/ambient/spring/night/local.jpg")
+        payload = {"season": "spring", "phase": "night", "holiday": "none", "rng": 1}
+        with mock.patch.object(uploader, "list_local_images", return_value=[local_file]), \
+             mock.patch.object(uploader, "atomic_write_json") as write:
+            selected = uploader.publish_jsignals_local_art(payload, uploader.default_state())
+
+        self.assertEqual(local_file, selected)
+        self.assertEqual(str(local_file), write.call_args.args[1]["path"])
+        self.assertEqual(uploader.JSIGNALS_LOCAL_ART_PATH, write.call_args.args[0])
+
     def test_record_samsung_pick_failure_prunes_after_threshold(self):
         state = uploader.load_state()
         first = uploader.record_samsung_pick_failure(state, "SAM-B", requested_at="2026-03-21T08:00:00-05:00")

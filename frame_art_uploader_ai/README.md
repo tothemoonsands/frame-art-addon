@@ -5,6 +5,16 @@ It can upload the newest AI-generated image, generate music-inspired widescreen 
 
 TV control is direct over the local network and does not use the SmartThings API.
 
+## JSignals local art selection (4.1.9)
+
+Each ambient pick now writes `/share/frame_art_jsignals_local_art.json` with a
+local image path and selection time. This happens even when the Frame TV's pick
+uses the Samsung gallery or is queued while Art Mode is hidden. Holiday art is
+preferred when present; if that holiday folder is empty, the local selection
+falls back to the current seasonal ambient folder. The record contains no
+Samsung gallery artwork or image data. Home Assistant can expose it with a
+command-line sensor for JSignals to read.
+
 ## Playlist and radio session backgrounds (4.1.8)
 
 Playlist and radio requests can set `preserve_album: false`, provide a stable

@@ -53,6 +53,7 @@ STATE_PATH = "/data/frame_art_uploader_state.json"
 DISPLAY_DIR = Path("/share/frame_art_display")
 DISPLAY_CURRENT_JSON_PATH = DISPLAY_DIR / "current.json"
 DISPLAY_ERROR_JSON_PATH = DISPLAY_DIR / "error.json"
+JSIGNALS_LOCAL_ART_PATH = Path("/share/frame_art_jsignals_local_art.json")
 ACTIVE_MUSIC_JOB_PATH = Path("/share/frame_art_active_music_job.json")
 
 # One-shot restore request written by Home Assistant.
@@ -99,7 +100,7 @@ MUSIC_RESTORE_KINDS = {"cover_art_reference_background", "cover_art_outpaint"}
 MUSIC_ASSOCIATION_SESSION_TTL_DAYS = 0
 
 RUNTIME_OPTIONS: dict[str, Any] = {}
-ADDON_VERSION = "4.1.8"
+ADDON_VERSION = "4.1.9"
 HOLIDAY_ALIASES = {
     "football": "huskers",
 }
@@ -927,6 +928,23 @@ def choose_pick_file(payload: dict, state: dict) -> tuple[Optional[Path], str, i
                 break
 
     return chosen, str(folder), file_count, chosen_index
+
+
+def publish_jsignals_local_art(payload: dict, state: dict) -> Optional[Path]:
+    """Publish the local counterpart of every ambient pick, including Samsung picks."""
+    chosen, _, _, _ = choose_pick_file(payload, state)
+    if chosen is None and str(payload.get("holiday", "none")).strip().lower() != "none":
+        ambient_payload = {**payload, "holiday": "none"}
+        chosen, _, _, _ = choose_pick_file(ambient_payload, state)
+    atomic_write_json(JSIGNALS_LOCAL_ART_PATH, {
+        "path": str(chosen) if chosen else "",
+        "season": str(payload.get("season", "")).strip().lower(),
+        "phase": str(payload.get("phase", "")).strip().lower(),
+        "holiday": str(payload.get("holiday", "none")).strip().lower(),
+        "requested_at": str(payload.get("requested_at", "")).strip(),
+        "updated_at": datetime.now(timezone.utc).isoformat(timespec="microseconds"),
+    })
+    return chosen
 
 
 def compute_phase_roll(payload: dict) -> tuple[int, int, str]:
@@ -5742,6 +5760,7 @@ def main() -> None:
                     display_local_path = local_path
                 elif kind == "pick":
                     rng, phase_roll, phase = compute_phase_roll(restore_payload)
+                    publish_jsignals_local_art(restore_payload, state)
                     pick_bucket_key_value = pick_bucket_key(restore_payload, phase)
                     display_source_kind = "ambient_or_holiday"
                     display_phase = phase
