@@ -2,6 +2,8 @@
 __MACOSX/
 ._*
 .nova/
+.venv/
+/Frame Art Review/
 
 # Codex local context artifacts
 .codex/context/
