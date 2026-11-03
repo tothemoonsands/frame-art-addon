@@ -100,7 +100,7 @@ MUSIC_RESTORE_KINDS = {"cover_art_reference_background", "cover_art_outpaint"}
 MUSIC_ASSOCIATION_SESSION_TTL_DAYS = 0
 
 RUNTIME_OPTIONS: dict[str, Any] = {}
-ADDON_VERSION = "4.1.10"
+ADDON_VERSION = "4.1.11"
 HOLIDAY_ALIASES = {
     "football": "huskers",
 }
@@ -328,6 +328,8 @@ def resolve_duplicate_music_request_content_id(payload: dict[str, Any], kind: st
 
     last_status = load_last_status_payload()
     if not last_status or last_status.get("ok") is not True:
+        return None
+    if last_status.get("phase_status") == "skipped":
         return None
     if not is_music_restore_kind(str(last_status.get("kind", "")).strip().lower()):
         return None
@@ -4216,6 +4218,54 @@ def should_skip_superseded_music_request(
     return is_superseded_music_request(work_item, current_kind, current_payload)
 
 
+def find_superseding_restore_request(work_item: Path, payload: dict, requested_show: Optional[bool]) -> Optional[dict]:
+    """Resolve obsolete display work without opening a TV connection."""
+    kind = str(payload.get("kind", "")).strip().lower()
+    if is_music_restore_kind(kind):
+        if requested_show is False:
+            return None
+        return find_superseding_music_request(work_item, kind, payload)
+    # Session-end restores must yield when music has since resumed. Preserve
+    # ordinary ambient picks, manual selections, seeds and background music.
+    if kind not in {"pick", "content_id"} or not payload.get("suppress_prior_music"):
+        return None
+    queued = list_queued_requests()
+    names = [item.name for item in queued]
+    if work_item.name not in names:
+        return None
+    for item in queued[names.index(work_item.name) + 1:]:
+        newer, show, error = load_restore_work_item(item)
+        if error or not newer:
+            continue
+        if is_music_restore_kind(newer.get("kind", "")) and show is not False:
+            return {"payload": newer, "kind": newer["kind"], "work_item": item}
+    return None
+
+
+def discard_superseded_restore_request(work_item: Path, payload: dict, requested_show: Optional[bool], tv_ip: str) -> bool:
+    newer = find_superseding_restore_request(work_item, payload, requested_show)
+    if newer is None:
+        return False
+    music = is_music_restore_kind(payload.get("kind", ""))
+    log_event("restore_request_skipped", kind=payload.get("kind"), reason="superseded_before_tv",
+              superseding_kind=newer.get("kind"))
+    write_superseded_music_status(
+        tv_ip=tv_ip, kind=payload.get("kind", ""), request_value=str(payload.get("value", "")),
+        requested_at=str(payload.get("requested_at", "")), requested_show=requested_show,
+        is_art_mode=False, restore_payload=payload, pick_source="superseded_before_tv",
+        phase_action="skipped_superseded_music_request" if music else "skipped_superseded_restore_request",
+    )
+    work_item.unlink()
+    return True
+
+
+def prune_superseded_restore_requests(tv_ip: str) -> None:
+    for item in list_queued_requests():
+        payload, show, error = load_restore_work_item(item)
+        if not error and payload:
+            discard_superseded_restore_request(item, payload, show, tv_ip)
+
+
 def write_superseded_music_status(
     *,
     tv_ip: str,
@@ -4240,6 +4290,8 @@ def write_superseded_music_status(
         "requested_at": requested_at,
         "requested_show": requested_show,
         "effective_show": False,
+        "verified": False,
+        "delivered": False,
         "art_mode": is_art_mode,
         "requested_music_session_key": str(restore_payload.get("music_session_key", "")).strip(),
         "restore_content_id": str(restore_payload.get("restore_content_id", "")).strip(),
@@ -5641,19 +5693,6 @@ def main() -> None:
     _ = resolve_runtime_int_option("art_ws_open_timeout_s", 15, min_value=3, max_value=60)
     _ = resolve_runtime_int_option("art_channel_timeout_s", 12, min_value=3, max_value=60)
 
-    tv = create_tv_client(tv_ip)
-    art = create_art_client(tv)
-
-    if not art.supported():
-        write_status(
-            {
-                "ok": False,
-                "error": "Art mode not supported / unreachable",
-                "tv_ip": tv_ip,
-            }
-        )
-        return
-
     with worker_lock() as has_lock:
         if not has_lock:
             write_status(
@@ -5665,6 +5704,17 @@ def main() -> None:
                     "error": "worker_already_processing",
                 }
             )
+            return
+
+        # A wedged TV must not make obsolete requests spend minutes in socket
+        # retries before the current album can even reach its cache lookup.
+        prune_superseded_restore_requests(tv_ip)
+        if dequeue_next_restore_work_item() is None:
+            return
+        tv = create_tv_client(tv_ip)
+        art = create_art_client(tv)
+        if not art.supported():
+            write_status({"ok": False, "error": "Art mode not supported / unreachable", "tv_ip": tv_ip})
             return
 
         handled_restore_work = False
@@ -5691,6 +5741,9 @@ def main() -> None:
                 if not restore_payload:
                     raise ValueError("Invalid restore payload")
 
+                if discard_superseded_restore_request(work_item, restore_payload, requested_show, tv_ip):
+                    continue
+
                 current_info = get_current_info(art)
                 is_art_mode = bool(current_info) or extract_content_id(current_info) is not None
                 show_flag = requested_show if requested_show is not None else is_art_mode
@@ -5711,6 +5764,9 @@ def main() -> None:
                 artist = ""
                 album = ""
                 track = ""
+                # A cache hit must not inherit the preceding item's paid request.
+                request_id = None
+                model_used = None
                 match_candidates_for_status: list[dict[str, Any]] = []
                 match_source_for_status: Optional[str] = None
                 match_confidence_for_status: Optional[float] = None
@@ -6978,6 +7034,10 @@ def main() -> None:
                     ):
                         continue
 
+                # Music may have resumed during a slow ambient lookup/upload.
+                if discard_superseded_restore_request(work_item, restore_payload, requested_show, tv_ip):
+                    continue
+
                 verified = False
                 verification_skipped = False
 
@@ -7285,6 +7345,7 @@ def main() -> None:
                         "keep_count_deleted": deleted_keep_count,
                         "keep_count_cleanup_error": pending_cleanup_error,
                         "verified": verified,
+                        "delivered": bool(show_flag and verified and target_cid),
                         "verification_skipped": verification_skipped,
                         "cache_key": locals().get("cache_key"),
                         "source_path": str(locals().get("src_path")) if "src_path" in locals() else None,

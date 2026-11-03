@@ -453,6 +453,78 @@ class RestoreQueueTests(unittest.TestCase):
 
         self.assertTrue(uploader.is_superseded_music_request(first, "cover_art_reference_background"))
 
+    def test_prune_discards_old_session_restore_before_any_tv_io(self):
+        requests = [
+            {"kind": "cover_art_reference", "artist": "Kofi Stone", "album": "The Last Flower To Bloom", "show": True},
+            {"kind": "pick", "phase": "night", "season": "autumn", "suppress_prior_music": True, "show": False},
+            {"kind": "cover_art_reference", "artist": "Kofi Stone", "album": "The Last Flower To Bloom", "show": True},
+        ]
+        items = [uploader.enqueue_restore_payload(payload) for payload in requests]
+        with mock.patch.object(uploader, "create_tv_client") as tv:
+            uploader.prune_superseded_restore_requests("192.0.2.1")
+        tv.assert_not_called()
+        self.assertEqual([items[-1]], uploader.list_queued_requests())
+        status = json.loads(self.status.read_text())
+        self.assertEqual("skipped", status["phase_status"])
+        self.assertFalse(status["verified"])
+        self.assertFalse(status["delivered"])
+        self.assertEqual("pick", status["kind"])
+
+    def test_worker_prunes_before_connecting_to_unreachable_tv(self):
+        self.options.write_text(json.dumps({"tv_ip": "192.0.2.1", "queue_drain_grace_s": 0}))
+        old = uploader.enqueue_restore_payload({"kind": "cover_art_reference", "artist": "Old", "album": "Old", "show": True})
+        current = uploader.enqueue_restore_payload({"kind": "cover_art_reference", "artist": "New", "album": "New", "show": True})
+
+        def connect(tv_ip):
+            self.assertFalse(old.exists())
+            self.assertTrue(current.exists())
+            raise TimeoutError("TV unreachable")
+
+        with mock.patch.object(uploader, "create_tv_client", side_effect=connect):
+            with self.assertRaises(TimeoutError):
+                uploader.main()
+        self.assertTrue(current.exists())
+
+    def test_prune_preserves_manual_pick_and_background_music(self):
+        items = [uploader.enqueue_restore_payload(payload) for payload in [
+            {"kind": "pick", "phase": "night", "season": "autumn", "show": True},
+            {"content_id": "MY_MANUAL", "show": True},
+            {"kind": "cover_art_reference", "artist": "Old", "album": "Old", "show": False},
+            {"kind": "cover_art_reference", "artist": "New", "album": "New", "show": True},
+        ]]
+        uploader.prune_superseded_restore_requests("192.0.2.1")
+        self.assertEqual(items, uploader.list_queued_requests())
+
+    def test_session_restore_yields_when_music_arrives_during_tv_state_read(self):
+        self.options.write_text(json.dumps({"tv_ip": "192.0.2.1", "queue_drain_grace_s": 0}))
+        restore = uploader.enqueue_restore_payload({"content_id": "MY_AMBIENT", "suppress_prior_music": True, "show": True})
+        art = mock.Mock()
+        art.supported.return_value = True
+
+        def current_info(client):
+            uploader.enqueue_restore_payload({"kind": "cover_art_reference", "artist": "Kofi Stone",
+                                              "album": "The Last Flower To Bloom", "show": True})
+            return {"content_id": "MY_PREVIOUS"}
+
+        with mock.patch.object(uploader, "create_tv_client"), \
+             mock.patch.object(uploader, "create_art_client", return_value=art), \
+             mock.patch.object(uploader, "get_current_info", side_effect=current_info), \
+             mock.patch.object(uploader, "dequeue_next_restore_work_item_with_grace", side_effect=[restore, None]), \
+             mock.patch.object(uploader, "select_and_verify_with_reconnect") as select:
+            uploader.main()
+        select.assert_not_called()
+        art.select_image.assert_not_called()
+        self.assertFalse(restore.exists())
+        self.assertEqual(1, len(uploader.list_queued_requests()))
+
+    def test_skipped_result_cannot_supply_duplicate_music_content_id(self):
+        self.status.write_text(json.dumps({
+            "ok": True, "kind": "cover_art_reference_background", "phase_status": "skipped",
+            "requested_music_session_key": "album:Same", "selected_content_id": "MY_STALE",
+        }))
+        self.assertIsNone(uploader.resolve_duplicate_music_request_content_id(
+            {"music_session_key": "album:Same"}, "cover_art_reference_background"))
+
     def test_music_request_not_superseded_when_newer_music_shares_normalized_album_identity(self):
         self._write_inbox(
             {

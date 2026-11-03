@@ -5,6 +5,23 @@ It can upload the newest AI-generated image, generate music-inspired widescreen 
 
 TV control is direct over the local network and does not use the SmartThings API.
 
+## Queue recovery and music completion (4.1.11)
+
+The worker discards superseded foreground music requests before opening a TV
+connection. Session-end ambient restores also yield to later foreground music
+when playback resumes. Manual selections, ordinary ambient picks, seed work,
+and background music requests retain their existing queue policy. The worker
+checks again before reading TV state and before selecting artwork, so obsolete
+work can yield after a slow lookup or upload.
+
+Skipped statuses keep `ok: true` for queue-processing compatibility, but carry
+`phase_status: skipped`, `verified: false`, and `delivered: false`. They must not
+be interpreted as completed artwork delivery. Normal completion reports
+`delivered: true` only for a verified visible selection. The HA configuration
+must expose `verified` and reject skipped or outdated results before clearing
+retry flags or marking an album complete. A TV whose Art API is unresponsive
+can still require separate recovery; pruning the queue does not repair it.
+
 ## JSignals local art selection (4.1.9)
 
 Each ambient pick now writes `/share/frame_art_jsignals_local_art.json` with a
