@@ -5,6 +5,13 @@ It can upload the newest AI-generated image, generate music-inspired widescreen 
 
 TV control is direct over the local network and does not use the SmartThings API.
 
+## Configured continuation models (4.1.12)
+
+The seamless pipeline now sends the configured model directly to OpenAI, fixing
+local rejection of models such as `gpt-image-2.6-sunburst`. Defaults and automatic
+fallbacks are unchanged. Frontier failures still retain the current artwork
+without retrying another model.
+
 ## Queue recovery and music completion (4.1.11)
 
 The worker discards superseded foreground music requests before opening a TV
