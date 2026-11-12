@@ -47,11 +47,43 @@ class SeamlessTests(unittest.TestCase):
             headers = {}
             def json(self):
                 return {'error': {'code': 'model_not_found', 'message': 'Frontier model unavailable'}}
-        with patch.object(seamless, 'request_image', side_effect=seamless.RequestFailure(Response())) as request:
-            with self.assertRaisesRegex(seamless.RequestFailure, 'Frontier model unavailable'):
-                seamless.generate(self.source, 'test', 'gpt-image-2.5-sunburst', 120, True, None, cover_art, allow_fallback=False)
-        self.assertEqual(1, request.call_count)
-        self.assertFalse(self.source.with_suffix('.recipe.json').exists())
+        for model in ('gpt-image-2.5-sunburst', 'gpt-image-2.6-sunburst'):
+            with self.subTest(model=model):
+                with patch.object(seamless, 'request_image', side_effect=seamless.RequestFailure(Response())) as request:
+                    with self.assertRaisesRegex(seamless.RequestFailure, 'Frontier model unavailable'):
+                        seamless.generate(self.source, 'test', model, 120, True, None, cover_art, allow_fallback=False)
+                self.assertEqual(1, request.call_count)
+                self.assertFalse(self.source.with_suffix('.recipe.json').exists())
+
+    def test_new_frontier_model_is_requested_and_recorded_without_fallback(self):
+        model='gpt-image-2.6-sunburst'
+        generated=seamless.png(Image.new('RGB',(1536,1024)))
+        with patch.object(seamless,'request_image',return_value=(generated,'req',model,{})) as request:
+            result=seamless.generate(self.source,'test',model,120,True,None,cover_art,allow_fallback=False)
+        request.assert_called_once()
+        self.assertEqual(model,request.call_args.args[1])
+        self.assertEqual(seamless.PROMPT,request.call_args.args[2])
+        self.assertIsNotNone(request.call_args.args[4])
+        self.assertEqual(model,result[3])
+        recipe=json.loads(self.source.with_suffix('.recipe.json').read_text())
+        self.assertEqual(model,recipe['model_requested'])
+        self.assertEqual(model,recipe['model_used'])
+        self.assertEqual([],recipe['attempts'])
+
+    def test_configured_model_is_validated_by_api(self):
+        with patch.object(seamless,'request_image',side_effect=requests.Timeout) as request:
+            with self.assertRaises(requests.Timeout):
+                seamless.generate(self.source,'test','future-configured-model',120,True,None,cover_art,allow_fallback=False)
+        request.assert_called_once()
+        self.assertEqual('future-configured-model',request.call_args.args[1])
+
+    def test_missing_model_is_rejected_before_request(self):
+        for model in (None, '', '   '):
+            with self.subTest(model=model):
+                with patch.object(seamless,'request_image') as request:
+                    with self.assertRaisesRegex(ValueError,'Missing continuation model'):
+                        seamless.generate(self.source,'test',model,120,True,None,cover_art)
+                request.assert_not_called()
 
     def test_transport_failure_does_not_try_another_model(self):
         with patch.object(seamless,'request_image',side_effect=requests.Timeout) as request:

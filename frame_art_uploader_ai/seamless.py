@@ -80,8 +80,8 @@ def request_image(key, model, prompt, canvas, mask, timeout):
 def generate(source, key, primary, timeout, shadow, hook, cover_art, allow_fallback=True):
     if not key:
         raise ValueError('Missing OpenAI API key')
-    if primary not in MODELS:
-        raise ValueError(f'Unsupported continuation model: {primary}')
+    if not isinstance(primary, str) or not primary.strip():
+        raise ValueError('Missing continuation model')
     source = Path(source)
     source_hash = hashlib.sha256(source.read_bytes()).hexdigest()
     water = source_hash == WATER_SOURCE_HASH or source.stem.split('__')[0] == '1440783617' or 'nirvana-nevermind' in source.stem.lower()

@@ -74,6 +74,10 @@ The add-on Configuration menu has two independent model fields:
 - **OpenAI model** (`openai_model`, default `gpt-image-2.5-flare`) for ordinary generation.
 - **Frontier OpenAI model** (`openai_frontier_model`, default `gpt-image-2.5-sunburst`) for explicit one-time repairs.
 
+The seamless pipeline sends the configured model directly to OpenAI rather than
+restricting it to a local allowlist. OpenAI determines whether that model is
+available to your account. The defaults and automatic fallback sequence are unchanged.
+
 The HA Music Actions buttons **Fix with frontier** and **Frontier background**
 use the frontier setting for that request. Fix refreshes the cover/generation;
 background regenerates around the selected cover. Both force a new generation
